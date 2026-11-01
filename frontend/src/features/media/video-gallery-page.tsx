@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, CheckCircle2, Clock, Eye, ListVideo, Loader2, RefreshCw, Search, Trash2 } from "lucide-react";
+import { AlertCircle, CheckCircle2, Clock, Download, Eye, ListVideo, Loader2, RefreshCw, Search, Trash2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -220,6 +220,11 @@ export function VideoGalleryPage() {
                     {job.status === "completed" ? (
                       <Button type="button" variant="ghost" size="icon" className="size-8" disabled={!job.assetId} title={job.assetId ? t("media.videos.preview") : t("media.videos.previewUnavailable")} onClick={() => setPreviewing(job)} aria-label={job.assetId ? t("media.videos.preview") : t("media.videos.previewUnavailable")}><Eye /></Button>
                     ) : null}
+                    {job.status === "completed" && job.assetId ? (
+                      <Button asChild variant="ghost" size="icon" className="size-8">
+                        <a href={videoAssetURL(job.assetId)} download={`${job.id}.mp4`} title={t("media.videos.download")} aria-label={t("media.videos.download")}><Download /></a>
+                      </Button>
+                    ) : null}
                   </TableActionCell>
                 </TableRow>
               )} />
@@ -251,7 +256,14 @@ export function VideoGalleryPage() {
             <DialogDescription className="min-w-0 truncate font-mono" title={previewing?.id}>{previewing?.id}</DialogDescription>
           </DialogHeader>
           {previewing?.assetId ? (
-            <VideoPreview key={previewing.assetId} assetId={previewing.assetId} />
+            <>
+              <VideoPreview key={previewing.assetId} assetId={previewing.assetId} />
+              <div className="flex justify-end">
+                <Button asChild variant="outline" size="sm">
+                  <a href={videoAssetURL(previewing.assetId)} download={`${previewing.id}.mp4`}><Download />{t("media.videos.download")}</a>
+                </Button>
+              </div>
+            </>
           ) : null}
         </DialogContent>
       </Dialog>
