@@ -394,6 +394,9 @@ func TestParseImportedCredentialsBatch(t *testing.T) {
 	if len(values) != 2 || values[0].Name != "primary" || values[0].UserID != "user-1" || values[0].OIDCClientID != "client-1" || values[1].RefreshToken != "refresh-2" {
 		t.Fatalf("导入结果不正确: %#v", values)
 	}
+	if string(values[0].Provider) != "grok_build" || string(values[1].Provider) != "grok_build" {
+		t.Fatal("导入凭据必须保留 Grok Build 类型")
+	}
 	if values[0].SourceKey == values[1].SourceKey {
 		t.Fatal("不同账号生成了相同来源标识")
 	}

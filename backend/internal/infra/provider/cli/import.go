@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode"
 
+	account "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
@@ -274,7 +275,7 @@ func normalizeImportedCredential(entry importedCredentialEntry) (provider.Creden
 	sourceKey := "import:" + security.HashToken(strings.Join([]string{providerName, clientID, identity}, "|"))
 
 	return provider.CredentialSeed{
-		Name: firstNonEmpty(entry.Name, email, userID, "Grok Build account"), Email: email, UserID: userID, TeamID: teamID,
+		Provider: account.ProviderBuild, Name: firstNonEmpty(entry.Name, email, userID, "Grok Build account"), Email: email, UserID: userID, TeamID: teamID,
 		SourceKey: sourceKey, OIDCClientID: clientID, AccessToken: accessToken, RefreshToken: refreshToken, ExpiresAt: expiresAt,
 	}, nil
 }
