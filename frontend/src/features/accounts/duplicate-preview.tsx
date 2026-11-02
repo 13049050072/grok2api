@@ -1,8 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { listAccounts, type AccountDTO, type AccountProvider } from "@/features/accounts/accounts-api";
+import { deleteAccounts, listAccounts, previewAccountDeletion, type AccountDTO, type AccountProvider } from "@/features/accounts/accounts-api";
+import { toast } from "sonner";
 
 async function readAccounts(provider: AccountProvider): Promise<AccountDTO[]> {
   const accounts: AccountDTO[] = [];
@@ -30,7 +33,20 @@ function date(value?: string): string {
 
 export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
   const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [targets, setTargets] = useState<AccountProvider[]>([]);
+  const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["duplicate-preview", provider], queryFn: () => readAccounts(provider), enabled: open, staleTime: 0, refetchOnWindowFocus: false });
+  const preview = useQuery({ queryKey: ["duplicate-deletion-preview", provider, selected, targets], queryFn: () => previewAccountDeletion(selected, provider, targets), enabled: deleteOpen && selected.length > 0, staleTime: 0, refetchOnWindowFocus: false });
+  const deletion = useMutation({ mutationFn: () => deleteAccounts(selected, provider, targets), onSuccess: (result) => {
+    toast.success(`已删除 ${result.deleted} 条账号${result.skipped ? `，跳过 ${result.skipped} 条` : ""}`);
+    setSelected([]); setTargets([]); setDeleteOpen(false);
+    void queryClient.invalidateQueries({ queryKey: ["accounts"] });
+    void queryClient.invalidateQueries({ queryKey: ["duplicate-preview", provider] });
+  }, onError: (error) => toast.error(`删除失败：${error.message}`) });
+  const options = (["grok_build", "grok_web", "grok_console"] as AccountProvider[]).filter((value) => value !== provider);
+  const label = (value: AccountProvider) => ({ grok_build: "Grok Build", grok_web: "Grok Web", grok_console: "Grok Console" })[value];
   const grouped = new Map<string, AccountDTO[]>();
   for (const account of query.data ?? []) {
     const email = account.email?.trim().toLowerCase();
@@ -42,7 +58,7 @@ export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
 
   return <>
     <Button variant="secondary" size="sm" onClick={() => setOpen(true)}>重复账号检查</Button>
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(value) => { if (deletion.isPending) return; setOpen(value); if (!value) { setSelected([]); setTargets([]); setDeleteOpen(false); } }}>
       <DialogContent className="max-h-[85vh] max-w-[900px] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>重复账号与合并预览</DialogTitle>
@@ -52,6 +68,7 @@ export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
         {query.isError ? <p className="text-destructive">检查失败：{query.error.message} <Button size="sm" variant="secondary" onClick={() => void query.refetch()}>重试</Button></p> : null}
         {query.isSuccess ? <>
           <p className="text-sm">发现 {duplicates.length} 组同邮箱账号；{missing} 条缺少邮箱，无法按邮箱检查。</p>
+          <div className="flex items-center gap-3"><span className="text-sm">已选 {selected.length} 条</span><Button variant="destructive" size="sm" disabled={!selected.length || query.isFetching} onClick={() => { setTargets([]); setDeleteOpen(true); }}>删除所选</Button></div>
           {duplicates.length === 0 ? <p className="text-sm text-muted-foreground">未发现同邮箱重复记录。</p> : null}
           {duplicates.map(([email, items]) => {
             const userIds = new Set(items.map((item) => item.userId?.trim()).filter(Boolean));
@@ -64,7 +81,7 @@ export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
               {conflict ? <p className="text-sm text-destructive">用户 ID 或团队 ID 不一致：可能不是同一身份，请勿直接合并。</p> : <p className="text-sm text-muted-foreground">同邮箱只是候选；缺失用户 ID 时仍需核实身份。</p>}
               {!conflict ? <p className="text-sm">凭据记录最近更新：{latestTime ? knownTimes.filter((item) => Date.parse(item.credentialUpdatedAt!) === latestTime).map((item) => `#${item.id}`).join("、") : "未知"}。无法仅凭现有信息确定最完整或有效的凭据，请比较各项状态和关联。</p> : null}
               {items.map((item) => <div key={item.id} className="rounded border p-2 text-sm space-y-1">
-                <div className="font-medium break-all">{item.name} · ID {item.id} {latestTime && Date.parse(item.credentialUpdatedAt ?? "") === latestTime ? "· 凭据记录最近更新" : ""}</div>
+                <label className="flex items-start gap-2"><Checkbox checked={selected.includes(item.id)} onCheckedChange={(checked) => setSelected((current) => checked === true ? [...current, item.id] : current.filter((id) => id !== item.id))} /><span className="font-medium break-all">{item.name} · ID {item.id} {latestTime && Date.parse(item.credentialUpdatedAt ?? "") === latestTime ? "· 凭据记录最近更新" : ""}</span></label>
                 <div>状态：{item.authStatus === "active" ? "正常" : "需重新授权"} / {item.enabled ? "已启用" : "已停用"}；类型：{item.authType}；可刷新：{item.refreshable ? "是" : "否"}；Cloudflare Cookie：{item.cloudflareCookieConfigured ? "有" : "无"}</div>
                 <div>凭据记录更新：{date(item.credentialUpdatedAt)}；上次刷新：{date(item.lastRefreshAt)}；到期：{date(item.expiresAt)}</div>
                 <div className="break-all">用户 ID：{item.userId || "未知"}；团队 ID：{item.teamId || "未知"}</div>
@@ -76,5 +93,15 @@ export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
         </> : null}
       </DialogContent>
     </Dialog>
+    <AlertDialog open={deleteOpen} onOpenChange={(value) => { if (!deletion.isPending) setDeleteOpen(value); }}>
+      <AlertDialogContent>
+        <AlertDialogHeader><AlertDialogTitle>删除所选 {selected.length} 个账号？</AlertDialogTitle><AlertDialogDescription>账号凭据和额度快照将从本服务删除，此操作无法撤销。请先确认不会删除需要保留的记录。</AlertDialogDescription></AlertDialogHeader>
+        <div className="space-y-3 border-t pt-3"><p className="text-sm font-medium">同时删除关联账号？</p>
+          <div className="flex flex-wrap gap-4">{options.map((target) => <label key={target} className="flex items-center gap-2 text-sm"><Checkbox checked={targets.includes(target)} onCheckedChange={(checked) => setTargets((current) => checked === true ? [...current, target] : current.filter((item) => item !== target))} />{label(target)}</label>)}</div>
+          {preview.isFetching ? <p className="text-sm">正在检查影响…</p> : preview.isError ? <p className="text-sm text-destructive">无法预览删除范围，请重试。<Button size="sm" variant="ghost" onClick={() => void preview.refetch()}>重试</Button></p> : preview.data ? <p className="text-sm">预计删除 {preview.data.total} 条：所选 {preview.data.rootCount} 条{targets.map((target) => `，关联 ${label(target)} ${preview.data?.linkedByProvider[target] ?? 0} 条`).join("")}。</p> : null}
+        </div>
+        <AlertDialogFooter><AlertDialogCancel disabled={deletion.isPending}>取消</AlertDialogCancel><AlertDialogAction className="bg-destructive text-white" disabled={deletion.isPending || preview.isFetching || preview.isError || !preview.data || preview.data.rootCount !== selected.length} onClick={(event) => { event.preventDefault(); deletion.mutate(); }}>确认删除</AlertDialogAction></AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   </>;
 }
