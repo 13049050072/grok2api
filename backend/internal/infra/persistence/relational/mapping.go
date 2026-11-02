@@ -24,7 +24,7 @@ func toSessionDomain(value adminSessionModel) admin.Session {
 
 func toAccountDomain(value accountModel) account.Credential {
 	var expiresAt time.Time
-	var refreshDueAt, lastRefreshAt *time.Time
+	var refreshDueAt, lastRefreshAt, credentialUpdatedAt *time.Time
 	var refreshFailures int
 	var refreshUnclassifiedAuthFailures int
 	var lastRefreshErrorStatus int
@@ -36,6 +36,7 @@ func toAccountDomain(value accountModel) account.Credential {
 	var clientID, encryptedPrimary, encryptedRefresh, encryptedCloudflareCookie string
 	var consoleAPIKeyID, encryptedConsoleWorkOSSession string
 	if value.Credential != nil {
+		credentialUpdatedAt = &value.Credential.UpdatedAt
 		consoleAPIKeyID = value.Credential.ConsoleAPIKeyID
 		encryptedConsoleWorkOSSession = value.Credential.EncryptedConsoleWorkOSSession
 		authType = account.AuthType(value.Credential.AuthType)
@@ -85,7 +86,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		UserID: value.UserID, TeamID: value.TeamID, SourceKey: value.SourceKey, OIDCClientID: clientID,
 		EncryptedAccessToken: encryptedPrimary, EncryptedRefreshToken: encryptedRefresh, EncryptedCloudflareCookie: encryptedCloudflareCookie,
 		ConsoleAPIKeyID: consoleAPIKeyID, EncryptedConsoleWorkOSSession: encryptedConsoleWorkOSSession,
-		ExpiresAt: expiresAt, RefreshDueAt: refreshDueAt, LastRefreshAt: lastRefreshAt,
+		ExpiresAt: expiresAt, RefreshDueAt: refreshDueAt, LastRefreshAt: lastRefreshAt, CredentialUpdatedAt: credentialUpdatedAt,
 		RefreshFailureCount: refreshFailures, RefreshUnclassifiedAuthCount: refreshUnclassifiedAuthFailures, LastRefreshErrorStatus: lastRefreshErrorStatus, LastRefreshErrorCode: lastRefreshError, LastRefreshErrorMessage: lastRefreshErrorMessage, LastRefreshErrorResponse: lastRefreshErrorResponse, RefreshPermanent: refreshPermanent,
 		Enabled: value.Enabled, AuthStatus: account.AuthStatus(value.AuthStatus), ReauthMarkedAt: value.ReauthMarkedAt, Priority: value.Priority,
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,

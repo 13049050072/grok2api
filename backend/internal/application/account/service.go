@@ -1419,6 +1419,125 @@ func (s *Service) ImportConsoleCredentialDocumentsWithProgress(ctx context.Conte
 	return s.importCredentialDocumentsWithProgress(ctx, adapter, documents, observer, progress)
 }
 
+type uniqueCredentialReplacer interface {
+	ReplaceCredentialIfUnique(context.Context, uint64, string, string, string, accountdomain.Credential) error
+}
+
+type uniqueCredentialCreator interface {
+	CreateCredentialIfAbsent(context.Context, string, string, string, accountdomain.Credential) (uint64, error)
+}
+
+func (s *Service) CredentialNeedsReauth(ctx context.Context, id uint64) (bool, error) {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return value.AuthStatus == accountdomain.AuthStatusReauthRequired, nil
+}
+
+// ValidateReplacedCredential verifies rejected accounts before returning them to scheduling.
+func (s *Service) ValidateReplacedCredential(ctx context.Context, id uint64) error {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if value.AuthStatus != accountdomain.AuthStatusReauthRequired {
+		return nil
+	}
+	if value.Provider == accountdomain.ProviderBuild {
+		if value.EncryptedRefreshToken == "" {
+			return fmt.Errorf("缺少可验证的刷新凭据")
+		}
+		_, err = s.ensureCredential(ctx, value, ensureCredentialOptions{force: true, bypassCooldown: true, retryPermanentOnce: true})
+		return err
+	}
+	if s.providers == nil {
+		return ErrUnsupported
+	}
+	adapter, ok := s.providers.AccountIdentity(value.Provider)
+	if !ok {
+		return ErrUnsupported
+	}
+	identity, err := adapter.SyncAccountIdentity(ctx, value)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(identity.UserID) == "" || strings.TrimSpace(identity.UserID) != strings.TrimSpace(value.UserID) || (strings.TrimSpace(identity.Email) != "" && !strings.EqualFold(strings.TrimSpace(identity.Email), strings.TrimSpace(value.Email))) {
+		return fmt.Errorf("上游验证返回的身份不一致")
+	}
+	activator, ok := s.accounts.(interface {
+		ActivateCredentialIfUnchanged(context.Context, uint64, string, string) error
+	})
+	if !ok {
+		return ErrUnsupported
+	}
+	return activator.ActivateCredentialIfUnchanged(ctx, id, value.EncryptedAccessToken, value.EncryptedRefreshToken)
+}
+
+// ReplaceExistingCredential updates only a uniquely identified account, keeping its ID and links.
+func (s *Service) ReplaceExistingCredential(ctx context.Context, id uint64, providerValue accountdomain.Provider, email, userID, teamID string, document []byte) error {
+	if id == 0 {
+		return invalidInput("账号 ID 无效")
+	}
+	value, err := s.parseUniqueCredential(providerValue, email, userID, teamID, document)
+	if err != nil {
+		return err
+	}
+	replacer, ok := s.accounts.(uniqueCredentialReplacer)
+	if !ok {
+		return ErrUnsupported
+	}
+	if err := replacer.ReplaceCredentialIfUnique(ctx, id, email, userID, teamID, value); err != nil {
+		return mapRepositoryError(err)
+	}
+	s.reconcileProviderLinksBestEffort(ctx, id)
+	s.WakeCredentialRefresh()
+	return nil
+}
+
+func (s *Service) CreateUniqueCredential(ctx context.Context, providerValue accountdomain.Provider, email, userID, teamID string, document []byte) (uint64, error) {
+	value, err := s.parseUniqueCredential(providerValue, email, userID, teamID, document)
+	if err != nil {
+		return 0, err
+	}
+	creator, ok := s.accounts.(uniqueCredentialCreator)
+	if !ok {
+		return 0, ErrUnsupported
+	}
+	id, err := creator.CreateCredentialIfAbsent(ctx, email, userID, teamID, value)
+	if err != nil {
+		return 0, mapRepositoryError(err)
+	}
+	s.reconcileProviderLinksBestEffort(ctx, id)
+	s.WakeCredentialRefresh()
+	return id, nil
+}
+
+func (s *Service) parseUniqueCredential(providerValue accountdomain.Provider, email, userID, teamID string, document []byte) (accountdomain.Credential, error) {
+	if strings.TrimSpace(email) == "" || strings.TrimSpace(userID) == "" || strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(userID)) || len(document) == 0 || len(document) > 1<<20 {
+		return accountdomain.Credential{}, invalidInput("缺少账号身份或凭据文件无效")
+	}
+	if providerValue != accountdomain.ProviderBuild && providerValue != accountdomain.ProviderWeb && providerValue != accountdomain.ProviderConsole {
+		return accountdomain.Credential{}, invalidInput("账号类型无效")
+	}
+	if s.providers == nil {
+		return accountdomain.Credential{}, ErrUnsupported
+	}
+	codec, ok := s.providers.CredentialCodec(providerValue)
+	if !ok {
+		return accountdomain.Credential{}, ErrUnsupported
+	}
+	seeds, err := codec.ParseImportedCredentials(document)
+	if err != nil || len(seeds) != 1 {
+		return accountdomain.Credential{}, fmt.Errorf("%w: 凭据文件必须包含一个有效账号", ErrInvalidImport)
+	}
+	seed := seeds[0]
+	if seed.Provider != providerValue || !strings.EqualFold(strings.TrimSpace(seed.Email), strings.TrimSpace(email)) || strings.TrimSpace(seed.UserID) != strings.TrimSpace(userID) || strings.TrimSpace(seed.TeamID) != strings.TrimSpace(teamID) {
+		return accountdomain.Credential{}, fmt.Errorf("%w: 导入文件身份与目标账号不一致", ErrConflict)
+	}
+	return s.credentialFromSeed(seed)
+}
+
 func (s *Service) importCredentialDocumentsWithProgress(ctx context.Context, adapter provider.CredentialCodecAdapter, documents [][]byte, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
 	if len(documents) == 0 {
 		return ImportResult{}, fmt.Errorf("%w: 没有可导入的账号文件", ErrInvalidImport)
@@ -1559,11 +1678,23 @@ func reportCredentialImportProgress(progress BatchProgressObserver, completed, t
 	}
 }
 
+func (s *Service) upsertImportedCredentialsSafely(ctx context.Context, values []accountdomain.Credential) ([]repository.AccountUpsertResult, error) {
+	repo, ok := s.accounts.(interface {
+		UpsertImportedCredentialsSafely(context.Context, []accountdomain.Credential) ([]repository.AccountUpsertResult, error)
+	})
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	return repo.UpsertImportedCredentialsSafely(ctx, values)
+}
+
 func (s *Service) persistImportedSeed(ctx context.Context, seed provider.CredentialSeed) (repository.AccountUpsertResult, error) {
 	value, err := s.credentialFromSeed(seed)
 	if err != nil {
 		return repository.AccountUpsertResult{}, err
 	}
+	// The refresh token may already have rotated; do not reject its new value
+	// after exchange until a durable staging/recovery mechanism is available.
 	stored, err := s.accounts.UpsertManyByIdentity(ctx, []accountdomain.Credential{value})
 	if err != nil {
 		return repository.AccountUpsertResult{}, err
@@ -1596,7 +1727,7 @@ func (s *Service) persistImportedSeedsFromProgress(ctx context.Context, seeds []
 			}
 			values = append(values, value)
 		}
-		stored, err := s.accounts.UpsertManyByIdentity(ctx, values)
+		stored, err := s.upsertImportedCredentialsSafely(ctx, values)
 		if err != nil {
 			return ImportResult{}, err
 		}
@@ -2566,7 +2697,17 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 			botFlagSource = metadata.BuildBotFlagSource
 		}
 		persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
-		updated, err := s.accounts.UpdateTokens(persistCtx, latest.ID, refreshed.EncryptedAccessToken, refreshed.EncryptedRefreshToken, refreshed.ExpiresAt, botFlagSource)
+		var updated accountdomain.Credential
+		if guarded, ok := s.accounts.(interface {
+			UpdateTokensIfUnchanged(context.Context, uint64, string, string, string, string, time.Time, int) (accountdomain.Credential, error)
+		}); ok {
+			updated, err = guarded.UpdateTokensIfUnchanged(persistCtx, latest.ID, latest.EncryptedAccessToken, latest.EncryptedRefreshToken, refreshed.EncryptedAccessToken, refreshed.EncryptedRefreshToken, refreshed.ExpiresAt, botFlagSource)
+			if errors.Is(err, repository.ErrConflict) {
+				updated, err = s.accounts.Get(persistCtx, latest.ID)
+			}
+		} else {
+			updated, err = s.accounts.UpdateTokens(persistCtx, latest.ID, refreshed.EncryptedAccessToken, refreshed.EncryptedRefreshToken, refreshed.ExpiresAt, botFlagSource)
+		}
 		cancelPersist()
 		if err != nil {
 			s.logger.Error("credential_refresh_token_write_failed",
@@ -2720,12 +2861,35 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	} else if permanent {
 		retryAt = now
 	}
-	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, repository.CredentialRefreshFailure{
+	failure := repository.CredentialRefreshFailure{
 		Count: failureCount, UnclassifiedAuthFailureCount: unclassifiedAuthFailureCount,
 		RetryAt: retryAt, Status: errorStatus, Code: errorCode,
 		Message: errorMessage, Response: errorResponse, Permanent: permanent,
-	}); err != nil {
-		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", err)
+	}
+	reason := ""
+	if permanent && !accessTokenAlive {
+		reason = "OAuth refresh failed: " + errorCode
+	} else if requiresReauth {
+		reason = "OAuth refresh repeatedly rejected without a classifiable error"
+	}
+	guarded, guardedOK := s.accounts.(interface {
+		RecordRefreshFailureIfUnchanged(context.Context, uint64, string, string, repository.CredentialRefreshFailure, string) error
+	})
+	var writeErr error
+	if guardedOK {
+		writeErr = guarded.RecordRefreshFailureIfUnchanged(ctx, credential.ID, credential.EncryptedAccessToken, credential.EncryptedRefreshToken, failure, reason)
+		if errors.Is(writeErr, repository.ErrConflict) {
+			return
+		}
+		if writeErr == nil && reason != "" && s.sticky != nil {
+			_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+		}
+	} else {
+		writeErr = s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, failure)
+	}
+	if writeErr != nil {
+		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", writeErr)
+		return
 	}
 	s.logger.Warn("credential_refresh_failed",
 		"account_id", credential.ID,
@@ -2752,15 +2916,19 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		return
 	}
 	if permanent {
-		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh failed: "+errorCode); err != nil {
-			s.logger.Warn("credential_refresh_reauth_mark_failed", "account_id", credential.ID, "error", err)
+		if !guardedOK {
+			if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh failed: "+errorCode); err != nil {
+				s.logger.Warn("credential_refresh_reauth_mark_failed", "account_id", credential.ID, "error", err)
+			}
 		}
 		return
 	}
 	if requiresReauth {
-		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh repeatedly rejected without a classifiable error"); err != nil {
-			s.logger.Warn("credential_refresh_unclassified_reauth_mark_failed", "account_id", credential.ID, "error", err)
-			return
+		if !guardedOK {
+			if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh repeatedly rejected without a classifiable error"); err != nil {
+				s.logger.Warn("credential_refresh_unclassified_reauth_mark_failed", "account_id", credential.ID, "error", err)
+				return
+			}
 		}
 		s.logger.Warn("credential_refresh_unclassified_reauth_required",
 			"account_id", credential.ID,

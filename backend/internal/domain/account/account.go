@@ -169,6 +169,7 @@ type Credential struct {
 	ExpiresAt                     time.Time
 	RefreshDueAt                  *time.Time
 	LastRefreshAt                 *time.Time
+	CredentialUpdatedAt           *time.Time
 	RefreshFailureCount           int
 	// RefreshUnclassifiedAuthCount counts consecutive OAuth 400/401 rejections
 	// that cannot be classified from a machine-readable error code.

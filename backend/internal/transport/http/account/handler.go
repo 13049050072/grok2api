@@ -140,6 +140,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
 	router.POST("/accounts/import", h.importAuth)
+	router.POST("/accounts/import-unique", h.importUniqueCredential)
 	router.POST("/accounts/web/import", h.importWebAuth)
 	router.POST("/accounts/console/import", h.importConsoleAuth)
 	router.POST("/accounts/web/convert-to-build", h.convertWebToBuild)
@@ -168,6 +169,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/:id/clear-cooldown", h.clearCooldown)
 	router.POST("/accounts/:id/refresh-token", h.refreshToken)
 	router.POST("/accounts/:id/refresh-billing", h.refreshBilling)
+	router.POST("/accounts/:id/replace-credential", h.replaceCredential)
 	router.POST("/accounts/:id/refresh-quota", h.refreshWebQuota)
 }
 
@@ -181,6 +183,14 @@ type updateRequest struct {
 	ClearCloudflareCookies bool                          `json:"clearCloudflareCookies"`
 	BuildSuperEntitled     *bool                         `json:"buildSuperEntitled"`
 	BuildRouteMode         *accountdomain.BuildRouteMode `json:"buildRouteMode"`
+}
+
+type replaceCredentialRequest struct {
+	Provider string          `json:"provider" binding:"required"`
+	Email    string          `json:"email" binding:"required"`
+	UserID   string          `json:"userId" binding:"required"`
+	TeamID   string          `json:"teamId"`
+	Document json.RawMessage `json:"document" binding:"required"`
 }
 
 type batchUpdateRequest struct {
@@ -297,6 +307,7 @@ type accountResponse struct {
 	Refreshable                bool                    `json:"refreshable"`
 	RefreshDueAt               *time.Time              `json:"refreshDueAt,omitempty"`
 	LastRefreshAt              *time.Time              `json:"lastRefreshAt,omitempty"`
+	CredentialUpdatedAt        *time.Time              `json:"credentialUpdatedAt,omitempty"`
 	RefreshFailures            int                     `json:"refreshFailureCount"`
 	LastRefreshErrorStatus     int                     `json:"lastRefreshErrorStatus,omitempty"`
 	LastRefreshError           string                  `json:"lastRefreshErrorCode,omitempty"`
@@ -1238,6 +1249,46 @@ func (h *Handler) syncInitial(ctx context.Context, accountIDs ...uint64) account
 	return h.sync.Sync(ctx, accountIDs...)
 }
 
+func (h *Handler) importUniqueCredential(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+	var request replaceCredentialRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	id, err := h.service.CreateUniqueCredential(c.Request.Context(), accountdomain.Provider(request.Provider), request.Email, request.UserID, request.TeamID, request.Document)
+	if err != nil {
+		h.writeServiceError(c, "credentialCreateFailed", err, http.StatusInternalServerError, "创建账号凭据失败")
+		return
+	}
+	syncResult := h.syncInitial(c.Request.Context(), id)
+	response.Success(c, http.StatusOK, gin.H{"accountId": strconv.FormatUint(id, 10), "created": 1, "updated": 0, "synced": syncResult.Succeeded, "syncFailed": syncResult.Failed})
+}
+
+func (h *Handler) replaceCredential(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+	var request replaceCredentialRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	err := h.service.ReplaceExistingCredential(c.Request.Context(), id, accountdomain.Provider(request.Provider), request.Email, request.UserID, request.TeamID, request.Document)
+	if err != nil {
+		h.writeServiceError(c, "credentialReplaceFailed", err, http.StatusInternalServerError, "更新账号凭据失败")
+		return
+	}
+	validationErr := h.service.ValidateReplacedCredential(c.Request.Context(), id)
+	syncResult := h.syncInitial(c.Request.Context(), id)
+	if needsReauth, readErr := h.service.CredentialNeedsReauth(c.Request.Context(), id); validationErr != nil || readErr != nil || needsReauth {
+		syncResult.Failed++
+	}
+	response.Success(c, http.StatusOK, gin.H{"accountId": strconv.FormatUint(id, 10), "created": 0, "updated": 1, "synced": syncResult.Succeeded, "syncFailed": syncResult.Failed})
+}
+
 func (h *Handler) update(c *gin.Context) {
 	id, ok := pathID(c)
 	if !ok {
@@ -1506,7 +1557,7 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		ID: c.ID, Provider: string(c.Provider), AuthType: string(c.AuthType), WebTier: string(c.WebTier),
 		WebTierSyncedAt: c.WebTierSyncedAt, WebNSFWEnabledAt: c.WebNSFWEnabledAt, WebTermsAcceptedAt: c.WebTermsAcceptedAt, Name: c.Name, Email: c.Email, UserID: c.UserID, TeamID: c.TeamID,
 		Enabled: c.Enabled, AuthStatus: string(c.AuthStatus), Refreshable: c.EncryptedRefreshToken != "",
-		RefreshDueAt: c.RefreshDueAt, LastRefreshAt: c.LastRefreshAt,
+		RefreshDueAt: c.RefreshDueAt, LastRefreshAt: c.LastRefreshAt, CredentialUpdatedAt: c.CredentialUpdatedAt,
 		RefreshFailures: c.RefreshFailureCount, LastRefreshErrorStatus: c.LastRefreshErrorStatus, LastRefreshError: c.LastRefreshErrorCode, LastRefreshErrorMessage: c.LastRefreshErrorMessage, LastRefreshErrorResponse: c.LastRefreshErrorResponse,
 		Priority: c.Priority, MaxConcurrent: c.MaxConcurrent, MinimumRemaining: c.MinimumRemaining,
 		FailureCount: c.FailureCount, CooldownUntil: c.CooldownUntil, LastError: c.LastError,

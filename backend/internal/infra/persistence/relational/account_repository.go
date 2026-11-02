@@ -1255,6 +1255,9 @@ func linkedWebEgressIdentity(stored, sourceKey string) string {
 func (r *AccountRepository) UpsertByIdentity(ctx context.Context, value account.Credential) (account.Credential, bool, error) {
 	var result repository.AccountUpsertResult
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
 		var err error
 		result, err = upsertAccountByIdentity(tx, value)
 		return err
@@ -1273,6 +1276,9 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 	}
 	results := make([]repository.AccountUpsertResult, len(values))
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
 		identityKeys := make([]string, 0, len(values))
 		sourceKeysByProvider := make(map[account.Provider][]string)
 		for _, value := range values {
@@ -1378,6 +1384,16 @@ func providerSourceLookupKey(providerValue, sourceKey string) string {
 func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existing *accountModel) (repository.AccountUpsertResult, accountModel, error) {
 	row := fromAccountDomain(value)
 	if existing != nil {
+		row.IdentityKey = existing.IdentityKey
+		if strings.TrimSpace(row.Email) == "" {
+			row.Email = existing.Email
+		}
+		if strings.TrimSpace(row.UserID) == "" {
+			row.UserID = existing.UserID
+		}
+		if strings.TrimSpace(row.TeamID) == "" {
+			row.TeamID = existing.TeamID
+		}
 		if value.EncryptedCloudflareCookie == "" || value.ConsoleAPIKeyID == "" || value.EncryptedConsoleWorkOSSession == "" {
 			var storedCredential accountCredentialModel
 			if err := tx.Where("account_id = ?", existing.ID).First(&storedCredential).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1451,6 +1467,150 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		return repository.AccountUpsertResult{}, accountModel{}, err
 	}
 	return repository.AccountUpsertResult{ID: row.ID, Created: true}, row, nil
+}
+
+// UpsertImportedCredentialsSafely refuses ambiguous identity matches in one
+// transaction, including duplicates created earlier in the same batch.
+func (r *AccountRepository) UpsertImportedCredentialsSafely(ctx context.Context, values []account.Credential) ([]repository.AccountUpsertResult, error) {
+	results := make([]repository.AccountUpsertResult, 0, len(values))
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
+		for _, value := range values {
+			email, uid, team := strings.TrimSpace(value.Email), strings.TrimSpace(value.UserID), strings.TrimSpace(value.TeamID)
+			var rows []accountModel
+			if err := tx.Where("provider = ? AND (source_key = ? OR (? <> '' AND lower(trim(email)) = ?) OR (? <> '' AND trim(user_id) = ? AND COALESCE(trim(team_id), '') = ?))", string(value.Provider), value.SourceKey, email, strings.ToLower(email), uid, uid, team).Find(&rows).Error; err != nil {
+				return err
+			}
+			if len(rows) > 1 {
+				return fmt.Errorf("%w: 同一账号存在多条候选记录，请先检查重复账号", repository.ErrConflict)
+			}
+			var current *accountModel
+			if len(rows) == 1 {
+				row := rows[0]
+				if (email != "" && row.Email != "" && !strings.EqualFold(email, strings.TrimSpace(row.Email))) || (uid != "" && row.UserID != "" && uid != strings.TrimSpace(row.UserID)) || (team != "" && row.TeamID != "" && team != strings.TrimSpace(row.TeamID)) {
+					return fmt.Errorf("%w: 已有账号的邮箱、用户 ID 或团队不一致", repository.ErrConflict)
+				}
+				if row.SourceKey != value.SourceKey && (email == "" || uid == "" || strings.TrimSpace(row.Email) == "" || strings.TrimSpace(row.UserID) == "" || strings.EqualFold(email, uid)) {
+					return fmt.Errorf("%w: 匹配记录缺少可确认的账号身份", repository.ErrConflict)
+				}
+				current = &row
+			}
+			result, _, err := upsertKnownAccountByIdentity(tx, value, current)
+			if err != nil {
+				return err
+			}
+			results = append(results, result)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	for _, value := range values {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider})
+	}
+	return results, nil
+}
+
+// CreateCredentialIfAbsent refuses ambiguous or existing identities under the account mutation lock.
+func (r *AccountRepository) CreateCredentialIfAbsent(ctx context.Context, email, userID, teamID string, value account.Credential) (uint64, error) {
+	var id uint64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
+		if strings.TrimSpace(email) == "" || strings.TrimSpace(userID) == "" || !strings.EqualFold(strings.TrimSpace(value.Email), strings.TrimSpace(email)) || strings.TrimSpace(value.UserID) != strings.TrimSpace(userID) || strings.TrimSpace(value.TeamID) != strings.TrimSpace(teamID) || strings.TrimSpace(value.SourceKey) == "" || strings.TrimSpace(value.EncryptedAccessToken) == "" {
+			return repository.ErrInvalidRecord
+		}
+		var ambiguous int64
+		if err := tx.Model(&accountModel{}).Where("provider = ? AND (((email IS NULL OR trim(email) = '') AND (user_id IS NULL OR trim(user_id) = '' OR lower(trim(user_id)) = ?)) OR lower(trim(email)) = ? OR (COALESCE(trim(user_id), '') = ? AND COALESCE(trim(team_id), '') = ?) OR source_key = ?)", string(value.Provider), strings.ToLower(strings.TrimSpace(email)), strings.ToLower(strings.TrimSpace(email)), strings.TrimSpace(userID), strings.TrimSpace(teamID), value.SourceKey).Count(&ambiguous).Error; err != nil {
+			return err
+		}
+		if ambiguous != 0 {
+			return fmt.Errorf("%w: 远程账号已存在或身份不完整", repository.ErrConflict)
+		}
+		result, _, err := upsertKnownAccountByIdentity(tx, value, nil)
+		if err != nil {
+			return err
+		}
+		id = result.ID
+		return nil
+	})
+	if err != nil {
+		return 0, mapError(err)
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider, AccountID: id})
+	return id, nil
+}
+
+// ReplaceCredentialIfUnique targets an existing account without relying on its immutable identity key.
+func (r *AccountRepository) ReplaceCredentialIfUnique(ctx context.Context, id uint64, email, userID, teamID string, value account.Credential) error {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
+		var target accountModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&target, id).Error; err != nil {
+			return mapError(err)
+		}
+		if target.Provider != string(value.Provider) || !strings.EqualFold(strings.TrimSpace(target.Email), strings.TrimSpace(email)) || strings.TrimSpace(email) == "" || strings.TrimSpace(userID) == "" || strings.TrimSpace(target.UserID) != strings.TrimSpace(userID) || strings.TrimSpace(target.TeamID) != strings.TrimSpace(teamID) {
+			return fmt.Errorf("%w: 远程账号身份已变化或不匹配", repository.ErrConflict)
+		}
+		if !strings.EqualFold(strings.TrimSpace(value.Email), strings.TrimSpace(email)) || strings.TrimSpace(value.UserID) != strings.TrimSpace(userID) || strings.TrimSpace(value.TeamID) != strings.TrimSpace(teamID) {
+			return fmt.Errorf("%w: 新凭据身份不匹配", repository.ErrConflict)
+		}
+		var matches int64
+		if err := tx.Model(&accountModel{}).Where("provider = ? AND lower(trim(email)) = ?", target.Provider, strings.ToLower(strings.TrimSpace(email))).Count(&matches).Error; err != nil {
+			return err
+		}
+		if matches != 1 {
+			return fmt.Errorf("%w: 同一类型的邮箱不唯一", repository.ErrConflict)
+		}
+		var anonymous int64
+		if err := tx.Model(&accountModel{}).Where("provider = ? AND (email IS NULL OR trim(email) = '') AND (user_id IS NULL OR trim(user_id) = '' OR lower(trim(user_id)) = ? OR (trim(user_id) = ? AND COALESCE(trim(team_id), '') = ?))", target.Provider, strings.ToLower(strings.TrimSpace(email)), strings.TrimSpace(userID), strings.TrimSpace(teamID)).Count(&anonymous).Error; err != nil {
+			return err
+		}
+		if anonymous != 0 {
+			return fmt.Errorf("%w: 存在缺少邮箱的账号，无法排除重复", repository.ErrConflict)
+		}
+		if strings.TrimSpace(value.SourceKey) == "" || strings.TrimSpace(value.EncryptedAccessToken) == "" {
+			return repository.ErrInvalidRecord
+		}
+		var sourceConflicts int64
+		if err := tx.Model(&accountModel{}).Where("provider = ? AND source_key = ? AND id <> ?", target.Provider, value.SourceKey, id).Count(&sourceConflicts).Error; err != nil {
+			return err
+		}
+		if sourceConflicts != 0 {
+			return fmt.Errorf("%w: 新凭据已属于其他账号", repository.ErrConflict)
+		}
+		value.ID = id
+		credential := fromAccountCredentialDomain(value)
+		updates := map[string]any{"auth_type": credential.AuthType, "client_id": credential.ClientID,
+			"encrypted_primary": credential.EncryptedPrimary, "encrypted_refresh": credential.EncryptedRefresh,
+			"expires_at": credential.ExpiresAt, "refresh_due_at": credential.RefreshDueAt,
+			"refresh_failures": 0, "refresh_unclassified_auth_failures": 0,
+			"last_refresh_error_status": 0, "last_refresh_error": "", "last_refresh_error_message": "", "last_refresh_error_response": "", "refresh_permanent": false,
+			"updated_at": time.Now().UTC()}
+		if value.Provider == account.ProviderConsole {
+			updates["console_api_key_id"] = ""
+			updates["encrypted_console_workos_session"] = ""
+		}
+		result := tx.Model(&accountCredentialModel{}).Where("account_id = ? AND auth_type = ?", id, credential.AuthType).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return repository.ErrNotFound
+		}
+		return tx.Model(&accountModel{}).Where("id = ?", id).Update("source_key", value.SourceKey).Error
+	})
+	if err != nil {
+		return mapError(err)
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider, AccountID: id})
+	return nil
 }
 
 func (r *AccountRepository) Update(ctx context.Context, value account.Credential) (account.Credential, error) {
@@ -2058,6 +2218,14 @@ func applyAssociationFilter(query *gorm.DB, providerValue, association string) *
 }
 
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time, buildBotFlagSource int) (account.Credential, error) {
+	return r.updateTokens(ctx, id, nil, nil, accessToken, refreshToken, expiresAt, buildBotFlagSource)
+}
+
+func (r *AccountRepository) UpdateTokensIfUnchanged(ctx context.Context, id uint64, expectedAccess, expectedRefresh, accessToken, refreshToken string, expiresAt time.Time, buildBotFlagSource int) (account.Credential, error) {
+	return r.updateTokens(ctx, id, &expectedAccess, &expectedRefresh, accessToken, refreshToken, expiresAt, buildBotFlagSource)
+}
+
+func (r *AccountRepository) updateTokens(ctx context.Context, id uint64, expectedAccess, expectedRefresh *string, accessToken, refreshToken string, expiresAt time.Time, buildBotFlagSource int) (account.Credential, error) {
 	now := time.Now().UTC()
 	refreshDueAt := account.CredentialRefreshDueAt(id, expiresAt)
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -2073,8 +2241,16 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 		if refreshToken != "" {
 			updates["encrypted_refresh"] = refreshToken
 		}
-		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(updates).Error; err != nil {
-			return err
+		query := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id)
+		if expectedAccess != nil && expectedRefresh != nil {
+			query = query.Where("encrypted_primary = ? AND encrypted_refresh = ?", *expectedAccess, *expectedRefresh)
+		}
+		result := query.Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return repository.ErrConflict
 		}
 		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": "", "reauth_marked_at": nil}).Error
 	}); err != nil {
@@ -2188,6 +2364,63 @@ func (r *AccountRepository) UpdateCredentialRefreshFailure(ctx context.Context, 
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, AccountID: id})
 	}
 	return err
+}
+
+// RecordRefreshFailureIfUnchanged commits failure and reauth state together only
+// when the credential that was sent upstream is still current.
+func (r *AccountRepository) RecordRefreshFailureIfUnchanged(ctx context.Context, id uint64, expectedAccess, expectedRefresh string, failure repository.CredentialRefreshFailure, reason string) error {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").First(&row, id).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&accountCredentialModel{}).Where("account_id = ? AND encrypted_primary = ? AND encrypted_refresh = ?", id, expectedAccess, expectedRefresh).Updates(map[string]any{
+			"refresh_due_at": failure.RetryAt.UTC(), "refresh_failures": max(0, failure.Count),
+			"refresh_unclassified_auth_failures": max(0, failure.UnclassifiedAuthFailureCount),
+			"last_refresh_error_status":          max(0, failure.Status), "last_refresh_error": truncate(failure.Code, 100),
+			"last_refresh_error_message": truncate(failure.Message, 512), "last_refresh_error_response": truncate(failure.Response, 4096),
+			"refresh_permanent": failure.Permanent, "updated_at": time.Now().UTC(),
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return repository.ErrConflict
+		}
+		if reason != "" {
+			now := time.Now().UTC()
+			return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusReauthRequired), "last_error": truncate(reason, 512), "reauth_marked_at": gorm.Expr("COALESCE(reauth_marked_at, ?)", now)}).Error
+		}
+		return nil
+	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, AccountID: id})
+	}
+	return mapError(err)
+}
+
+func (r *AccountRepository) ActivateCredentialIfUnchanged(ctx context.Context, id uint64, expectedAccess, expectedRefresh string) error {
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").First(&row, id).Error; err != nil {
+			return err
+		}
+		var credential accountCredentialModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("account_id = ?", id).First(&credential).Error; err != nil {
+			return err
+		}
+		if credential.EncryptedPrimary != expectedAccess || credential.EncryptedRefresh != expectedRefresh {
+			return repository.ErrConflict
+		}
+		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(map[string]any{"refresh_failures": 0, "refresh_unclassified_auth_failures": 0, "refresh_permanent": false, "last_refresh_error_status": 0, "last_refresh_error": "", "last_refresh_error_message": "", "last_refresh_error_response": ""}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": "", "reauth_marked_at": nil}).Error
+	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, AccountID: id})
+	}
+	return mapError(err)
 }
 
 func (r *AccountRepository) UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error {
