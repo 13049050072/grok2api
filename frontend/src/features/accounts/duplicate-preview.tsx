@@ -31,6 +31,22 @@ function date(value?: string): string {
   return new Date(value).toLocaleString();
 }
 
+function autoDeleteCandidate(items: AccountDTO[]): AccountDTO | undefined {
+  const users = new Set(items.map((item) => item.userId?.trim()).filter(Boolean));
+  const teams = new Set(items.map((item) => item.teamId?.trim()).filter(Boolean));
+  if (items.some((item) => !item.userId?.trim()) || users.size !== 1 || teams.size > 1) return undefined;
+  return [...items].sort((a, b) => {
+    const links = (a.linkedAccounts?.length ?? 0) - (b.linkedAccounts?.length ?? 0);
+    if (links) return links;
+    const health = Number(a.enabled && a.authStatus === "active") - Number(b.enabled && b.authStatus === "active");
+    if (health) return health;
+    const updatedA = Date.parse(a.credentialUpdatedAt ?? "");
+    const updatedB = Date.parse(b.credentialUpdatedAt ?? "");
+    if (Number.isFinite(updatedA) && Number.isFinite(updatedB) && updatedA !== updatedB) return updatedA - updatedB;
+    return a.id.localeCompare(b.id, undefined, { numeric: true });
+  })[0];
+}
+
 export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
@@ -68,7 +84,19 @@ export function DuplicatePreview({ provider }: { provider: AccountProvider }) {
         {query.isError ? <p className="text-destructive">检查失败：{query.error.message} <Button size="sm" variant="secondary" onClick={() => void query.refetch()}>重试</Button></p> : null}
         {query.isSuccess ? <>
           <p className="text-sm">发现 {duplicates.length} 组同邮箱账号；{missing} 条缺少邮箱，无法按邮箱检查。</p>
-          <div className="flex items-center gap-3"><span className="text-sm">已选 {selected.length} 条</span><Button variant="destructive" size="sm" disabled={!selected.length || query.isFetching} onClick={() => { setTargets([]); setDeleteOpen(true); }}>删除所选</Button></div>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm">已选 {selected.length} 条</span>
+            <Button variant="secondary" size="sm" disabled={!duplicates.length || query.isFetching} onClick={() => setSelected(duplicates.flatMap(([, items]) => items.map((item) => item.id)))}>全选</Button>
+            <Button variant="secondary" size="sm" disabled={!duplicates.length || query.isFetching} onClick={() => {
+              const candidates = duplicates.map(([, items]) => autoDeleteCandidate(items));
+              const skipped = candidates.filter((item) => !item).length;
+              setSelected(candidates.filter((item): item is AccountDTO => Boolean(item)).map((item) => item.id));
+              if (skipped) toast.warning(`${skipped} 组身份不完整或冲突，未自动选择，请手动核对`);
+            }}>自动选择每组一条</Button>
+            <Button variant="secondary" size="sm" disabled={!selected.length || query.isFetching} onClick={() => setSelected([])}>取消选择</Button>
+            <Button variant="destructive" size="sm" disabled={!selected.length || query.isFetching} onClick={() => { setTargets([]); setDeleteOpen(true); }}>删除所选</Button>
+          </div>
+          <p className="text-xs text-muted-foreground">自动选择的是待删除记录：每组最多选一条，优先选关联较少、状态较差的记录；请确认凭据和关联后再删除。</p>
           {duplicates.length === 0 ? <p className="text-sm text-muted-foreground">未发现同邮箱重复记录。</p> : null}
           {duplicates.map(([email, items]) => {
             const userIds = new Set(items.map((item) => item.userId?.trim()).filter(Boolean));
