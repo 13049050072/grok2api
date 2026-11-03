@@ -113,6 +113,24 @@ export async function generateImage(input: {
   return images.map((image) => ({ ...image, url: resolveMediaURL(image.url) }));
 }
 
+export async function editImage(input: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  imageURL: string;
+  aspectRatio: string;
+  signal?: AbortSignal;
+}): Promise<ImageResult[]> {
+  const payload = await publicApiRequest(input.apiKey, "/images/edits", {
+    method: "POST",
+    body: { model: input.model, prompt: input.prompt, image: { url: input.imageURL }, n: 1, aspect_ratio: input.aspectRatio, resolution: "1k", response_format: "url", stream: false },
+    signal: input.signal,
+  });
+  const images = readImages(payload);
+  if (images.length === 0) throw new CreativeApiError(200, "The image response did not contain any images", "invalid_response");
+  return images.map((image) => ({ ...image, url: resolveMediaURL(image.url) }));
+}
+
 export async function createVideo(input: {
   apiKey: string;
   model: string;

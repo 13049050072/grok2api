@@ -18,7 +18,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8000",
-      "/v1": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8000",
+      "/v1": { target: process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8000", ws: true },
       "/healthz": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8000",
       "/readyz": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8000",
     },

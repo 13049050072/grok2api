@@ -113,3 +113,23 @@ func TestBearerTokenAcceptsCaseInsensitiveSchemeAndWhitespace(t *testing.T) {
 		}
 	}
 }
+
+func TestRealtimeBrowserTokenIsLimitedToWebSocketEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		path, method, upgrade, protocol, want string
+	}{
+		{"/v1/realtime", "GET", "websocket", "grok2api-key.g2a_test", "g2a_test"},
+		{"/v1/realtime", "GET", "websocket", "other, grok2api-key.g2a_test", "g2a_test"},
+		{"/v1/realtime", "GET", "", "grok2api-key.g2a_test", ""},
+		{"/v1/stt", "GET", "websocket", "grok2api-key.g2a_test", ""},
+		{"/v1/realtime", "POST", "websocket", "grok2api-key.g2a_test", ""},
+		{"/v1/realtime", "GET", "websocket", "other", ""},
+	} {
+		request := httptest.NewRequest(tc.method, tc.path, nil)
+		request.Header.Set("Upgrade", tc.upgrade)
+		request.Header.Set("Sec-WebSocket-Protocol", tc.protocol)
+		if got := realtimeBrowserToken(request); got != tc.want {
+			t.Errorf("path=%q protocol=%q: got %q, want %q", tc.path, tc.protocol, got, tc.want)
+		}
+	}
+}

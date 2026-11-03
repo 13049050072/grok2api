@@ -22,6 +22,7 @@ import type { ModelRouteDTO } from "@/entities/model/types";
 import {
   createChatResponse,
   createVideo,
+  editImage,
   editVideo,
   extendVideo,
   generateImage,
@@ -39,6 +40,7 @@ import {
   type VideoStatus,
   type VoiceInfo,
 } from "@/features/creative-console/creative-console-api";
+import { RealtimeVoice } from "@/features/creative-console/realtime-voice";
 import { getClientKeySecret, listClientKeys, type ClientKeyDTO } from "@/features/client-keys/client-keys-api";
 import { importVideoInputFromURL, uploadMediaInput } from "@/features/media/media-api";
 import { PageHeader } from "@/shared/components/page-header";
@@ -236,9 +238,9 @@ export function CreativeConsolePage() {
 
         <div className="min-h-0 flex-1">
           <div className="h-full" hidden={mode !== "chat"}><ChatPanel key={effectiveKeyId || "default"} storageScope={effectiveKeyId || "default"} toolbarElement={chatToolbarElement} {...panelProps("chat")} /></div>
-          <div className="h-full" hidden={mode !== "image"}><ImagePanel {...panelProps("image")} /></div>
+          <div className="h-full" hidden={mode !== "image"}><ImagePanel {...panelProps("image")} editModels={uniqueModelsByPublicID(permittedModels.filter((item) => item.capability === "image_edit"))} /></div>
           <div className="h-full" hidden={mode !== "video"}><VideoPanel {...panelProps("video")} /></div>
-          <div className="h-full" hidden={mode !== "voice"}><VoicePanel {...panelProps("voice")} /></div>
+          <div className="h-full" hidden={mode !== "voice"}>{mode === "voice" ? <VoicePanel {...panelProps("voice")} /> : null}</div>
         </div>
       </section>
     </div>
@@ -866,9 +868,17 @@ function ChatPanel({ apiKey, model, modelOptions, onModelChange, storageScope, t
   );
 }
 
-function ImagePanel({ apiKey, model, modelOptions, onModelChange }: CreativePanelProps) {
+function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: CreativePanelProps & { editModels: ModelRouteDTO[] }) {
   const { t } = useTranslation();
   const [prompt, setPrompt] = useState("");
+  const [action, setAction] = useState<"generate" | "edit">("generate");
+  const [editModel, setEditModel] = useState("");
+  const [sourceImage, setSourceImage] = useState<{ name: string; url: string } | null>(null);
+  const [sourceError, setSourceError] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectionVersionRef = useRef(0);
+  const activeEditModel = editModels.some((item) => item.publicId === editModel) ? editModel : editModels[0]?.publicId ?? "";
+  const activeModel = action === "edit" ? activeEditModel : model;
   const [count, setCount] = useState("1");
   const [aspectRatio, setAspectRatio] = useState("1:1");
   const [resolution, setResolution] = useState("1k");
@@ -877,22 +887,24 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const supportsQuality = model.toLowerCase().endsWith("grok-imagine-image-2.0");
 
   const mutation = useMutation({
-    mutationFn: (request: Parameters<typeof generateImage>[0]) => generateImage(request),
+    mutationFn: (request: { model: string; imageURL?: string }) => request.imageURL
+      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageURL: request.imageURL, aspectRatio })
+      : generateImage({ apiKey, model: request.model, prompt: prompt.trim(), count: Number(count), aspectRatio, resolution, quality: supportsQuality ? quality : undefined }),
     onSuccess: setImages,
   });
 
   function submit(event: FormEvent): void {
     event.preventDefault();
-    if (!apiKey || !model || !prompt.trim() || mutation.isPending) return;
+    if (!apiKey || !activeModel || !prompt.trim() || mutation.isPending || (action === "edit" && !sourceImage)) return;
     mutation.reset();
-    mutation.mutate({ apiKey, model, prompt: prompt.trim(), count: Number(count), aspectRatio, resolution, quality: supportsQuality ? quality : undefined });
+    mutation.mutate({ model: activeModel, imageURL: action === "edit" ? sourceImage?.url : undefined });
   }
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="min-h-0 flex-1 overflow-y-auto py-6">
         <div className="flex min-h-full w-full flex-col justify-center px-3 sm:px-6">
-          {images.length === 0 && !mutation.isPending ? <WelcomeState title={t("creativeConsole.welcomeImage")} /> : null}
+          {images.length === 0 && !mutation.isPending ? <WelcomeState title={t(action === "edit" ? "creativeConsole.welcomeImageEdit" : "creativeConsole.welcomeImage")} /> : null}
           {mutation.isPending ? <LoadingResult text={t("creativeConsole.generatingImage")} /> : null}
           {images.length > 0 ? (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2" aria-live="polite">
@@ -912,18 +924,32 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
 
       <form className="w-full shrink-0 px-3 pb-2 sm:px-6 sm:pb-3" onSubmit={submit}>
         <div className={composerClassName}>
-          <Textarea id="image-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t("creativeConsole.imagePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
+          {action === "edit" && sourceImage ? <div className="flex items-center gap-3 px-4 pt-3"><img src={sourceImage.url} alt={t("creativeConsole.sourceImage")} className="size-14 rounded-lg object-cover" /><span className="min-w-0 flex-1 truncate text-xs">{sourceImage.name}</span><Button type="button" variant="ghost" size="icon" aria-label={t("creativeConsole.clearSourceImage")} onClick={() => { selectionVersionRef.current += 1; setSourceImage(null); setSourceError(""); }}><X /></Button></div> : null}
+          <Textarea id="image-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t(action === "edit" ? "creativeConsole.imageEditPlaceholder" : "creativeConsole.imagePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3">
             <div className="flex min-w-0 flex-wrap items-center gap-1">
-              <CompactModelSelect value={model} models={modelOptions} onChange={onModelChange} />
-              <CompactSelect value={count} options={["1", "2", "3", "4"]} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />
+              <Select value={action} onValueChange={(value) => { setAction(value as "generate" | "edit"); mutation.reset(); }}><SelectTrigger className="h-8 w-auto gap-1 border-0 bg-transparent text-xs" aria-label={t("creativeConsole.imageAction")}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="generate">{t("creativeConsole.imageGenerateMode")}</SelectItem><SelectItem value="edit">{t("creativeConsole.imageEditMode")}</SelectItem></SelectContent></Select>
+              <CompactModelSelect value={activeModel} models={action === "edit" ? editModels : modelOptions} onChange={action === "edit" ? setEditModel : onModelChange} />
+              {action === "edit" ? <><input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (!file) return;
+                const version = ++selectionVersionRef.current;
+                setSourceImage(null); setSourceError("");
+                if (!file.type.startsWith("image/")) { setSourceError(t("creativeConsole.errors.invalidImage")); return; }
+                const reader = new FileReader();
+                reader.onload = () => { if (version === selectionVersionRef.current && typeof reader.result === "string") setSourceImage({ name: file.name, url: reader.result }); };
+                reader.onerror = () => { if (version === selectionVersionRef.current) setSourceError(t("creativeConsole.imageReadError")); };
+                reader.readAsDataURL(file);
+              }} /><Button type="button" variant="ghost" size="sm" className="h-8" onClick={() => fileInputRef.current?.click()}><ImagePlus />{t("creativeConsole.uploadImage")}</Button></> : <CompactSelect value={count} options={["1", "2", "3", "4"]} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />}
               <CompactSelect value={aspectRatio} options={imageAspectRatios} onChange={setAspectRatio} ariaLabel={t("creativeConsole.aspectRatio")} icon={<TvMinimal />} />
-              <CompactSelect value={resolution} options={imageResolutions} onChange={setResolution} ariaLabel={t("creativeConsole.resolution")} icon={<ImageUpscale />} />
-              {supportsQuality ? <CompactSelect value={quality} options={["low", "medium"]} onChange={(value) => setQuality(value as "low" | "medium")} ariaLabel={t("creativeConsole.quality")} /> : null}
+              {action === "generate" ? <CompactSelect value={resolution} options={imageResolutions} onChange={setResolution} ariaLabel={t("creativeConsole.resolution")} icon={<ImageUpscale />} /> : null}
+              {action === "generate" && supportsQuality ? <CompactSelect value={quality} options={["low", "medium"]} onChange={(value) => setQuality(value as "low" | "medium")} ariaLabel={t("creativeConsole.quality")} /> : null}
             </div>
-            <Button type="submit" size="icon" aria-label={t("creativeConsole.generateImage")} disabled={!apiKey || !model || !prompt.trim() || mutation.isPending}>{mutation.isPending ? <Loader2 className="animate-spin" /> : <ArrowUp />}</Button>
+            <Button type="submit" size="icon" aria-label={t(action === "edit" ? "creativeConsole.imageEditMode" : "creativeConsole.generateImage")} disabled={!apiKey || !activeModel || !prompt.trim() || mutation.isPending || (action === "edit" && !sourceImage)}>{mutation.isPending ? <Loader2 className="animate-spin" /> : <ArrowUp />}</Button>
           </div>
         </div>
+        {sourceError ? <div className="mt-1 px-2 text-[11px] text-destructive">{sourceError}</div> : null}
         {mutation.isError ? <div className="mt-1 px-2 text-[11px] text-destructive">{mutation.error.message}</div> : null}
       </form>
     </div>
@@ -1363,7 +1389,7 @@ function VideoResult({ requestId, status, loading, error, onRetry }: { requestId
 
 function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePanelProps) {
   const { t } = useTranslation();
-  const [subMode, setSubMode] = useState<"tts" | "stt">("tts");
+  const [subMode, setSubMode] = useState<"tts" | "stt" | "realtime">("tts");
   const [prompt, setPrompt] = useState("");
   const [language, setLanguage] = useState("zh");
   const [voiceId, setVoiceId] = useState("eve");
@@ -1377,7 +1403,7 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     const matched = modelOptions.filter((item) => (
       subMode === "tts"
         ? item.capability === "tts" || item.capability === "realtime"
-        : item.capability === "stt"
+        : item.capability === subMode
     ));
     return uniqueModelsByPublicID(matched);
   }, [modelOptions, subMode]);
@@ -1439,9 +1465,9 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto px-1 py-4">
-        {!ttsResult && !sttResult && !busy ? <WelcomeState title={t("creativeConsole.welcomeVoice")} /> : null}
+        {subMode !== "realtime" && !ttsResult && !sttResult && !busy ? <WelcomeState title={t("creativeConsole.welcomeVoice")} /> : null}
         {busy ? <LoadingResult text={subMode === "tts" ? t("creativeConsole.synthesizing") : t("creativeConsole.transcribing")} /> : null}
-        {ttsResult ? (
+        {subMode !== "realtime" && ttsResult ? (
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 rounded-2xl bg-secondary/40 p-4">
             <audio controls src={ttsResult.url} className="w-full" />
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
@@ -1450,7 +1476,7 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
             </div>
           </div>
         ) : null}
-        {sttResult ? (
+        {subMode !== "realtime" && sttResult ? (
           <div className="mx-auto w-full max-w-3xl space-y-3 rounded-2xl bg-secondary/40 p-4">
             <p className="whitespace-pre-wrap text-sm leading-6">{sttResult.text}</p>
             <div className="text-xs text-muted-foreground">
@@ -1465,8 +1491,9 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
         <div className="flex items-center gap-2 px-3 pt-3">
           <Button type="button" size="sm" variant={subMode === "tts" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => setSubMode("tts")}><AudioLines />{t("creativeConsole.synthesize")}</Button>
           <Button type="button" size="sm" variant={subMode === "stt" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => setSubMode("stt")}><Mic />{t("creativeConsole.transcribe")}</Button>
+          <Button type="button" size="sm" variant={subMode === "realtime" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => setSubMode("realtime")}><AudioLines />{t("creativeConsole.realtime")}</Button>
         </div>
-        {subMode === "tts" ? (
+        {subMode === "realtime" ? <RealtimeVoice key={`${apiKey}:${activeModel}`} apiKey={apiKey} model={activeModel} /> : subMode === "tts" ? (
           <Textarea id="voice-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t("creativeConsole.voicePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
         ) : (
           <div className="flex items-center gap-2 px-4 py-3">
@@ -1478,7 +1505,7 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
         <div className="flex items-center justify-between gap-2 px-3 pb-3">
           <div className="flex min-w-0 flex-wrap items-center gap-1">
             <CompactModelSelect value={activeModel} models={filteredModels} onChange={onModelChange} />
-            <CompactSelect value={language} options={languageOptions} onChange={setLanguage} ariaLabel={t("creativeConsole.voiceLanguage")} />
+            {subMode !== "realtime" ? <CompactSelect value={language} options={languageOptions} onChange={setLanguage} ariaLabel={t("creativeConsole.voiceLanguage")} /> : null}
             {subMode === "tts" ? (
               <CompactSelect value={speed} options={speedOptions} onChange={setSpeed} ariaLabel={t("creativeConsole.voiceSpeed")} suffix="x" icon={<Clock3 />} />
             ) : null}
@@ -1495,9 +1522,9 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
               </Select>
             ) : null}
           </div>
-          <Button type="submit" size="icon" aria-label={subMode === "tts" ? t("creativeConsole.synthesize") : t("creativeConsole.transcribe")} disabled={!apiKey || !activeModel || busy || (subMode === "tts" ? !prompt.trim() : !audioFile)}>
+          {subMode !== "realtime" ? <Button type="submit" size="icon" aria-label={subMode === "tts" ? t("creativeConsole.synthesize") : t("creativeConsole.transcribe")} disabled={!apiKey || !activeModel || busy || (subMode === "tts" ? !prompt.trim() : !audioFile)}>
             {busy ? <Loader2 className="animate-spin" /> : <ArrowUp />}
-          </Button>
+          </Button> : null}
         </div>
       </form>
     </div>

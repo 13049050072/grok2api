@@ -20,6 +20,7 @@ const voiceWSMessageLimit = 16 << 20
 var voiceWSUpgrader = clientws.Upgrader{
 	ReadBufferSize:  32 << 10,
 	WriteBufferSize: 32 << 10,
+	Subprotocols:    []string{"grok2api-realtime"},
 	CheckOrigin: func(*http.Request) bool {
 		return true
 	},

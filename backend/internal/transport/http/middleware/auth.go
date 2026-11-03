@@ -95,6 +95,9 @@ func ClientAuth(service *clientkeyapp.Service) gin.HandlerFunc {
 		if !ok {
 			raw = strings.TrimSpace(c.GetHeader("X-API-Key"))
 		}
+		if raw == "" {
+			raw = realtimeBrowserToken(c.Request)
+		}
 		value, release, err := service.Authenticate(c.Request.Context(), raw)
 		if err != nil {
 			writeOpenAIError(c, clientErrorStatus(err), clientErrorCode(err), clientErrorMessage(err))
@@ -104,6 +107,23 @@ func ClientAuth(service *clientkeyapp.Service) gin.HandlerFunc {
 		c.Set(ClientKey, value)
 		c.Next()
 	}
+}
+
+// Browsers cannot set an Authorization header on a WebSocket handshake.
+// Accept the existing client key as a subprotocol only on this endpoint; do
+// not echo the credential back as the negotiated protocol.
+func realtimeBrowserToken(request *http.Request) string {
+	if request.Method != http.MethodGet || request.URL.Path != "/v1/realtime" || !strings.EqualFold(strings.TrimSpace(request.Header.Get("Upgrade")), "websocket") {
+		return ""
+	}
+	const prefix = "grok2api-key."
+	for _, protocol := range strings.Split(request.Header.Get("Sec-WebSocket-Protocol"), ",") {
+		protocol = strings.TrimSpace(protocol)
+		if strings.HasPrefix(protocol, prefix) {
+			return strings.TrimPrefix(protocol, prefix)
+		}
+	}
+	return ""
 }
 
 func bearerToken(header string) (string, bool) {
