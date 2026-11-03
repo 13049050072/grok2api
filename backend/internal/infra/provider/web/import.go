@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/mail"
 	"strings"
 	"time"
 
@@ -94,7 +95,24 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 	seen := make(map[string]struct{}, len(lines))
 	result := make([]provider.CredentialSeed, 0, len(lines))
 	for index, line := range lines {
-		token := sanitizeSSOToken(line)
+		email := ""
+		tokenValue := line
+		if strings.Contains(line, "----") {
+			parts := strings.Split(strings.TrimSpace(line), "----")
+			if len(parts) < 3 {
+				return nil, fmt.Errorf("第 %d 行缺少 SSO，邮箱和密码不能直接导入 Grok Web", index+1)
+			}
+			email = strings.TrimSpace(parts[0])
+			address, err := mail.ParseAddress(email)
+			if err != nil || address.Address != email {
+				return nil, fmt.Errorf("第 %d 行邮箱无效", index+1)
+			}
+			tokenValue = parts[2]
+			if strings.TrimSpace(tokenValue) == "" {
+				return nil, fmt.Errorf("第 %d 行缺少 SSO", index+1)
+			}
+		}
+		token := sanitizeSSOToken(tokenValue)
 		if token == "" {
 			continue
 		}
@@ -107,7 +125,7 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 		seen[token] = struct{}{}
 		result = append(result, provider.CredentialSeed{
 			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierAuto,
-			Name: "Grok Web " + security.HashToken(token)[:8], SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
+			Name: "Grok Web " + security.HashToken(token)[:8], Email: email, SourceKey: "sso:" + security.HashToken(token), AccessToken: token,
 		})
 		if len(result) > maxImportAccounts {
 			return nil, provider.ErrCredentialLimit
