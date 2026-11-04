@@ -438,11 +438,71 @@ func TestImageEditStructuredForbiddenDoesNotRetryOrRefresh(t *testing.T) {
 	}
 }
 
-// 上游异步完成上传时只会返回 uploadId，此时 imageToImage.inputAssets 仍需要一个
-// 可用的文件标识。编辑链路必须回退到 uploaded.ID 继续生成，而不是把一次成功上传
-// 直接判成上游故障，也不能只是发一个空 inputAssets 让编辑退化成文生图。
-func TestImageEditFallsBackToUploadIDWhenFileMetadataIsMissing(t *testing.T) {
-	var uploadCalls atomic.Int32
+// 编辑请求的参考图走 imageEditModelConfig.imageReferences，值必须是可寻址的资产地址
+// （ASSET_SERVER_URL + fileUri）。上传只返回 uploadId 时上游没有可用地址，必须明确
+// 报错而不是把空引用发下去，否则编辑会退化成纯文生图。
+func TestImageEditRequiresAssetURIForImageReferences(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		uploadBody string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "missing file uri",
+			uploadBody: `{"uploadId":"upload-1"}`,
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "image_edit_upload_reference_missing",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var generationCalls atomic.Int32
+			server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+				switch request.URL.Path {
+				case "/v1":
+					writeTestClearanceSolution(t, writer, 1)
+				case "/http/upload-file-v2/direct":
+					writer.Header().Set("Content-Type", "application/json")
+					_, _ = writer.Write([]byte(test.uploadBody))
+				case "/rest/app-chat/conversations/new":
+					generationCalls.Add(1)
+					writeTestPolicyForbidden(writer)
+				default:
+					fhttp.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+
+			adapter, credential := testMediaAdapter(t, server.URL)
+			enableTestClearance(adapter, server.URL)
+			response, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
+				Credential: credential,
+				ImageURLs:  []string{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+				Prompt:     "turn it blue",
+				Count:      1,
+				Resolution: "1k",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil || response.StatusCode != test.wantStatus {
+				t.Fatalf("status=%d body=%s err=%v", response.StatusCode, body, readErr)
+			}
+			if !strings.Contains(string(body), test.wantCode) {
+				t.Fatalf("body = %s", body)
+			}
+			if generationCalls.Load() != 0 {
+				t.Fatalf("generation calls = %d, want 0", generationCalls.Load())
+			}
+		})
+	}
+}
+
+// 参考图地址必须出现在 imageEditModelConfig.imageReferences 里，且不能再带旧的
+// mediaGenInput.imageToImage.inputAssets 形态。
+func TestImageEditSendsImageReferencesForUploadedAsset(t *testing.T) {
 	var generationCalls atomic.Int32
 	var payload map[string]any
 	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
@@ -450,9 +510,8 @@ func TestImageEditFallsBackToUploadIDWhenFileMetadataIsMissing(t *testing.T) {
 		case "/v1":
 			writeTestClearanceSolution(t, writer, 1)
 		case "/http/upload-file-v2/direct":
-			uploadCalls.Add(1)
 			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(`{"uploadId":"upload-1"}`))
+			_, _ = writer.Write([]byte(`{"uploadId":"upload-1","fileMetadata":{"fileMetadataId":"file-1","fileUri":"users/test/reference/content"}}`))
 		case "/rest/app-chat/conversations/new":
 			generationCalls.Add(1)
 			body, _ := io.ReadAll(request.Body)
@@ -477,22 +536,24 @@ func TestImageEditFallsBackToUploadIDWhenFileMetadataIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, readErr := io.ReadAll(response.Body)
+	_, _ = io.Copy(io.Discard, response.Body)
 	_ = response.Body.Close()
-	if readErr != nil || response.StatusCode != http.StatusForbidden || !json.Valid(body) {
-		t.Fatalf("status=%d body=%s err=%v", response.StatusCode, body, readErr)
+	if generationCalls.Load() != 1 {
+		t.Fatalf("generation calls = %d, want 1", generationCalls.Load())
 	}
-	if uploadCalls.Load() != 1 || generationCalls.Load() != 1 {
-		t.Fatalf("upload/generation calls=%d/%d, want 1/1", uploadCalls.Load(), generationCalls.Load())
+	if _, exists := payload["mediaGenInput"]; exists {
+		t.Fatalf("legacy mediaGenInput leaked: %#v", payload["mediaGenInput"])
 	}
-	if payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
-		t.Fatalf("kind = %#v", payload["kind"])
+	metadata, _ := payload["responseMetadata"].(map[string]any)
+	override, _ := metadata["modelConfigOverride"].(map[string]any)
+	modelMap, _ := override["modelMap"].(map[string]any)
+	config, _ := modelMap["imageEditModelConfig"].(map[string]any)
+	references, _ := config["imageReferences"].([]any)
+	if len(references) != 1 || references[0] != "https://assets.grok.com/users/test/reference/content" {
+		t.Fatalf("imageReferences = %#v", config["imageReferences"])
 	}
-	mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
-	imageToImage, _ := mediaGenInput["imageToImage"].(map[string]any)
-	assets, _ := imageToImage["inputAssets"].([]any)
-	if len(assets) != 1 || assets[0] != "upload-1" {
-		t.Fatalf("inputAssets = %#v", imageToImage["inputAssets"])
+	if config["aspectRatio"] != "9:16" {
+		t.Fatalf("aspectRatio = %#v", config["aspectRatio"])
 	}
 }
 

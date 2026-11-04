@@ -863,28 +863,24 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		}
 		images = append(images, image)
 	}
-	assets := make([]string, 0, len(images))
+	references := make([]string, 0, len(images))
 	for _, image := range images {
 		uploaded, uploadErr := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "image_edit_upload")
 		if uploadErr != nil {
 			return nil, uploadErr
 		}
-		// fileMetadataId 是上游 imageToImage.inputAssets 期望的标识；异步上传只返回
-		// fileId/uploadId 时 uploaded.ID 已经做过同样的优先级收敛，这里必须回退而不是
-		// 直接判失败，否则一次可用上传会被记成账号上游故障。
-		reference := uploaded.MetadataID
-		if reference == "" {
-			reference = uploaded.ID
-		}
+		// 当前浏览器编辑请求用 imageEditModelConfig.imageReferences 传参考图，
+		// 值是资产地址（ASSET_SERVER_URL + fileUri），不再是 inputAssets 里的元数据 ID。
+		reference := uploaded.URI
 		if reference == "" {
 			return jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
-				"message": "参考图上传完成但上游未返回可用的文件标识",
+				"message": "参考图上传完成但上游未返回文件地址",
 				"type":    "upstream_error", "code": "image_edit_upload_reference_missing",
 			}}), nil
 		}
-		assets = append(assets, reference)
+		references = append(references, reference)
 	}
-	payload := buildImageEditPayload(request.Prompt, assets, ratio)
+	payload := buildImageEditPayload(request.Prompt, references, ratio)
 	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.ImageTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
 	if err != nil {
 		return nil, err
@@ -927,26 +923,33 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 	return result, err
 }
 
-func buildImageEditPayload(prompt string, assets []string, aspectRatio string) map[string]any {
-	imageToImage := map[string]any{
-		"prompt":      prompt,
-		"inputAssets": assets,
-	}
+// buildImageEditPayload 复刻 grok.com Imagine 的直出编辑请求：参考图放在
+// responseMetadata.modelConfigOverride.modelMap.imageEditModelConfig.imageReferences，
+// 值是资产地址。旧实现的 mediaGenInput.imageToImage.inputAssets 只是媒体帖的读取字段，
+// 上游不会据此绑定输入图，编辑会退化成只用 message 的文生图。
+func buildImageEditPayload(prompt string, references []string, aspectRatio string) map[string]any {
+	imageEditModelConfig := map[string]any{"imageReferences": references}
 	if aspectRatio != "" {
-		imageToImage["aspectRatio"] = aspectRatio
+		imageEditModelConfig["aspectRatio"] = aspectRatio
 	}
 	return map[string]any{
-		"modelName": "imagine-image-edit", "message": prompt,
-		"enableImageStreaming": true, "enableSideBySide": true, "sendFinalMetadata": true,
-		// kind 与 responseMetadata 让会话按 Imagine 媒体会话建立。缺少 kind 时上游
-		// 会把请求当成普通对话，imageToImage.inputAssets 绑不上会话，编辑退化成
-		// 只用 message 的文生图（返回与参考图无关的图片）。与 videoCreatePayload 一致。
+		"modelName":             "imagine-image-edit",
+		"message":               prompt,
+		"temporary":             true,
+		"fileAttachments":       []any{},
+		"imageGenerationCount":  1,
+		"enableImageGeneration": true,
+		"enableImageStreaming":  true,
+		"enableSideBySide":      false,
+		"sendFinalMetadata":     true,
 		"responseMetadata": map[string]any{
-			"experiments":         []any{},
-			"modelConfigOverride": map[string]any{"modelMap": map[string]any{}},
+			"modelConfigOverride": map[string]any{
+				"modelMap": map[string]any{
+					"imageEditModel":       "imagine",
+					"imageEditModelConfig": imageEditModelConfig,
+				},
+			},
 		},
-		"mediaGenInput": map[string]any{"imageToImage": imageToImage},
-		"kind":          "CONVERSATION_KIND_IMAGINE",
 	}
 }
 
