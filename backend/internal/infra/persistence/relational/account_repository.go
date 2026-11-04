@@ -1525,7 +1525,7 @@ func (r *AccountRepository) CreateCredentialIfAbsent(ctx context.Context, email,
 			return repository.ErrInvalidRecord
 		}
 		var ambiguous int64
-		if err := tx.Model(&accountModel{}).Where("provider = ? AND (((email IS NULL OR trim(email) = '') AND (user_id IS NULL OR trim(user_id) = '' OR lower(trim(user_id)) = ?)) OR lower(trim(email)) = ? OR (COALESCE(trim(user_id), '') = ? AND COALESCE(trim(team_id), '') = ?) OR source_key = ?)", string(value.Provider), strings.ToLower(strings.TrimSpace(email)), strings.ToLower(strings.TrimSpace(email)), strings.TrimSpace(userID), strings.TrimSpace(teamID), value.SourceKey).Count(&ambiguous).Error; err != nil {
+		if err := tx.Model(&accountModel{}).Where("provider = ? AND (((email IS NULL OR trim(email) = '') AND lower(trim(user_id)) = ?) OR lower(trim(email)) = ? OR (COALESCE(trim(user_id), '') = ? AND COALESCE(trim(team_id), '') = ?) OR source_key = ?)", string(value.Provider), strings.ToLower(strings.TrimSpace(email)), strings.ToLower(strings.TrimSpace(email)), strings.TrimSpace(userID), strings.TrimSpace(teamID), value.SourceKey).Count(&ambiguous).Error; err != nil {
 			return err
 		}
 		if ambiguous != 0 {

@@ -42,3 +42,20 @@ func TestSafeImportMatchesKnownIdentityAndRejectsAmbiguity(t *testing.T) {
 		t.Fatalf("conflict modified credential: %v", err)
 	}
 }
+
+func TestCreateAllowsUnidentifiedAccountButRejectsKnownDuplicate(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	anonymous := account.Credential{Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "anonymous", SourceKey: "old", EncryptedAccessToken: "old-token", Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 8}
+	if _, _, err := repo.UpsertByIdentity(ctx, anonymous); err != nil {
+		t.Fatal(err)
+	}
+	value := anonymous
+	value.Email, value.UserID, value.SourceKey, value.EncryptedAccessToken = "user@example.test", "user-1", "new", "new-token"
+	if _, err := repo.CreateCredentialIfAbsent(ctx, value.Email, value.UserID, "", value); err != nil {
+		t.Fatalf("create with anonymous account: %v", err)
+	}
+	if _, err := repo.CreateCredentialIfAbsent(ctx, value.Email, value.UserID, "", value); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("expected duplicate conflict: %v", err)
+	}
+}
