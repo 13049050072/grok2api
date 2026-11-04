@@ -208,9 +208,17 @@ func sanitizeResponsesEvent(event map[string]any, state *responsesCompatState) b
 		}
 		state.rememberItemID(outputIndex, hasOutputIndex, itemID)
 	}
-	if strings.TrimSpace(stringAny(event["item_id"])) == "" && responsesEventNeedsItemID(stringAny(event["type"])) {
-		if outputIndex, ok := asInt64(event["output_index"]); ok {
-			itemID := state.itemID(outputIndex)
+	if outputIndex, hasOutputIndex := asInt64(event["output_index"]); hasOutputIndex && responsesEventNeedsItemID(stringAny(event["type"])) {
+		existing := strings.TrimSpace(stringAny(event["item_id"]))
+		remembered := state.itemID(outputIndex)
+		switch {
+		case remembered != "" && existing != remembered:
+			event["item_id"] = remembered
+			changed = true
+		case remembered == "" && existing != "":
+			state.rememberItemID(outputIndex, true, existing)
+		case existing == "":
+			itemID := remembered
 			if itemID == "" {
 				itemID = state.nextItemID()
 				state.rememberItemID(outputIndex, true, itemID)

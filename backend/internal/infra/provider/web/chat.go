@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -76,7 +77,7 @@ type chatMessage struct {
 	ToolCallID string          `json:"tool_call_id"`
 	CallID     string          `json:"call_id"`
 	Name       string          `json:"name"`
-	Arguments  string          `json:"arguments"`
+	Arguments  json.RawMessage `json:"arguments"`
 	Output     json.RawMessage `json:"output"`
 }
 
@@ -690,11 +691,17 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 			if !toolNamePattern.MatchString(strings.TrimSpace(message.Name)) {
 				return normalizedChatInput{}, errors.New("function_call.name 无效")
 			}
-			arguments := normalizeToolArguments(message.Arguments)
+			arguments := toolArgumentsText(message.Arguments)
 			if !json.Valid([]byte(arguments)) {
 				return normalizedChatInput{}, errors.New("function_call.arguments 必须是有效 JSON")
 			}
-			builder.WriteString("[assistant]\n<tool_calls>\n  <tool_call>\n    <tool_name>")
+			builder.WriteString("[assistant]\n<tool_calls>\n  <tool_call")
+			if callID := strings.TrimSpace(message.CallID); callID != "" {
+				builder.WriteString(` call_id="`)
+				builder.WriteString(html.EscapeString(callID))
+				builder.WriteString(`"`)
+			}
+			builder.WriteString(">\n    <tool_name>")
 			builder.WriteString(message.Name)
 			builder.WriteString("</tool_name>\n    <parameters>")
 			builder.WriteString(arguments)
@@ -702,9 +709,15 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 			continue
 		}
 		if typeName == "function_call_output" {
-			text, err := rawTextValue(message.Output)
-			if err != nil {
-				return normalizedChatInput{}, errors.New("function_call_output.output 必须是字符串或 JSON")
+			text, parts, attachErr := contentTextAndAttachments(message.Output)
+			if attachErr != nil {
+				var err error
+				text, err = rawTextValue(message.Output)
+				if err != nil {
+					return normalizedChatInput{}, errors.New("function_call_output.output 必须是字符串或 JSON")
+				}
+			} else {
+				attachments = append(attachments, parts...)
 			}
 			builder.WriteString("[tool result for ")
 			builder.WriteString(strings.TrimSpace(message.CallID))

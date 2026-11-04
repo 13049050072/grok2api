@@ -1298,6 +1298,15 @@ func TestSanitizeResponsesKeepsItemIDStableAcrossEvents(t *testing.T) {
 	}
 }
 
+func TestSanitizeResponsesRewritesMismatchedItemID(t *testing.T) {
+	state := &responsesCompatState{}
+	_ = rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_real","type":"function_call"}}`+"\n"), state)
+	got := rewriteResponsesDataLine([]byte(`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_other","delta":"{}"}`+"\n"), state)
+	if !bytes.Contains(got, []byte(`"item_id":"fc_real"`)) || bytes.Contains(got, []byte("fc_other")) {
+		t.Fatalf("argument delta kept a different item id: %s", got)
+	}
+}
+
 func TestSanitizeResponsesKeepsGeneratedResponseIDStable(t *testing.T) {
 	state := &responsesCompatState{}
 	created := rewriteResponsesDataLine([]byte(`data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n"), state)

@@ -445,6 +445,8 @@ function ChatPanel({ apiKey, model, modelOptions, onModelChange, storageScope, t
     },
   });
 
+  const searchToolsAvailable = !modelOptions.some((item) => item.publicId === model && item.provider === "grok_console" && item.upstreamModel === "grok-4.5");
+
   function beginAssistantRequest(params: {
     history: ConversationMessage[];
     assistantMessage: ConversationMessage;
@@ -460,8 +462,8 @@ function ChatPanel({ apiKey, model, modelOptions, onModelChange, storageScope, t
       messages: requestMessages,
       promptCacheKey: params.cacheKey,
       reasoningEffort: effectiveReasoningEffort,
-      webSearch,
-      xSearch,
+      webSearch: searchToolsAvailable && webSearch,
+      xSearch: searchToolsAvailable && xSearch,
       assistantMessageId: params.assistantMessage.id,
       apiKey,
       model,
@@ -809,20 +811,22 @@ function ChatPanel({ apiKey, model, modelOptions, onModelChange, storageScope, t
             <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto">
               <CompactModelSelect value={model} models={modelOptions} onChange={onModelChange} />
               <CompactIconSelect
-                value={webSearch ? "on" : "off"}
+                value={searchToolsAvailable && webSearch ? "on" : "off"}
                 options={[{ value: "off", label: t("creativeConsole.webSearchOff") }, { value: "on", label: t("creativeConsole.webSearchOn") }]}
                 onChange={(value) => setWebSearch(value === "on")}
                 ariaLabel={t("creativeConsole.webSearch")}
                 icon={<Globe />}
-                active={webSearch}
+                active={searchToolsAvailable && webSearch}
+                disabled={!searchToolsAvailable}
               />
               <CompactIconSelect
-                value={xSearch ? "on" : "off"}
+                value={searchToolsAvailable && xSearch ? "on" : "off"}
                 options={[{ value: "off", label: t("creativeConsole.xSearchOff") }, { value: "on", label: t("creativeConsole.xSearchOn") }]}
                 onChange={(value) => setXSearch(value === "on")}
                 ariaLabel={t("creativeConsole.xSearch")}
                 icon={<XSocialIcon />}
-                active={xSearch}
+                active={searchToolsAvailable && xSearch}
+                disabled={!searchToolsAvailable}
               />
               <CompactIconSelect
                 value={effectiveReasoningEffort}
@@ -1037,8 +1041,13 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const hasReferenceImage = Boolean(referenceURL.trim() || referenceFileID);
   const hasReferenceAudio = Boolean(referenceVoiceId.trim());
   const isReferenceMode = hasReferenceImage || hasReferenceAudio;
-  const generateResolutions = isReferenceMode ? videoResolutions.filter((item) => item !== "1080p") : videoResolutions;
-  const selectedVideoResolution = isReferenceMode && resolution === "1080p" ? "720p" : resolution;
+  const activeRoutes = modelOptions.filter((item) => item.publicId === activeModel);
+  const supports1080p = !isReferenceMode && activeRoutes.some((item) => item.upstreamModel === "grok-imagine-video-1.5");
+  const referenceDurationLimited = hasReferenceImage && activeRoutes.some((item) => item.upstreamModel === "grok-imagine-video") && !activeRoutes.some((item) => item.upstreamModel === "grok-imagine-video-1.5");
+  const generateResolutions = videoResolutions.filter((item) => item !== "1080p" || supports1080p);
+  const durationChoices = referenceDurationLimited ? videoDurations.filter((item) => Number(item) <= 10) : videoDurations;
+  const selectedVideoResolution = generateResolutions.includes(resolution as typeof generateResolutions[number]) ? resolution : (generateResolutions.includes("720p") ? "720p" : generateResolutions[0]);
+  const selectedDuration = durationChoices.includes(duration as typeof durationChoices[number]) ? duration : durationChoices[durationChoices.length - 1];
   const requests = useRequestGuard();
 
   const createMutation = useMutation({
@@ -1077,7 +1086,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
               ? [{ url: nextReferenceURL }]
               : undefined,
           referenceVoiceIds: nextReferenceVoice ? [nextReferenceVoice] : undefined,
-          duration: Number(duration),
+          duration: Number(selectedDuration),
           aspectRatio,
           resolution: selectedVideoResolution,
           signal: request.signal,
@@ -1157,7 +1166,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     event.preventDefault();
     if (!apiKey || !activeModel || createMutation.isPending || uploadMutation.isPending || videoUploadMutation.isPending) return;
     if (action === "generate") {
-      if ((!prompt.trim() && !hasFirstFrame && !isReferenceMode) || !validDuration(duration)) return;
+      if ((!prompt.trim() && !hasFirstFrame && !isReferenceMode) || !validDuration(selectedDuration)) return;
       if (isReferenceMode && !prompt.trim()) return;
     } else {
       if (!prompt.trim() || (!sourceVideoURL.trim() && !sourceVideoFileID)) return;
@@ -1189,7 +1198,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
       : t("creativeConsole.extendVideo");
   const canSubmit = Boolean(apiKey && activeModel && !createMutation.isPending && !uploadMutation.isPending && !videoUploadMutation.isPending
     && (action === "generate"
-      ? ((prompt.trim() || hasFirstFrame || isReferenceMode) && (!isReferenceMode || prompt.trim()) && validDuration(duration) && !(hasFirstFrame && isReferenceMode))
+      ? ((prompt.trim() || hasFirstFrame || isReferenceMode) && (!isReferenceMode || prompt.trim()) && validDuration(selectedDuration) && !(hasFirstFrame && isReferenceMode))
       : prompt.trim() && (sourceVideoURL.trim() || sourceVideoFileID) && (action !== "extend" || (Number(extendDuration) >= 2 && Number(extendDuration) <= 10))));
 
   return (
@@ -1376,7 +1385,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
               )}
               {action === "generate" ? (
                 <>
-                  <CompactSelect value={duration} options={videoDurations} onChange={setDuration} ariaLabel={t("creativeConsole.duration")} suffix="s" icon={<Clock3 />} />
+                  <CompactSelect value={selectedDuration} options={durationChoices} onChange={setDuration} ariaLabel={t("creativeConsole.duration")} suffix="s" icon={<Clock3 />} />
                   <CompactSelect value={aspectRatio} options={videoAspectRatios} onChange={setAspectRatio} ariaLabel={t("creativeConsole.aspectRatio")} icon={<TvMinimal />} />
                   <CompactSelect value={selectedVideoResolution} options={generateResolutions} onChange={setResolution} ariaLabel={t("creativeConsole.resolution")} icon={<ImageUpscale />} />
                 </>

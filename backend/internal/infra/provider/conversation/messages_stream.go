@@ -19,8 +19,19 @@ func (c *streamConverter) startMessages() error {
 	})
 }
 
+func (c *streamConverter) closeMessagesBlock(started, closed *bool, index int) error {
+	if !*started || *closed {
+		return nil
+	}
+	*closed = true
+	return c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+}
+
 func (c *streamConverter) textDeltaMessages(delta string) error {
 	if !c.textStarted {
+		if err := c.closeMessagesBlock(&c.thinkingStarted, &c.thinkingClosed, c.thinkingIndex); err != nil {
+			return err
+		}
 		c.textStarted = true
 		c.textIndex = c.nextIndex
 		c.nextIndex++
@@ -161,6 +172,22 @@ func (c *streamConverter) toolStartMessages(item responseItem) error {
 	if err := c.start(); err != nil {
 		return err
 	}
+	if _, exists := c.tools[item.ID]; exists {
+		return nil
+	}
+	if err := c.closeMessagesBlock(&c.thinkingStarted, &c.thinkingClosed, c.thinkingIndex); err != nil {
+		return err
+	}
+	if c.textStarted && !c.textClosed && c.stopSequence == "" {
+		if pending := c.stopFilter.Flush(); pending != "" {
+			if err := c.textDeltaWithoutFilter(pending); err != nil {
+				return err
+			}
+		}
+	}
+	if err := c.closeMessagesBlock(&c.textStarted, &c.textClosed, c.textIndex); err != nil {
+		return err
+	}
 	tool := streamTool{Index: c.nextIndex, ID: anthropicToolUseID(item.CallID), Name: item.Name, Arguments: item.Arguments}
 	c.nextIndex++
 	c.tools[item.ID] = tool
@@ -208,11 +235,8 @@ func (c *streamConverter) toolArgumentsDoneMessages(itemID, arguments string) er
 }
 
 func (c *streamConverter) doneMessages(status string) error {
-	if c.thinkingStarted && !c.thinkingClosed {
-		c.thinkingClosed = true
-		if err := c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": c.thinkingIndex}); err != nil {
-			return err
-		}
+	if err := c.closeMessagesBlock(&c.thinkingStarted, &c.thinkingClosed, c.thinkingIndex); err != nil {
+		return err
 	}
 	if c.options.AnthropicWebSearchRequired && len(c.webSearch) == 0 {
 		c.webSearch = []webSearchCall{unavailableWebSearchCall(c.options.AnthropicWebSearchQuery)}
@@ -229,17 +253,15 @@ func (c *streamConverter) doneMessages(status string) error {
 			}
 		}
 	}
-	if c.stopSequence == "" {
+	if c.stopSequence == "" && c.textStarted && !c.textClosed {
 		if pending := c.stopFilter.Flush(); pending != "" {
 			if err := c.textDeltaWithoutFilter(pending); err != nil {
 				return err
 			}
 		}
 	}
-	if c.textStarted {
-		if err := c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": c.textIndex}); err != nil {
-			return err
-		}
+	if err := c.closeMessagesBlock(&c.textStarted, &c.textClosed, c.textIndex); err != nil {
+		return err
 	}
 	if !c.deferSearchText {
 		// If text arrived before the search item, close it before starting any server

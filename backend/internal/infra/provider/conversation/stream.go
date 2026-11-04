@@ -61,6 +61,7 @@ type streamConverter struct {
 	started                bool
 	finished               bool
 	textStarted            bool
+	textClosed             bool
 	textIndex              int
 	thinkingStarted        bool
 	thinkingClosed         bool
@@ -69,6 +70,9 @@ type streamConverter struct {
 	chatReasoningMark      bool
 	nextIndex              int
 	tools                  map[string]streamTool
+	toolIndex              map[int]string
+	toolOrder              []string
+	anonTools              int
 	webSearch              []webSearchCall
 	webSearchEmitted       map[string]bool
 	deferSearchText        bool
@@ -370,25 +374,27 @@ func (c *streamConverter) handle(event string, data []byte) error {
 		if item.Type != "function_call" {
 			return nil
 		}
-		var outputIndex int
-		_ = json.Unmarshal(root["output_index"], &outputIndex)
-		return c.toolStart(item, outputIndex)
+		outputIndex, hasOutputIndex := rawInt(root["output_index"])
+		return c.toolStart(item, outputIndex, hasOutputIndex)
 	case "response.function_call_arguments.delta":
 		var itemID, delta string
 		_ = json.Unmarshal(root["item_id"], &itemID)
 		_ = json.Unmarshal(root["delta"], &delta)
-		return c.toolDelta(itemID, delta)
+		outputIndex, hasOutputIndex := rawInt(root["output_index"])
+		return c.toolDelta(c.resolveToolKey(itemID, outputIndex, hasOutputIndex), delta)
 	case "response.function_call_arguments.done":
 		var itemID, arguments string
 		_ = json.Unmarshal(root["item_id"], &itemID)
 		_ = json.Unmarshal(root["arguments"], &arguments)
-		return c.toolArgumentsDone(itemID, arguments)
+		outputIndex, hasOutputIndex := rawInt(root["output_index"])
+		return c.toolArgumentsDone(c.resolveToolKey(itemID, outputIndex, hasOutputIndex), arguments)
 	case "response.output_item.done":
 		var item responseItem
 		_ = json.Unmarshal(root["item"], &item)
 		c.recordOutputItem(item)
 		if item.Type == "function_call" {
-			return c.toolArgumentsDone(item.ID, item.Arguments)
+			outputIndex, hasOutputIndex := rawInt(root["output_index"])
+			return c.toolArgumentsDone(c.resolveToolKey(item.ID, outputIndex, hasOutputIndex), item.Arguments)
 		}
 		if item.Type == "reasoning" {
 			if c.reasoningOutputEnabled() {
@@ -429,6 +435,9 @@ func (c *streamConverter) handle(event string, data []byte) error {
 					return err
 				}
 			}
+		}
+		if err := c.emitTerminalFunctionCalls(response.Output); err != nil {
+			return err
 		}
 		status := response.Status
 		if status == "" && typeName == "response.incomplete" {
@@ -557,15 +566,28 @@ func (c *streamConverter) mergeOutputItems(output []responseItem) []responseItem
 		return append([]responseItem(nil), c.outputItems...)
 	}
 	merged := append([]responseItem(nil), output...)
+	used := make(map[int]bool, len(merged))
 	for _, item := range c.outputItems {
 		found := false
 		if key := replayOutputKey(item); key != "" {
 			for index := range merged {
-				if replayOutputKey(merged[index]) == key {
-					merged[index] = mergeResponseItem(merged[index], item)
-					found = true
-					break
+				if used[index] || replayOutputKey(merged[index]) != key {
+					continue
 				}
+				merged[index] = mergeResponseItem(merged[index], item)
+				used[index] = true
+				found = true
+				break
+			}
+		} else if item.Type == "function_call" {
+			for index := range merged {
+				if used[index] || !sameAnonymousFunctionCall(merged[index], item) {
+					continue
+				}
+				merged[index] = mergeResponseItem(merged[index], item)
+				used[index] = true
+				found = true
+				break
 			}
 		}
 		if !found {
@@ -573,6 +595,13 @@ func (c *streamConverter) mergeOutputItems(output []responseItem) []responseItem
 		}
 	}
 	return merged
+}
+
+func sameAnonymousFunctionCall(left, right responseItem) bool {
+	return left.Type == "function_call" && right.Type == "function_call" &&
+		strings.TrimSpace(left.ID) == "" && strings.TrimSpace(right.ID) == "" &&
+		strings.TrimSpace(left.CallID) == strings.TrimSpace(right.CallID) &&
+		left.Name == right.Name
 }
 
 func mergeResponseItem(base, update responseItem) responseItem {
@@ -830,7 +859,172 @@ func (c *streamConverter) textDelta(delta string) error {
 	return c.textDeltaMessages(delta)
 }
 
-func (c *streamConverter) toolStart(item responseItem, outputIndex int) error {
+func rawInt(raw json.RawMessage) (int, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return 0, false
+	}
+	var value int
+	if json.Unmarshal(raw, &value) != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func (c *streamConverter) assignToolKey(item responseItem, outputIndex int, hasOutputIndex bool) string {
+	if hasOutputIndex && c.toolIndex != nil {
+		if key, ok := c.toolIndex[outputIndex]; ok {
+			return key
+		}
+	}
+	if existing := c.existingToolKey(item); existing != "" {
+		return existing
+	}
+	if id := strings.TrimSpace(item.ID); id != "" {
+		return id
+	}
+	if callID := strings.TrimSpace(item.CallID); callID != "" {
+		return "call:" + callID
+	}
+	c.anonTools++
+	return fmt.Sprintf("anon:%d", c.anonTools)
+}
+
+func (c *streamConverter) rememberToolKey(key string, outputIndex int, hasOutputIndex bool) {
+	if !hasOutputIndex || key == "" {
+		return
+	}
+	if c.toolIndex == nil {
+		c.toolIndex = make(map[int]string)
+	}
+	c.toolIndex[outputIndex] = key
+}
+
+func (c *streamConverter) trackToolOrder(key string) {
+	if key == "" {
+		return
+	}
+	for _, existing := range c.toolOrder {
+		if existing == key {
+			return
+		}
+	}
+	c.toolOrder = append(c.toolOrder, key)
+}
+
+// matchUnclaimedTool pairs a terminal function_call that has no id with a call
+// already opened on the stream. The envelope array position is not output_index:
+// earlier reasoning items are often omitted, so index 0 in the envelope can be
+// the call that was announced at output_index 1.
+func (c *streamConverter) matchUnclaimedTool(item responseItem, claimed map[string]bool) string {
+	name := strings.TrimSpace(item.Name)
+	var namedPending, anyPending, namedDone, anyDone string
+	for _, key := range c.toolOrder {
+		if claimed[key] {
+			continue
+		}
+		tool, ok := c.tools[key]
+		if !ok || tool.ID != "" {
+			continue
+		}
+		pending := !tool.SentArgs && !tool.Closed
+		sameName := name != "" && tool.Name == name
+		switch {
+		case sameName && pending && namedPending == "":
+			namedPending = key
+		case pending && anyPending == "":
+			anyPending = key
+		case sameName && namedDone == "":
+			namedDone = key
+		case anyDone == "":
+			anyDone = key
+		}
+	}
+	switch {
+	case namedPending != "":
+		return namedPending
+	case anyPending != "":
+		return anyPending
+	case namedDone != "":
+		return namedDone
+	default:
+		return anyDone
+	}
+}
+
+func (c *streamConverter) existingToolKey(item responseItem) string {
+	if id := strings.TrimSpace(item.ID); id != "" {
+		if _, ok := c.tools[id]; ok {
+			return id
+		}
+	}
+	if callID := strings.TrimSpace(item.CallID); callID != "" {
+		if _, ok := c.tools["call:"+callID]; ok {
+			return "call:" + callID
+		}
+		for key, tool := range c.tools {
+			if tool.ID == callID {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
+func (c *streamConverter) resolveToolKey(itemID string, outputIndex int, hasOutputIndex bool) string {
+	if hasOutputIndex && c.toolIndex != nil {
+		if key, ok := c.toolIndex[outputIndex]; ok {
+			return key
+		}
+	}
+	itemID = strings.TrimSpace(itemID)
+	if itemID == "" {
+		return ""
+	}
+	if _, ok := c.tools[itemID]; ok {
+		return itemID
+	}
+	if _, ok := c.tools["call:"+itemID]; ok {
+		return "call:" + itemID
+	}
+	return itemID
+}
+
+func (c *streamConverter) emitTerminalFunctionCalls(output []responseItem) error {
+	claimed := make(map[string]bool, len(output))
+	for _, item := range output {
+		if item.Type != "function_call" {
+			continue
+		}
+		key := c.existingToolKey(item)
+		if key == "" {
+			key = c.matchUnclaimedTool(item, claimed)
+		}
+		if key == "" {
+			key = c.assignToolKey(item, 0, false)
+		}
+		claimed[key] = true
+		if _, exists := c.tools[key]; !exists {
+			started := item
+			started.ID = key
+			if err := c.toolStart(started, 0, false); err != nil {
+				return err
+			}
+		}
+		if err := c.toolArgumentsDone(key, item.Arguments); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *streamConverter) toolStart(item responseItem, outputIndex int, hasOutputIndex bool) error {
+	key := c.assignToolKey(item, outputIndex, hasOutputIndex)
+	c.rememberToolKey(key, outputIndex, hasOutputIndex)
+	c.trackToolOrder(key)
+	if _, exists := c.tools[key]; exists {
+		return nil
+	}
+	item.ID = key
 	if c.operation == OperationMessages {
 		return c.toolStartMessages(item)
 	}

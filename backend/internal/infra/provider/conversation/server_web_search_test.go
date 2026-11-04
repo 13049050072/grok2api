@@ -335,6 +335,29 @@ func TestClientWebSearchFunctionNotPromoted(t *testing.T) {
 	}
 }
 
+func TestWebSearchToolChoiceDropsOtherTools(t *testing.T) {
+	converted, _, err := ConvertRequestWithOptions([]byte(`{
+		"model":"public","max_tokens":64,
+		"messages":[{"role":"user","content":"search"}],
+		"tools":[
+			{"type":"web_search_20250305","name":"web_search"},
+			{"name":"lookup","description":"Lookup","input_schema":{"type":"object"}}
+		],
+		"tool_choice":{"type":"tool","name":"web_search"}
+	}`), "grok-4.5", OperationMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(converted, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools := payload["tools"].([]any)
+	if payload["tool_choice"] != "required" || len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" {
+		t.Fatalf("tools=%#v choice=%#v", tools, payload["tool_choice"])
+	}
+}
+
 func TestClientLowercaseWebSearchToolChoiceRemainsFunction(t *testing.T) {
 	converted, _, err := ConvertRequestWithOptions([]byte(`{
 		"model":"public","max_tokens":64,

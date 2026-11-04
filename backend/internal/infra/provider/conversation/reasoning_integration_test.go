@@ -385,3 +385,84 @@ func TestStreamReasoningReplayCommitsOnlyAfterSuccessfulTerminal(t *testing.T) {
 		t.Fatal("failed stream left reasoning proof in replay cache")
 	}
 }
+
+func TestChatStreamEmitsFunctionCallFromTerminalEnvelope(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_terminal","status":"completed","output":[{"id":"fc_terminal","type":"function_call","call_id":"call_terminal","name":"list_dir","arguments":"{\"path\":\"/tmp\"}"}]}}`,
+		``,
+	}, "\n")
+	converted := ConvertResponseStreamWithOptions(io.NopCloser(strings.NewReader(stream)), OperationChat, ResponseOptions{})
+	body, err := io.ReadAll(converted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"name":"list_dir"`) || !strings.Contains(text, `\"path\":\"/tmp\"`) || !strings.Contains(text, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("terminal function call was not emitted: %s", text)
+	}
+}
+
+func TestChatStreamSeparatesParallelCallsWithoutItemID(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","name":"first","arguments":""}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","name":"second","arguments":""}}`, "",
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"n\":1}"}`, "",
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"n\":2}"}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_parallel","status":"completed","output":[]}}`, "",
+	}, "\n")
+	converted := ConvertResponseStreamWithOptions(io.NopCloser(strings.NewReader(stream)), OperationChat, ResponseOptions{})
+	body, err := io.ReadAll(converted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"name":"first"`) || !strings.Contains(text, `"name":"second"`) || !strings.Contains(text, `"id":"call_a"`) || !strings.Contains(text, `"id":"call_b"`) || !strings.Contains(text, `\"n\":1`) || !strings.Contains(text, `\"n\":2`) {
+		t.Fatalf("parallel calls collided: %s", text)
+	}
+}
+
+func TestTerminalEnvelopeWithoutIDsReusesEarlierOutputIndex(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","name":"lookup","arguments":""}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_shifted","status":"completed","output":[{"type":"function_call","name":"lookup","arguments":"{\"q\":1}"}]}}`, "",
+	}, "\n")
+	converted := ConvertResponseStreamWithOptions(io.NopCloser(strings.NewReader(stream)), OperationChat, ResponseOptions{})
+	body, err := io.ReadAll(converted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if strings.Count(text, `"name":"lookup"`) != 1 || !strings.Contains(text, `\"q\":1`) || strings.Contains(text, `"index":1`) {
+		t.Fatalf("terminal envelope duplicated the call announced at output_index 1: %s", text)
+	}
+}
+
+func TestMessagesStreamClosesTextBeforeToolUse(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_msg","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]}}`, "",
+	}, "\n")
+	converted := ConvertResponseStreamWithOptions(io.NopCloser(strings.NewReader(stream)), OperationMessages, ResponseOptions{})
+	body, err := io.ReadAll(converted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	textStop := strings.Index(text, `"content_block_stop"`)
+	toolStart := strings.Index(text, `"tool_use"`)
+	if textStop < 0 || toolStart < 0 || textStop > toolStart {
+		t.Fatalf("text block was still open when tool_use started: %s", text)
+	}
+}

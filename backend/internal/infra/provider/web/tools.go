@@ -247,9 +247,10 @@ WHEN TO CALL: %s`, definitions.String(), choiceInstruction)
 
 func toolCallsToXML(raw json.RawMessage) string {
 	var values []struct {
+		ID       string `json:"id"`
 		Function struct {
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
 		} `json:"function"`
 	}
 	if json.Unmarshal(raw, &values) != nil || len(values) == 0 {
@@ -257,19 +258,47 @@ func toolCallsToXML(raw json.RawMessage) string {
 	}
 	var builder strings.Builder
 	builder.WriteString("<tool_calls>")
+	written := 0
 	for _, value := range values {
 		if !toolNamePattern.MatchString(value.Function.Name) {
 			continue
 		}
-		arguments := normalizeToolArguments(value.Function.Arguments)
-		builder.WriteString("\n  <tool_call>\n    <tool_name>")
+		arguments := toolArgumentsText(value.Function.Arguments)
+		builder.WriteString("\n  <tool_call")
+		if callID := strings.TrimSpace(value.ID); callID != "" {
+			builder.WriteString(` call_id="`)
+			builder.WriteString(html.EscapeString(callID))
+			builder.WriteString(`"`)
+		}
+		builder.WriteString(">\n    <tool_name>")
 		builder.WriteString(html.EscapeString(value.Function.Name))
 		builder.WriteString("</tool_name>\n    <parameters>")
 		builder.WriteString(arguments)
 		builder.WriteString("</parameters>\n  </tool_call>")
+		written++
+	}
+	if written == 0 {
+		return ""
 	}
 	builder.WriteString("\n</tool_calls>")
 	return builder.String()
+}
+
+func toolArgumentsText(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "{}"
+	}
+	if raw[0] == '"' {
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			return normalizeToolArguments(text)
+		}
+	}
+	if json.Valid(raw) {
+		return string(raw)
+	}
+	return "{}"
 }
 
 // parseToolCalls 解析模型输出，并仅保留请求中声明过的函数名。

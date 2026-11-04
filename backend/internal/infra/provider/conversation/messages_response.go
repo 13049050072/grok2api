@@ -32,11 +32,7 @@ func messagesResponse(value parsedResponse, options ResponseOptions) map[string]
 		content = append(content, map[string]any{"type": "text", "text": value.Text})
 	}
 	for _, call := range value.Calls {
-		var input any = map[string]any{}
-		if json.Unmarshal([]byte(call.Arguments), &input) != nil {
-			input = map[string]any{}
-		}
-		content = append(content, map[string]any{"type": "tool_use", "id": anthropicToolUseID(call.CallID), "name": call.Name, "input": input})
+		content = append(content, map[string]any{"type": "tool_use", "id": anthropicToolUseID(call.CallID), "name": call.Name, "input": anthropicToolInput(call.Arguments)})
 	}
 	stopReason := "end_turn"
 	if len(value.Calls) > 0 {
@@ -174,4 +170,15 @@ func normalizeAnthropicErrorType(object map[string]any) string {
 		}
 	}
 	return "api_error"
+}
+
+func anthropicToolInput(arguments string) any {
+	var input any
+	if json.Unmarshal([]byte(arguments), &input) != nil || input == nil {
+		return map[string]any{}
+	}
+	if _, ok := input.(map[string]any); ok {
+		return input
+	}
+	return map[string]any{"value": input}
 }

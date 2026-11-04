@@ -200,7 +200,7 @@ func (c *responsesToolCompatibility) normalizeTool(raw any, namespace string, cl
 				c.addWarning("view_image_name_normalized")
 			}
 		}
-		if parameters, exists := tool["parameters"]; exists && schemaContainsInteger(parameters) {
+		if parameters, exists := converted["parameters"]; exists && schemaContainsInteger(parameters) {
 			c.functionSchemas[alias] = cloneJSONValue(parameters)
 		}
 		converted["name"] = alias

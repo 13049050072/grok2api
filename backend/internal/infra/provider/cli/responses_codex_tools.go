@@ -51,7 +51,7 @@ func (c *responsesToolCompatibility) normalizeApplyPatchTool(tool map[string]any
 		"type": "function",
 		"name": c.alias(identity),
 		"description": "Create, update, or delete one file using a structured V4A patch operation. " +
-			"create_file and update_file require path and diff; delete_file requires path.",
+			"create_file and update_file require path and diff. delete_file requires path and may send an empty diff.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -62,7 +62,7 @@ func (c *responsesToolCompatibility) normalizeApplyPatchTool(tool map[string]any
 						"path": map[string]any{"type": "string", "minLength": 1},
 						"diff": map[string]any{"type": "string"},
 					},
-					"required": []any{"type", "path"}, "additionalProperties": false,
+					"required": []any{"type", "path", "diff"}, "additionalProperties": false,
 				},
 			},
 			"required": []any{"operation"}, "additionalProperties": false,

@@ -141,6 +141,24 @@ func convertMessagesRequestWithReasoningReplay(body []byte, model string, cache 
 		}
 		target["tool_choice"] = choice
 		target["parallel_tool_calls"] = parallel
+		if strings.EqualFold(strings.TrimSpace(request.ToolChoice.Type), "tool") && strings.EqualFold(strings.TrimSpace(request.ToolChoice.Name), "web_search") && hasWebSearchTool {
+			if tools, ok := target["tools"].([]any); ok {
+				narrowed := make([]any, 0, len(tools))
+				for _, raw := range tools {
+					tool, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					typeName, _ := tool["type"].(string)
+					if typeName == "web_search" || strings.HasPrefix(typeName, "web_search") {
+						narrowed = append(narrowed, tool)
+					}
+				}
+				if len(narrowed) > 0 && len(narrowed) < len(tools) {
+					target["tools"] = narrowed
+				}
+			}
+		}
 	}
 	converted, err := json.Marshal(target)
 	return converted, ResponseOptions{
