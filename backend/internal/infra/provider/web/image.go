@@ -869,10 +869,20 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		if uploadErr != nil {
 			return nil, uploadErr
 		}
-		if uploaded.MetadataID == "" {
-			return nil, fmt.Errorf("上传图片成功但上游未返回 fileMetadataId")
+		// fileMetadataId 是上游 imageToImage.inputAssets 期望的标识；异步上传只返回
+		// fileId/uploadId 时 uploaded.ID 已经做过同样的优先级收敛，这里必须回退而不是
+		// 直接判失败，否则一次可用上传会被记成账号上游故障。
+		reference := uploaded.MetadataID
+		if reference == "" {
+			reference = uploaded.ID
 		}
-		assets = append(assets, uploaded.MetadataID)
+		if reference == "" {
+			return jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
+				"message": "参考图上传完成但上游未返回可用的文件标识",
+				"type":    "upstream_error", "code": "image_edit_upload_reference_missing",
+			}}), nil
+		}
+		assets = append(assets, reference)
 	}
 	payload := buildImageEditPayload(request.Prompt, assets, ratio)
 	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.ImageTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
@@ -928,7 +938,15 @@ func buildImageEditPayload(prompt string, assets []string, aspectRatio string) m
 	return map[string]any{
 		"modelName": "imagine-image-edit", "message": prompt,
 		"enableImageStreaming": true, "enableSideBySide": true, "sendFinalMetadata": true,
+		// kind 与 responseMetadata 让会话按 Imagine 媒体会话建立。缺少 kind 时上游
+		// 会把请求当成普通对话，imageToImage.inputAssets 绑不上会话，编辑退化成
+		// 只用 message 的文生图（返回与参考图无关的图片）。与 videoCreatePayload 一致。
+		"responseMetadata": map[string]any{
+			"experiments":         []any{},
+			"modelConfigOverride": map[string]any{"modelMap": map[string]any{}},
+		},
 		"mediaGenInput": map[string]any{"imageToImage": imageToImage},
+		"kind":          "CONVERSATION_KIND_IMAGINE",
 	}
 }
 
@@ -1088,6 +1106,12 @@ func imageEditResultURLs(parsed *parsedChat, captured []byte) []string {
 	}
 	result := make([]string, 0, len(values))
 	for _, value := range values {
+		value = strings.TrimSpace(value)
+		// -part- 是流式中间预览，不能被当成编辑成品返回。空值要在拼接资产域名之前
+		// 拦掉，否则 absoluteAssetURL("") 会把域名根当成图片地址。
+		if value == "" || strings.Contains(value, "-part-") {
+			continue
+		}
 		value = absoluteAssetURL(value)
 		if _, moderated := parsed.moderatedImages[value]; moderated || containsString(result, value) {
 			continue

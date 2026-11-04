@@ -37,7 +37,8 @@ type uploadedFile struct {
 	// attachment flows that already accept those references.
 	ID string
 	// MetadataID is populated only from fileMetadata.fileMetadataId. Current
-	// Imagine image-edit requests require this exact identifier in inputAssets.
+	// Imagine image-edit requests prefer this exact identifier in inputAssets;
+	// asynchronous uploads only expose fileId/uploadId, so callers fall back to ID.
 	MetadataID string
 	URI        string
 }

@@ -438,6 +438,64 @@ func TestImageEditStructuredForbiddenDoesNotRetryOrRefresh(t *testing.T) {
 	}
 }
 
+// 上游异步完成上传时只会返回 uploadId，此时 imageToImage.inputAssets 仍需要一个
+// 可用的文件标识。编辑链路必须回退到 uploaded.ID 继续生成，而不是把一次成功上传
+// 直接判成上游故障，也不能只是发一个空 inputAssets 让编辑退化成文生图。
+func TestImageEditFallsBackToUploadIDWhenFileMetadataIsMissing(t *testing.T) {
+	var uploadCalls atomic.Int32
+	var generationCalls atomic.Int32
+	var payload map[string]any
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+		switch request.URL.Path {
+		case "/v1":
+			writeTestClearanceSolution(t, writer, 1)
+		case "/http/upload-file-v2/direct":
+			uploadCalls.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"uploadId":"upload-1"}`))
+		case "/rest/app-chat/conversations/new":
+			generationCalls.Add(1)
+			body, _ := io.ReadAll(request.Body)
+			_ = json.Unmarshal(body, &payload)
+			writeTestPolicyForbidden(writer)
+		default:
+			fhttp.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	adapter, credential := testMediaAdapter(t, server.URL)
+	enableTestClearance(adapter, server.URL)
+	response, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
+		Credential:  credential,
+		ImageURLs:   []string{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+		Prompt:      "turn it blue",
+		Count:       1,
+		Resolution:  "1k",
+		AspectRatio: "9:16",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusForbidden || !json.Valid(body) {
+		t.Fatalf("status=%d body=%s err=%v", response.StatusCode, body, readErr)
+	}
+	if uploadCalls.Load() != 1 || generationCalls.Load() != 1 {
+		t.Fatalf("upload/generation calls=%d/%d, want 1/1", uploadCalls.Load(), generationCalls.Load())
+	}
+	if payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
+		t.Fatalf("kind = %#v", payload["kind"])
+	}
+	mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
+	imageToImage, _ := mediaGenInput["imageToImage"].(map[string]any)
+	assets, _ := imageToImage["inputAssets"].([]any)
+	if len(assets) != 1 || assets[0] != "upload-1" {
+		t.Fatalf("inputAssets = %#v", imageToImage["inputAssets"])
+	}
+}
+
 func testMediaAdapter(t *testing.T, baseURL string) (*Adapter, account.Credential) {
 	t.Helper()
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))

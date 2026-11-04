@@ -118,12 +118,23 @@ export async function editImage(input: {
   model: string;
   prompt: string;
   imageURL: string;
-  aspectRatio: string;
+  // 省略时按参考图原始比例编辑，避免把竖图强行重排成 1:1。
+  aspectRatio?: string;
   signal?: AbortSignal;
 }): Promise<ImageResult[]> {
+  const aspectRatio = (input.aspectRatio ?? "").trim();
   const payload = await publicApiRequest(input.apiKey, "/images/edits", {
     method: "POST",
-    body: { model: input.model, prompt: input.prompt, image: { url: input.imageURL }, n: 1, aspect_ratio: input.aspectRatio, resolution: "1k", response_format: "url", stream: false },
+    body: {
+      model: input.model,
+      prompt: input.prompt,
+      image: { url: input.imageURL },
+      n: 1,
+      ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+      resolution: "1k",
+      response_format: "url",
+      stream: false,
+    },
     signal: input.signal,
   });
   const images = readImages(payload);

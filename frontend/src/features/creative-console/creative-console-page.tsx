@@ -99,6 +99,8 @@ const chatHistoryStoragePrefix = "grok2api:creative-console:chat-history:";
 const chatHistoryMaxSessions = 50;
 const chatHistoryMaxBytes = 4 * 1024 * 1024;
 const composerClassName = "overflow-hidden rounded-2xl bg-secondary/45 ring-1 ring-transparent transition-colors focus-within:bg-secondary/60 focus-within:ring-ring";
+// 服务端请求体硬上限 32 MiB；data URL 会放大 4/3，留出余量后按 20 MiB 拦截。
+const imageEditInlineLimitBytes = 20 * 1024 * 1024;
 
 function revokeBlobURL(url: string | undefined): void {
   if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
@@ -918,7 +920,7 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
 
   const mutation = useMutation({
     mutationFn: (request: { model: string; imageURL?: string; generation: number; signal: AbortSignal }) => request.imageURL
-      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageURL: request.imageURL, aspectRatio, signal: request.signal })
+      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageURL: request.imageURL, signal: request.signal })
       : generateImage({ apiKey, model: request.model, prompt: prompt.trim(), count: Number(count), aspectRatio, resolution, quality: supportsQuality ? quality : undefined, signal: request.signal }),
     onSuccess: (images, request) => {
       if (request.generation !== requests.current()) return;
@@ -964,7 +966,7 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3">
             <div className="flex min-w-0 flex-wrap items-center gap-1">
               <Select value={action} onValueChange={(value) => { setAction(value as "generate" | "edit"); requests.drop(); mutation.reset(); setImages([]); }}><SelectTrigger className="h-8 w-auto gap-1 border-0 bg-transparent text-xs" aria-label={t("creativeConsole.imageAction")}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="generate">{t("creativeConsole.imageGenerateMode")}</SelectItem><SelectItem value="edit">{t("creativeConsole.imageEditMode")}</SelectItem></SelectContent></Select>
-              <CompactModelSelect value={activeModel} models={action === "edit" ? editModels : modelOptions} onChange={action === "edit" ? setEditModel : onModelChange} />
+              <CompactModelSelect value={activeModel} models={action === "edit" ? editModels : modelOptions} onChange={action === "edit" ? (value) => { setEditModel(value); requests.drop(); mutation.reset(); setImages([]); setSourceError(""); } : onModelChange} />
               {action === "edit" ? <><input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" onChange={(event) => {
                 const file = event.target.files?.[0];
                 event.target.value = "";
@@ -972,16 +974,19 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
                 const version = ++selectionVersionRef.current;
                 setSourceImage(null); setSourceError("");
                 if (!file.type.startsWith("image/")) { setSourceError(t("creativeConsole.errors.invalidImage")); return; }
+                // 参考图以 data URL 内联进 JSON 请求体（服务器上限 32 MiB，Base64 膨胀 4/3），
+                // 超过 20 MiB 的原始图片必然被拒，这里先给出可读提示而不是等 413。
+                if (file.size > imageEditInlineLimitBytes) { setSourceError(t("creativeConsole.errors.imageTooLarge")); return; }
                 const reader = new FileReader();
                 reader.onload = () => { if (version === selectionVersionRef.current && typeof reader.result === "string") setSourceImage({ name: file.name, url: reader.result }); };
                 reader.onerror = () => { if (version === selectionVersionRef.current) setSourceError(t("creativeConsole.imageReadError")); };
                 reader.readAsDataURL(file);
               }} /><Button type="button" variant="ghost" size="sm" className="h-8" onClick={() => fileInputRef.current?.click()}><ImagePlus />{t("creativeConsole.uploadImage")}</Button></> : <CompactSelect value={count} options={["1", "2", "3", "4"]} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />}
-              <CompactSelect value={aspectRatio} options={imageAspectRatios} onChange={setAspectRatio} ariaLabel={t("creativeConsole.aspectRatio")} icon={<TvMinimal />} />
+              {action === "generate" ? <CompactSelect value={aspectRatio} options={imageAspectRatios} onChange={setAspectRatio} ariaLabel={t("creativeConsole.aspectRatio")} icon={<TvMinimal />} /> : null}
               {action === "generate" ? <CompactSelect value={resolution} options={imageResolutions} onChange={setResolution} ariaLabel={t("creativeConsole.resolution")} icon={<ImageUpscale />} /> : null}
               {action === "generate" && supportsQuality ? <CompactSelect value={quality} options={["low", "medium"]} onChange={(value) => setQuality(value as "low" | "medium")} ariaLabel={t("creativeConsole.quality")} /> : null}
             </div>
-            <Button type="submit" size="icon" aria-label={t(action === "edit" ? "creativeConsole.imageEditMode" : "creativeConsole.generateImage")} disabled={!apiKey || !activeModel || !prompt.trim() || mutation.isPending || (action === "edit" && !sourceImage)}>{mutation.isPending ? <Loader2 className="animate-spin" /> : <ArrowUp />}</Button>
+            {mutation.isPending ? <Button type="button" size="icon" variant="secondary" aria-label={t("creativeConsole.stopGenerating")} onClick={() => { requests.drop(); mutation.reset(); }}><Square className="size-3.5 fill-current" /></Button> : <Button type="submit" size="icon" aria-label={t(action === "edit" ? "creativeConsole.imageEditMode" : "creativeConsole.generateImage")} disabled={!apiKey || !activeModel || !prompt.trim() || (action === "edit" && !sourceImage)}><ArrowUp /></Button>}
           </div>
         </div>
         {sourceError ? <div className="mt-1 px-2 text-[11px] text-destructive">{sourceError}</div> : null}
