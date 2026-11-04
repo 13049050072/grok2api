@@ -60,6 +60,33 @@ func TestFlareSolverrSolveAcceptsNoChallengeWithoutCloudflareCookies(t *testing.
 	}
 }
 
+func TestFlareSolverrSolveIgnoresEnvironmentProxy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			t.Fatalf("method = %s", request.Method)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"status":"ok","solution":{"userAgent":"Mozilla/5.0","cookies":[]}}`))
+	}))
+	defer server.Close()
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("http_proxy", "http://127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	t.Setenv("https_proxy", "http://127.0.0.1:1")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	solution, err := (flaresolverrSolver{}).Solve(context.Background(), ClearanceConfig{
+		FlareSolverrURL: server.URL, TargetURL: "https://grok.com", Timeout: time.Second,
+	}, "http://user:secret@proxy.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if solution.UserAgent == "" {
+		t.Fatalf("solution = %#v", solution)
+	}
+}
+
 func TestFlareSolverrSolveRejectsTunnelProxy(t *testing.T) {
 	_, err := (flaresolverrSolver{}).Solve(context.Background(), ClearanceConfig{}, "trojan://secret@proxy.example:443")
 	if err == nil || !strings.Contains(err.Error(), "FlareSolverr") {

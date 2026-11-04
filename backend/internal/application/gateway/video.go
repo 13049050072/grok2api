@@ -560,6 +560,13 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	var lease *accountLease
 	var result provider.VideoResult
 	var lastErr error
+	// Failure, cancellation, and success all leave through this function.
+	// Continue-retries release the previous lease at the top of the next attempt.
+	defer func() {
+		if lease != nil {
+			lease.Release()
+		}
+	}()
 
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		attemptStarted := time.Now()
@@ -738,7 +745,6 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		s.failVideoJob(parent, job, "account_unavailable", ErrNoAvailableAccount, 0, failureAttempts.snapshot())
 		return
 	}
-	defer lease.Release()
 
 	// Provider 已消费请求体，尽早释放 Base64 物化名额和大字符串。
 	referenceURLs = nil

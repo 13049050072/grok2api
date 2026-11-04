@@ -3,6 +3,7 @@ package egress
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	_ "github.com/bdandy/go-socks4"
+	"github.com/chenyme/grok2api/backend/internal/pkg/netguard"
 	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
 	xproxy "golang.org/x/net/proxy"
 )
@@ -29,13 +31,10 @@ const (
 	proxyHandshakeTimeout    = 10 * time.Second
 )
 
-var blockedSubscriptionPrefixes = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("2001:db8::/32"),
-}
+// subscriptionIPLookup overrides destination resolution in tests.
+var subscriptionIPLookup func(context.Context, string) ([]netip.Addr, error)
+
+type subscriptionServerNameKey struct{}
 
 type subscriptionEntry struct {
 	ProxyURL string
@@ -74,8 +73,14 @@ func fetchProxySubscription(ctx context.Context, value string, viaProxy string) 
 	}
 	defer transport.CloseIdleConnections()
 	proxied := strings.TrimSpace(viaProxy) != ""
+	var roundTripper http.RoundTripper = transport
+	if proxied {
+		// Pin every request, including redirects, to an address resolved here.
+		// The proxy then receives that IP instead of resolving the name again.
+		roundTripper = &pinnedSubscriptionTransport{base: transport}
+	}
 	client := &http.Client{
-		Transport: transport,
+		Transport: roundTripper,
 		CheckRedirect: func(request *http.Request, via []*http.Request) error {
 			if len(via) >= maxSubscriptionHops {
 				return errors.New("订阅重定向次数过多")
@@ -176,6 +181,68 @@ func subscriptionTransport(viaProxy string) (*http.Transport, error) {
 	return transport, nil
 }
 
+type pinnedSubscriptionTransport struct {
+	base *http.Transport
+}
+
+func (p *pinnedSubscriptionTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if p == nil || p.base == nil || request == nil {
+		return nil, errors.New("订阅地址格式无效")
+	}
+	if err := pinSubscriptionRequest(request); err != nil {
+		return nil, err
+	}
+	transport := p.base.Clone()
+	if request.URL != nil && request.URL.Scheme == "https" {
+		if serverName, _ := request.Context().Value(subscriptionServerNameKey{}).(string); serverName != "" {
+			transport.TLSClientConfig = &tls.Config{ServerName: serverName, NextProtos: []string{"h2", "http/1.1"}}
+		}
+	}
+	return transport.RoundTrip(request)
+}
+
+// pinSubscriptionRequest rewrites the destination to a public IP while keeping
+// the original hostname for the Host header and TLS server name.
+func pinSubscriptionRequest(request *http.Request) error {
+	if request == nil || request.URL == nil || request.URL.Hostname() == "" {
+		return errors.New("订阅地址格式无效")
+	}
+	host := request.URL.Hostname()
+	port := request.URL.Port()
+	if port == "" {
+		if request.URL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	addresses, err := resolvePublicAddresses(request.Context(), net.DefaultResolver, host)
+	if err != nil {
+		return err
+	}
+	pinned := net.JoinHostPort(addresses[0].String(), port)
+	hostHeader := host
+	if (request.URL.Scheme == "https" && port != "443") || (request.URL.Scheme != "https" && port != "80") {
+		hostHeader = net.JoinHostPort(host, port)
+	}
+	// Plain HTTP proxies copy Request.Host into the absolute request-target.
+	// The pinned IP has to live there, or the proxy resolves the original name.
+	if request.URL.Scheme != "https" {
+		if port == "80" {
+			hostHeader = addresses[0].String()
+			if addresses[0].Is6() {
+				hostHeader = "[" + hostHeader + "]"
+			}
+		} else {
+			hostHeader = pinned
+		}
+	}
+	*request = *request.WithContext(context.WithValue(request.Context(), subscriptionServerNameKey{}, host))
+	request.URL.Host = pinned
+	request.Host = hostHeader
+	return nil
+}
+
 type subscriptionProxyForwardDialer struct {
 	dialer  *net.Dialer
 	timeout time.Duration
@@ -261,7 +328,7 @@ func validatePublicSubscriptionTarget(ctx context.Context, value string) error {
 		}
 		return nil
 	}
-	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	addresses, err := lookupHostIPs(ctx, net.DefaultResolver, host)
 	if err != nil {
 		return fmt.Errorf("解析订阅地址: %w", err)
 	}
@@ -316,7 +383,7 @@ func resolvePublicAddresses(ctx context.Context, resolver *net.Resolver, host st
 		}
 		return []netip.Addr{parsed.Unmap()}, nil
 	}
-	addresses, err := resolver.LookupNetIP(ctx, "ip", host)
+	addresses, err := lookupHostIPs(ctx, resolver, host)
 	if err != nil {
 		return nil, err
 	}
@@ -332,17 +399,18 @@ func resolvePublicAddresses(ctx context.Context, resolver *net.Resolver, host st
 	return public, nil
 }
 
+func lookupHostIPs(ctx context.Context, resolver *net.Resolver, host string) ([]netip.Addr, error) {
+	if subscriptionIPLookup != nil {
+		return subscriptionIPLookup(ctx, host)
+	}
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	return resolver.LookupNetIP(ctx, "ip", host)
+}
+
 func isPublicAddress(value netip.Addr) bool {
-	value = value.Unmap()
-	if !value.IsValid() || !value.IsGlobalUnicast() || value.IsLoopback() || value.IsPrivate() || value.IsLinkLocalUnicast() || value.IsLinkLocalMulticast() || value.IsMulticast() || value.IsUnspecified() {
-		return false
-	}
-	for _, prefix := range blockedSubscriptionPrefixes {
-		if prefix.Contains(value) {
-			return false
-		}
-	}
-	return true
+	return netguard.IsPublicAddress(value)
 }
 
 func parseProxySubscription(value string) ([]subscriptionEntry, int, error) {

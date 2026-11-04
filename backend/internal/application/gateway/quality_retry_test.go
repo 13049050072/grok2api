@@ -1995,6 +1995,115 @@ func TestAttemptLoopQualityFailOpenFallbackAndTotalAttemptCap(t *testing.T) {
 	}
 }
 
+func TestResponseOutranksQualityFallback(t *testing.T) {
+	t.Parallel()
+	safety := &UpstreamFailure{SafetyRejection: true}
+	if !responseOutranksQualityFallback(&provider.Response{StatusCode: http.StatusForbidden}, accountdomain.ProviderBuild, safety) {
+		t.Fatal("safety 403 must reach the client")
+	}
+	if responseOutranksQualityFallback(&provider.Response{StatusCode: http.StatusForbidden}, accountdomain.ProviderBuild, &UpstreamFailure{}) {
+		t.Fatal("an ordinary 403 stays eligible for fail-open delivery")
+	}
+	if !responseOutranksQualityFallback(&provider.Response{StatusCode: http.StatusBadRequest}, accountdomain.ProviderBuild, nil) {
+		t.Fatal("400 must reach the client")
+	}
+	if !responseOutranksQualityFallback(&provider.Response{StatusCode: 525}, accountdomain.ProviderBuild, nil) {
+		t.Fatal("build 525 must reach the client")
+	}
+	if responseOutranksQualityFallback(&provider.Response{StatusCode: 525}, accountdomain.ProviderWeb, nil) {
+		t.Fatal("non-build 525 is not the origin-tls failure")
+	}
+	if responseOutranksQualityFallback(&provider.Response{StatusCode: http.StatusInternalServerError}, accountdomain.ProviderBuild, nil) {
+		t.Fatal("500 must remain eligible for fail-open delivery")
+	}
+}
+
+func TestAttemptLoopQualityFailOpenDoesNotHideTerminalClientError(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-hold-terminal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credentials := make([]accountdomain.Credential, 0, 2)
+	for index, name := range []string{"quality-degraded", "quality-terminal"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name,
+			EncryptedAccessToken: name, EncryptedRefreshToken: "refresh-" + name,
+			ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+			Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "quality-terminal-key", Prefix: "qterm", SecretHash: strings.Repeat("c", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content := strings.Repeat("abcd", 40)
+	noThink := sse(
+		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)
+	terminal := `{"code":"permission-denied","error":"Content violates usage guidelines. SAFETY_CHECK_TYPE_VIOLENCE"}`
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credentials[0].ID: {{status: http.StatusOK, body: noThink}},
+		credentials[1].ID: {{status: http.StatusForbidden, body: terminal}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 6)
+	service.UpdateQualityRetry(QualityRetryRuntime{
+		Enabled: true, MaxAttempts: 6, MinOutputTokens: 32, OnExhausted: qualityRetryFailOpen, HoldTimeout: time.Second,
+	})
+
+	result, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-quality-terminal", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true,
+		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"write a game"}],"stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("terminal 403 should be returned, err=%v", err)
+	}
+	body, readErr := io.ReadAll(result.Body)
+	result.Finalize(Usage{}, "", "upstream_forbidden")
+	_ = result.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if result.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "Content violates usage guidelines") || strings.Contains(string(body), content) {
+		t.Fatalf("status=%d body=%s", result.StatusCode, body)
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+		t.Fatalf("attempts=%#v", attempts)
+	}
+}
+
 func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	t.Parallel()
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})

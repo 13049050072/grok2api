@@ -5,7 +5,7 @@ import { Mic, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 type Status = "idle" | "connecting" | "connected";
-type Session = { socket?: WebSocket; stream?: MediaStream; context?: AudioContext; processor?: ScriptProcessorNode; source?: MediaStreamAudioSourceNode; playing: Set<AudioBufferSourceNode>; nextPlayback: number; stopped: boolean };
+type Session = { socket?: WebSocket; stream?: MediaStream; context?: AudioContext; processor?: ScriptProcessorNode; source?: MediaStreamAudioSourceNode; playing: Set<AudioBufferSourceNode>; nextPlayback: number; stopped: boolean; suppressAudio: boolean };
 
 export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string }) {
   const { t } = useTranslation();
@@ -36,7 +36,7 @@ export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string
 
   async function start() {
     if (sessionRef.current || !apiKey || !model) return;
-    const session: Session = { playing: new Set(), nextPlayback: 0, stopped: false };
+    const session: Session = { playing: new Set(), nextPlayback: 0, stopped: false, suppressAudio: false };
     sessionRef.current = session;
     setError(""); setTranscript([]); setStatus("connecting");
     try {
@@ -77,6 +77,7 @@ export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string
           source.connect(processor); processor.connect(context.destination);
           setStatus("connected");
         } else if ((event.type === "response.output_audio.delta" || event.type === "response.audio.delta") && typeof event.delta === "string") {
+          if (session.suppressAudio) return;
           const binary = atob(event.delta);
           const buffer = context.createBuffer(1, Math.floor(binary.length / 2), context.sampleRate);
           const channel = buffer.getChannelData(0);
@@ -85,8 +86,12 @@ export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string
           session.playing.add(player); player.onended = () => session.playing.delete(player);
           session.nextPlayback = Math.max(context.currentTime, session.nextPlayback); player.start(session.nextPlayback); session.nextPlayback += buffer.duration;
         } else if (event.type === "input_audio_buffer.speech_started") {
+          session.suppressAudio = true;
           for (const player of session.playing) { try { player.stop(); } catch { /* already stopped */ } }
           session.playing.clear(); session.nextPlayback = context.currentTime;
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "response.cancel" }));
+        } else if (event.type === "response.created") {
+          session.suppressAudio = false;
         } else if ((event.type === "conversation.item.input_audio_transcription.completed" || event.type === "response.output_audio_transcript.done" || event.type === "response.audio_transcript.done") && typeof event.transcript === "string") {
           const label = event.type.startsWith("conversation.") ? t("creativeConsole.realtimeYou") : t("creativeConsole.realtimeAssistant");
           setTranscript((previous) => [...previous.slice(-49), `${label}: ${event.transcript as string}`]);

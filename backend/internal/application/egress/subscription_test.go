@@ -255,6 +255,58 @@ proxies:
 	}
 }
 
+func TestPinSubscriptionRequestRewritesToResolvedIP(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	request, err := http.NewRequest(http.MethodGet, "https://pinned.example/list", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pinSubscriptionRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	if request.URL.Hostname() != "1.2.3.4" || request.URL.Port() != "443" {
+		t.Fatalf("pinned url = %s", request.URL.Host)
+	}
+	if request.Host != "pinned.example" {
+		t.Fatalf("host header = %q", request.Host)
+	}
+	serverName, _ := request.Context().Value(subscriptionServerNameKey{}).(string)
+	if serverName != "pinned.example" {
+		t.Fatalf("server name = %q", serverName)
+	}
+}
+
+func TestProxiedSubscriptionPinsResolvedAddress(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	var requestURI string
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestURI = request.RequestURI
+		_, _ = writer.Write([]byte("http://proxy.example:8080\n"))
+	}))
+	defer proxy.Close()
+
+	body, err := fetchProxySubscription(context.Background(), "http://pinned.example/subscription", proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(requestURI, "1.2.3.4") || strings.Contains(requestURI, "pinned.example") {
+		t.Fatalf("proxy request uri = %q", requestURI)
+	}
+	if !strings.Contains(string(body), "proxy.example") {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 func TestFetchProxySubscriptionUsesClashUserAgent(t *testing.T) {
 	var userAgent string
 	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -326,6 +378,7 @@ func TestIsPublicAddressRejectsNonPublicRanges(t *testing.T) {
 		"0.0.0.1", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.10.1",
 		"192.0.0.1", "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "240.0.0.1",
 		"::1", "fc00::1", "2001:db8::1", "::ffff:127.0.0.1",
+		"64:ff9b::127.0.0.1", "64:ff9b:1::1", "100::1", "2002:7f00:1::", "3fff::1", "5f00::1",
 	} {
 		if isPublicAddress(netip.MustParseAddr(raw)) {
 			t.Fatalf("non-public address accepted: %s", raw)
@@ -342,6 +395,8 @@ func TestValidatePublicSubscriptionTargetRejectsPrivateAddresses(t *testing.T) {
 		"http://10.0.0.1/subscription",
 		"http://169.254.169.254/latest/meta-data",
 		"http://[::1]/subscription",
+		"http://[64:ff9b::a9fe:a9fe]/latest/meta-data",
+		"http://[2002:a9fe:a9fe::]/latest/meta-data",
 	} {
 		if err := validatePublicSubscriptionTarget(context.Background(), value); err == nil {
 			t.Fatalf("private subscription target accepted: %s", value)

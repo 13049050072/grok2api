@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -74,8 +75,19 @@ func (flaresolverrSolver) Solve(ctx context.Context, cfg ClearanceConfig, proxyU
 		return clearanceSolution{}, fmt.Errorf("创建 FlareSolverr 请求: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	// Proxy is explicit nil so HTTP_PROXY cannot receive the egress proxy URL.
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	client := &http.Client{
 		Timeout: cfg.Timeout + 15*time.Second,
+		Transport: &http.Transport{
+			Proxy:                 nil,
+			DialContext:           dialer.DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          2,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		},
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return errors.New("FlareSolverr 响应不允许重定向")
 		},

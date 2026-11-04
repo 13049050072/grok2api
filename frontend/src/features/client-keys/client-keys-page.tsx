@@ -22,6 +22,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { listModels } from "@/entities/model/model-api";
+import type { ModelRouteDTO } from "@/entities/model/types";
 import { createClientKey, deleteClientKey, deleteClientKeys, getClientKeySecret, listClientKeys, updateClientKey, updateClientKeysEnabled, type ClientKeyDTO, type CreateKeyResponseDTO, type ProviderScopeValue, type TierScopeValue } from "@/features/client-keys/client-keys-api";
 import { EmptyState, ErrorState, LoadingState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
@@ -37,6 +38,20 @@ import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/tabl
 
 const USD_TICKS = 10_000_000_000;
 const MAX_BILLING_LIMIT_USD = 900_000;
+
+function modelCapabilityLabel(capability: ModelRouteDTO["capability"], translate: (key: string) => string): string {
+  switch (capability) {
+    case "responses": return translate("models.capabilityResponses");
+    case "chat": return translate("models.capabilityConversation");
+    case "image": return translate("models.capabilityImage");
+    case "image_edit": return translate("models.capabilityImageEdit");
+    case "video": return translate("models.capabilityVideo");
+    case "tts": return translate("models.capabilityTTS");
+    case "stt": return translate("models.capabilitySTT");
+    case "realtime": return translate("models.capabilityRealtime");
+    default: return capability;
+  }
+}
 
 type SecretDialogState = {
   secret: string;
@@ -576,9 +591,10 @@ export function ClientKeysPage() {
                           const controlId = `allowed-model-${model.id}`;
                           return (
                             <label key={model.id} htmlFor={controlId} className={cn("flex h-8 cursor-pointer items-center gap-2.5 rounded-md px-2 text-xs transition-colors hover:bg-accent/40", checked && "bg-accent/55")}>
-                              <Checkbox id={controlId} checked={checked} onCheckedChange={() => toggleModel(model.id)} aria-label={t("common.selectItem", { name: model.publicId })} />
+                              <Checkbox id={controlId} checked={checked} onCheckedChange={() => toggleModel(model.id)} aria-label={t("common.selectItem", { name: `${model.publicId} ${modelCapabilityLabel(model.capability, t)}` })} />
                               <span className="min-w-0 flex-1 truncate" title={model.publicId}>{model.publicId}</span>
-                              <span className="hidden max-w-[42%] shrink-0 truncate text-[11px] text-muted-foreground sm:block" title={model.upstreamModel}>{model.upstreamModel}</span>
+                              <span className="shrink-0 text-[11px] text-muted-foreground">{modelCapabilityLabel(model.capability, t)}</span>
+                              <span className="hidden max-w-[32%] shrink-0 truncate text-[11px] text-muted-foreground sm:block" title={model.upstreamModel}>{model.upstreamModel}</span>
                               {!model.enabled ? <Badge variant="secondary" className="shrink-0 text-[10px] font-normal text-muted-foreground">{t("common.disabled")}</Badge> : null}
                             </label>
                           );

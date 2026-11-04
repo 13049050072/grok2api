@@ -100,6 +100,31 @@ const chatHistoryMaxSessions = 50;
 const chatHistoryMaxBytes = 4 * 1024 * 1024;
 const composerClassName = "overflow-hidden rounded-2xl bg-secondary/45 ring-1 ring-transparent transition-colors focus-within:bg-secondary/60 focus-within:ring-ring";
 
+function revokeBlobURL(url: string | undefined): void {
+  if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
+}
+
+function useRequestGuard() {
+  const generationRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => abortRef.current?.abort(), []);
+  return {
+    current: () => generationRef.current,
+    start() {
+      generationRef.current += 1;
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      return { generation: generationRef.current, signal: controller.signal };
+    },
+    drop() {
+      generationRef.current += 1;
+      abortRef.current?.abort();
+      abortRef.current = null;
+    },
+  };
+}
+
 export function CreativeConsolePage() {
   const { t } = useTranslation();
   const [mode, setMode] = useState<CreativeMode>("chat");
@@ -232,7 +257,7 @@ export function CreativeConsolePage() {
         <div className="shrink-0 space-y-2 px-3">
           {keysQuery.isError ? <RetryableError message={keysQuery.error.message} onRetry={() => void keysQuery.refetch()} /> : null}
           {!keysQuery.isPending && !keysQuery.isError && activeKeys.length === 0 ? <InlineError message={t("creativeConsole.errors.noKeys")} /> : null}
-          {keyError ? <InlineError message={keyError} /> : null}
+          {keyError ? <RetryableError message={keyError} onRetry={() => { if (effectiveKeyId) loadSecret(effectiveKeyId); }} /> : null}
           {modelsQuery.isError ? <RetryableError message={modelsQuery.error.message} onRetry={() => void modelsQuery.refetch()} /> : null}
         </div>
 
@@ -885,19 +910,25 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
   const [quality, setQuality] = useState<"low" | "medium">("medium");
   const [images, setImages] = useState<ImageResult[]>([]);
   const supportsQuality = model.toLowerCase().endsWith("grok-imagine-image-2.0");
+  const requests = useRequestGuard();
 
   const mutation = useMutation({
-    mutationFn: (request: { model: string; imageURL?: string }) => request.imageURL
-      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageURL: request.imageURL, aspectRatio })
-      : generateImage({ apiKey, model: request.model, prompt: prompt.trim(), count: Number(count), aspectRatio, resolution, quality: supportsQuality ? quality : undefined }),
-    onSuccess: setImages,
+    mutationFn: (request: { model: string; imageURL?: string; generation: number; signal: AbortSignal }) => request.imageURL
+      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageURL: request.imageURL, aspectRatio, signal: request.signal })
+      : generateImage({ apiKey, model: request.model, prompt: prompt.trim(), count: Number(count), aspectRatio, resolution, quality: supportsQuality ? quality : undefined, signal: request.signal }),
+    onSuccess: (images, request) => {
+      if (request.generation !== requests.current()) return;
+      setImages(images);
+    },
   });
 
   function submit(event: FormEvent): void {
     event.preventDefault();
     if (!apiKey || !activeModel || !prompt.trim() || mutation.isPending || (action === "edit" && !sourceImage)) return;
     mutation.reset();
-    mutation.mutate({ model: activeModel, imageURL: action === "edit" ? sourceImage?.url : undefined });
+    setImages([]);
+    const attempt = requests.start();
+    mutation.mutate({ model: activeModel, imageURL: action === "edit" ? sourceImage?.url : undefined, generation: attempt.generation, signal: attempt.signal });
   }
 
   return (
@@ -928,7 +959,7 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
           <Textarea id="image-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t(action === "edit" ? "creativeConsole.imageEditPlaceholder" : "creativeConsole.imagePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3">
             <div className="flex min-w-0 flex-wrap items-center gap-1">
-              <Select value={action} onValueChange={(value) => { setAction(value as "generate" | "edit"); mutation.reset(); }}><SelectTrigger className="h-8 w-auto gap-1 border-0 bg-transparent text-xs" aria-label={t("creativeConsole.imageAction")}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="generate">{t("creativeConsole.imageGenerateMode")}</SelectItem><SelectItem value="edit">{t("creativeConsole.imageEditMode")}</SelectItem></SelectContent></Select>
+              <Select value={action} onValueChange={(value) => { setAction(value as "generate" | "edit"); requests.drop(); mutation.reset(); setImages([]); }}><SelectTrigger className="h-8 w-auto gap-1 border-0 bg-transparent text-xs" aria-label={t("creativeConsole.imageAction")}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="generate">{t("creativeConsole.imageGenerateMode")}</SelectItem><SelectItem value="edit">{t("creativeConsole.imageEditMode")}</SelectItem></SelectContent></Select>
               <CompactModelSelect value={activeModel} models={action === "edit" ? editModels : modelOptions} onChange={action === "edit" ? setEditModel : onModelChange} />
               {action === "edit" ? <><input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" onChange={(event) => {
                 const file = event.target.files?.[0];
@@ -950,7 +981,7 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
           </div>
         </div>
         {sourceError ? <div className="mt-1 px-2 text-[11px] text-destructive">{sourceError}</div> : null}
-        {mutation.isError ? <div className="mt-1 px-2 text-[11px] text-destructive">{mutation.error.message}</div> : null}
+        {mutation.isError && !isAbortError(mutation.error) ? <div className="mt-1 px-2 text-[11px] text-destructive">{mutation.error.message}</div> : null}
       </form>
     </div>
   );
@@ -1008,9 +1039,10 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const isReferenceMode = hasReferenceImage || hasReferenceAudio;
   const generateResolutions = isReferenceMode ? videoResolutions.filter((item) => item !== "1080p") : videoResolutions;
   const selectedVideoResolution = isReferenceMode && resolution === "1080p" ? "720p" : resolution;
+  const requests = useRequestGuard();
 
   const createMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (request: { generation: number; signal: AbortSignal }) => {
       if (!apiKey || !activeModel) throw new Error(t("creativeConsole.errors.noModels"));
       if (action === "generate") {
         let nextImageURL = imageURL.trim() || undefined;
@@ -1048,13 +1080,14 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
           duration: Number(duration),
           aspectRatio,
           resolution: selectedVideoResolution,
+          signal: request.signal,
         });
       }
       const videoURL = sourceVideoURL.trim() || undefined;
       const videoFileID = sourceVideoFileID || undefined;
       if (!videoURL && !videoFileID) throw new Error(t("creativeConsole.errors.noSourceVideo"));
       if (action === "edit") {
-        return editVideo({ apiKey, model: activeModel, prompt: prompt.trim(), videoURL, videoFileID });
+        return editVideo({ apiKey, model: activeModel, prompt: prompt.trim(), videoURL, videoFileID, signal: request.signal });
       }
       return extendVideo({
         apiKey,
@@ -1063,9 +1096,13 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
         videoURL,
         videoFileID,
         duration: Number(extendDuration),
+        signal: request.signal,
       });
     },
-    onSuccess: (requestId) => setJob({ requestId, apiKey }),
+    onSuccess: (requestId, request) => {
+      if (request.generation !== requests.current()) return;
+      setJob({ requestId, apiKey });
+    },
   });
 
   // 本地媒体进入有 TTL 的隐藏临时区；视频任务只持久化短 file_id，不写入图库或公开 URL。
@@ -1131,7 +1168,8 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     }
     setJob(null);
     createMutation.reset();
-    createMutation.mutate();
+    const attempt = requests.start();
+    createMutation.mutate(attempt);
   }
 
   const placeholder = action === "generate"
@@ -1188,6 +1226,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
                 className={cn("h-7 rounded-full px-3 text-xs font-normal", action === value && "bg-secondary/70 text-foreground")}
                 onClick={() => {
                   setAction(value);
+                  requests.drop();
                   setJob(null);
                   createMutation.reset();
                 }}
@@ -1290,7 +1329,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__none__">{t("creativeConsole.referenceVoiceNone")}</SelectItem>
-                    {(voices.length > 0 ? voices : [{ voiceId: "eve", name: "Eve" }, { voiceId: "ara", name: "Ara" }] as VoiceInfo[]).map((voice) => (
+                    {(voicesQuery.isError ? [] : voices.length > 0 ? voices : [{ voiceId: "eve", name: "Eve" }, { voiceId: "ara", name: "Ara" }] as VoiceInfo[]).map((voice) => (
                       <SelectItem key={voice.voiceId} value={voice.voiceId}>{voice.name || voice.voiceId}</SelectItem>
                     ))}
                   </SelectContent>
@@ -1351,7 +1390,8 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
             </Button>
           </div>
         </div>
-        {createMutation.isError ? <div className="mt-1 px-2 text-[11px] text-destructive">{createMutation.error.message}</div> : null}
+        {createMutation.isError && !isAbortError(createMutation.error) ? <div className="mt-1 px-2 text-[11px] text-destructive">{createMutation.error.message}</div> : null}
+        {action === "generate" && voicesQuery.isError ? <div className="mt-1 px-2 text-[11px] text-destructive">{voicesQuery.error.message}</div> : null}
       </form>
     </div>
   );
@@ -1397,7 +1437,16 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [ttsResult, setTtsResult] = useState<TTSResult | null>(null);
   const [sttResult, setSttResult] = useState<STTResult | null>(null);
+  const ttsResultRef = useRef<TTSResult | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const requests = useRequestGuard();
+  useEffect(() => () => revokeBlobURL(ttsResultRef.current?.url), []);
+
+  function publishTts(result: TTSResult | null): void {
+    if (ttsResultRef.current?.url !== result?.url) revokeBlobURL(ttsResultRef.current?.url);
+    ttsResultRef.current = result;
+    setTtsResult(result);
+  }
 
   const filteredModels = useMemo(() => {
     const matched = modelOptions.filter((item) => (
@@ -1412,7 +1461,7 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     : filteredModels[0]?.publicId ?? "";
 
   useEffect(() => {
-    if (activeModel !== model) onModelChange(activeModel);
+    if (activeModel && activeModel !== model) onModelChange(activeModel);
   }, [activeModel, model, onModelChange]);
 
   const voicesQuery = useQuery({
@@ -1427,35 +1476,50 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     : voices[0]?.voiceId ?? voiceId;
 
   const ttsMutation = useMutation({
-    mutationFn: () => synthesizeSpeech({ apiKey, model: activeModel || "grok-voice-latest", text: prompt.trim(), voiceId: activeVoiceId, language, speed: Number(speed) }),
-    onSuccess: (result) => {
-      setTtsResult(result);
+    mutationFn: (request: { generation: number; signal: AbortSignal }) => synthesizeSpeech({ apiKey, model: activeModel || "grok-voice-latest", text: prompt.trim(), voiceId: activeVoiceId, language, speed: Number(speed), signal: request.signal }),
+    onSuccess: (result, request) => {
+      if (request.generation !== requests.current()) {
+        revokeBlobURL(result.url);
+        return;
+      }
+      publishTts(result);
       setSttResult(null);
     },
   });
   const sttMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (request: { generation: number; signal: AbortSignal }) => {
       if (!audioFile) throw new Error(t("creativeConsole.errors.noAudio"));
-      return transcribeSpeech({ apiKey, model: activeModel || "grok-stt", file: audioFile, language });
+      return transcribeSpeech({ apiKey, model: activeModel || "grok-stt", file: audioFile, language, signal: request.signal });
     },
-    onSuccess: (result) => {
+    onSuccess: (result, request) => {
+      if (request.generation !== requests.current()) return;
       setSttResult(result);
-      setTtsResult(null);
+      publishTts(null);
     },
   });
+
+  function leaveSubMode(next: "tts" | "stt" | "realtime"): void {
+    if (next === subMode) return;
+    requests.drop();
+    ttsMutation.reset();
+    sttMutation.reset();
+    setSubMode(next);
+  }
 
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!apiKey || !activeModel) return;
     if (subMode === "tts") {
       if (!prompt.trim() || ttsMutation.isPending) return;
+      const attempt = requests.start();
       ttsMutation.reset();
-      ttsMutation.mutate();
+      ttsMutation.mutate(attempt);
       return;
     }
     if (!audioFile || sttMutation.isPending) return;
+    const attempt = requests.start();
     sttMutation.reset();
-    sttMutation.mutate();
+    sttMutation.mutate(attempt);
   }
 
   const busy = ttsMutation.isPending || sttMutation.isPending;
@@ -1484,14 +1548,14 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
             </div>
           </div>
         ) : null}
-        {ttsMutation.isError ? <div className="px-2 text-[11px] text-destructive">{ttsMutation.error.message}</div> : null}
-        {sttMutation.isError ? <div className="px-2 text-[11px] text-destructive">{sttMutation.error.message}</div> : null}
+        {ttsMutation.isError && !isAbortError(ttsMutation.error) ? <div className="px-2 text-[11px] text-destructive">{ttsMutation.error.message}</div> : null}
+        {sttMutation.isError && !isAbortError(sttMutation.error) ? <div className="px-2 text-[11px] text-destructive">{sttMutation.error.message}</div> : null}
       </div>
       <form onSubmit={submit} className={composerClassName}>
         <div className="flex items-center gap-2 px-3 pt-3">
-          <Button type="button" size="sm" variant={subMode === "tts" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => setSubMode("tts")}><AudioLines />{t("creativeConsole.synthesize")}</Button>
-          <Button type="button" size="sm" variant={subMode === "stt" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => setSubMode("stt")}><Mic />{t("creativeConsole.transcribe")}</Button>
-          <Button type="button" size="sm" variant={subMode === "realtime" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => setSubMode("realtime")}><AudioLines />{t("creativeConsole.realtime")}</Button>
+          <Button type="button" size="sm" variant={subMode === "tts" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => leaveSubMode("tts")}><AudioLines />{t("creativeConsole.synthesize")}</Button>
+          <Button type="button" size="sm" variant={subMode === "stt" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => leaveSubMode("stt")}><Mic />{t("creativeConsole.transcribe")}</Button>
+          <Button type="button" size="sm" variant={subMode === "realtime" ? "secondary" : "ghost"} className="h-8 gap-1.5" onClick={() => leaveSubMode("realtime")}><AudioLines />{t("creativeConsole.realtime")}</Button>
         </div>
         {subMode === "realtime" ? <RealtimeVoice key={`${apiKey}:${activeModel}`} apiKey={apiKey} model={activeModel} /> : subMode === "tts" ? (
           <Textarea id="voice-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t("creativeConsole.voicePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
@@ -1510,6 +1574,7 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
               <CompactSelect value={speed} options={speedOptions} onChange={setSpeed} ariaLabel={t("creativeConsole.voiceSpeed")} suffix="x" icon={<Clock3 />} />
             ) : null}
             {subMode === "tts" ? (
+              voicesQuery.isError ? <span className="px-2 text-[11px] text-destructive">{voicesQuery.error.message}</span> : (
               <Select value={activeVoiceId} onValueChange={setVoiceId} disabled={voices.length === 0 && voicesQuery.isPending}>
                 <SelectTrigger className="h-8 w-auto max-w-40 gap-1 border-0 bg-transparent px-2 shadow-none hover:bg-secondary/70 focus:ring-0" aria-label={t("creativeConsole.voiceId")}>
                   <SelectValue placeholder={t("creativeConsole.voiceId")} />
@@ -1520,6 +1585,7 @@ function VoicePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
                   ))}
                 </SelectContent>
               </Select>
+              )
             ) : null}
           </div>
           {subMode !== "realtime" ? <Button type="submit" size="icon" aria-label={subMode === "tts" ? t("creativeConsole.synthesize") : t("creativeConsole.transcribe")} disabled={!apiKey || !activeModel || busy || (subMode === "tts" ? !prompt.trim() : !audioFile)}>

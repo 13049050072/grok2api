@@ -1699,7 +1699,7 @@ attemptLoop:
 				}
 			}
 		}
-		if fallback != nil && holdCfg.OnExhausted == qualityRetryFailOpen {
+		if fallback != nil && holdCfg.OnExhausted == qualityRetryFailOpen && !responseOutranksQualityFallback(response, route.Provider, lastFailure) {
 			_ = response.Body.Close()
 			lease.completeSelectorObservation(false)
 			lease.Release()
@@ -1707,6 +1707,9 @@ attemptLoop:
 			fallback = nil
 			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
 			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+		}
+		if fallback != nil {
+			discardFallback(true)
 		}
 		return handoffResponse(response, lease, credential, responseStartedAt), nil
 	}
@@ -2143,6 +2146,22 @@ func shouldStopForNonAccountFingerprint(fingerprints map[string]int, failure *Up
 
 func isRetryable(status int) bool {
 	return status == 402 || status == 403 || status == 429 || status >= 500
+}
+
+// responseOutranksQualityFallback keeps a definitive client or origin error
+// ahead of a previously held no-thinking stream. Retryable upstream failures
+// still continue and can deliver that stream once attempts are exhausted.
+func responseOutranksQualityFallback(response *provider.Response, upstreamProvider accountdomain.Provider, failure *UpstreamFailure) bool {
+	if response == nil {
+		return false
+	}
+	if response.StatusCode == http.StatusForbidden && isTerminalRequestForbidden(upstreamProvider, failure) {
+		return true
+	}
+	if upstreamProvider == accountdomain.ProviderBuild && (response.StatusCode == 525 || response.StatusCode == 526) {
+		return true
+	}
+	return response.StatusCode >= 400 && response.StatusCode < 500 && !isRetryable(response.StatusCode)
 }
 
 // isBuildTransientRetryStatus mirrors the Grok Build client's turn-level
