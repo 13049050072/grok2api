@@ -350,6 +350,8 @@ Authorization: Bearer g2a_xxx_xxx
 | `GET`           | `/v1/media/images/{asset_id}`, `/v1/media/videos/{asset_id}` | Read archived media                  |
 
 
+`/v1/images/edits` accepts `application/json` and `multipart/form-data`: each entry of `image`/`images` may be an HTTP(S) or data URL, an `input_` temporary `file_id`, or a plain string, and multipart file fields (`image`, `images`, `image[]`, `images[]`) take PNG, JPEG, WebP, or GIF up to 20 MiB per file.
+
 Stored responses and compact depend on the selected Provider. The signed-in admin console provides live examples at `/docs`; Swagger is available only when `server.swaggerEnabled: true`.
 
 `/v1/audio/transcriptions` supports `json` (default), `verbose_json`, and `text`. Video edit/extension routes must resolve to Console `grok-imagine-video`; custom public model names remain supported. Monetary billing is applied only when the gateway can reliably measure the official pricing unit: TTS is reserved and settled from its input character count, while REST and streaming STT are settled from the actual audio duration returned by a successful response. Because STT duration is known only after completion, concurrent requests may briefly take a billing-limited key beyond its spend limit. Realtime, video edits/extensions, and custom routes without a recognized official price are currently audited as unpriced; they remain callable and do not consume the spend limit.

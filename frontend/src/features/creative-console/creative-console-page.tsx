@@ -99,8 +99,8 @@ const chatHistoryStoragePrefix = "grok2api:creative-console:chat-history:";
 const chatHistoryMaxSessions = 50;
 const chatHistoryMaxBytes = 4 * 1024 * 1024;
 const composerClassName = "overflow-hidden rounded-2xl bg-secondary/45 ring-1 ring-transparent transition-colors focus-within:bg-secondary/60 focus-within:ring-ring";
-// 服务端请求体硬上限 32 MiB；data URL 会放大 4/3，留出余量后按 20 MiB 拦截。
-const imageEditInlineLimitBytes = 20 * 1024 * 1024;
+// 临时输入区（/api/admin/v1/media/inputs/upload）的单文件上限，与服务端 20 MiB 对齐。
+const imageEditInputLimitBytes = 20 * 1024 * 1024;
 
 function revokeBlobURL(url: string | undefined): void {
   if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
@@ -904,10 +904,12 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
   const [prompt, setPrompt] = useState("");
   const [action, setAction] = useState<"generate" | "edit">("generate");
   const [editModel, setEditModel] = useState("");
-  const [sourceImage, setSourceImage] = useState<{ name: string; url: string } | null>(null);
+  const [sourceImage, setSourceImage] = useState<{ name: string; url: string; fileId: string } | null>(null);
   const [sourceError, setSourceError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectionVersionRef = useRef(0);
+  const sourcePreviewRef = useRef("");
+  useEffect(() => () => revokeBlobURL(sourcePreviewRef.current), []);
   const activeEditModel = editModels.some((item) => item.publicId === editModel) ? editModel : editModels[0]?.publicId ?? "";
   const activeModel = action === "edit" ? activeEditModel : model;
   const [count, setCount] = useState("1");
@@ -918,9 +920,26 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
   const supportsQuality = model.toLowerCase().endsWith("grok-imagine-image-2.0");
   const requests = useRequestGuard();
 
+  // 参考图先落到带 TTL 的临时输入区，请求体只带 input_xxx file_id：
+  // 既避开 32 MiB JSON 上限，也把大图彻底挡在浏览器和网关之外。
+  const uploadMutation = useMutation({
+    mutationFn: (request: { file: File; version: number }) => uploadMediaInput(request.file),
+    onSuccess: (uploaded, request) => {
+      if (request.version !== selectionVersionRef.current) return;
+      setSourceImage((current) => (current ? { ...current, fileId: uploaded.fileId } : current));
+    },
+    onError: (error, request) => {
+      if (request.version !== selectionVersionRef.current) return;
+      revokeBlobURL(sourcePreviewRef.current);
+      sourcePreviewRef.current = "";
+      setSourceImage(null);
+      setSourceError(error instanceof Error ? error.message : t("creativeConsole.imageReadError"));
+    },
+  });
+
   const mutation = useMutation({
-    mutationFn: (request: { model: string; imageURL?: string; generation: number; signal: AbortSignal }) => request.imageURL
-      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageURL: request.imageURL, signal: request.signal })
+    mutationFn: (request: { model: string; edit: boolean; imageFileID?: string; generation: number; signal: AbortSignal }) => request.edit
+      ? editImage({ apiKey, model: request.model, prompt: prompt.trim(), imageFileID: request.imageFileID, signal: request.signal })
       : generateImage({ apiKey, model: request.model, prompt: prompt.trim(), count: Number(count), aspectRatio, resolution, quality: supportsQuality ? quality : undefined, signal: request.signal }),
     onSuccess: (images, request) => {
       if (request.generation !== requests.current()) return;
@@ -930,11 +949,11 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
 
   function submit(event: FormEvent): void {
     event.preventDefault();
-    if (!apiKey || !activeModel || !prompt.trim() || mutation.isPending || (action === "edit" && !sourceImage)) return;
+    if (!apiKey || !activeModel || !prompt.trim() || mutation.isPending || uploadMutation.isPending || (action === "edit" && !sourceImage?.fileId)) return;
     mutation.reset();
     setImages([]);
     const attempt = requests.start();
-    mutation.mutate({ model: activeModel, imageURL: action === "edit" ? sourceImage?.url : undefined, generation: attempt.generation, signal: attempt.signal });
+    mutation.mutate({ model: activeModel, edit: action === "edit", imageFileID: sourceImage?.fileId || undefined, generation: attempt.generation, signal: attempt.signal });
   }
 
   return (
@@ -961,7 +980,7 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
 
       <form className="w-full shrink-0 px-3 pb-2 sm:px-6 sm:pb-3" onSubmit={submit}>
         <div className={composerClassName}>
-          {action === "edit" && sourceImage ? <div className="flex items-center gap-3 px-4 pt-3"><img src={sourceImage.url} alt={t("creativeConsole.sourceImage")} className="size-14 rounded-lg object-cover" /><span className="min-w-0 flex-1 truncate text-xs">{sourceImage.name}</span><Button type="button" variant="ghost" size="icon" aria-label={t("creativeConsole.clearSourceImage")} onClick={() => { selectionVersionRef.current += 1; setSourceImage(null); setSourceError(""); }}><X /></Button></div> : null}
+          {action === "edit" && sourceImage ? <div className="flex items-center gap-3 px-4 pt-3"><img src={sourceImage.url} alt={t("creativeConsole.sourceImage")} className="size-14 rounded-lg object-cover" /><span className="min-w-0 flex-1 truncate text-xs">{sourceImage.name}</span>{uploadMutation.isPending || !sourceImage.fileId ? <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" /> : null}<Button type="button" variant="ghost" size="icon" aria-label={t("creativeConsole.clearSourceImage")} onClick={() => { selectionVersionRef.current += 1; uploadMutation.reset(); revokeBlobURL(sourcePreviewRef.current); sourcePreviewRef.current = ""; setSourceImage(null); setSourceError(""); }}><X /></Button></div> : null}
           <Textarea id="image-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t(action === "edit" ? "creativeConsole.imageEditPlaceholder" : "creativeConsole.imagePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3">
             <div className="flex min-w-0 flex-wrap items-center gap-1">
@@ -972,21 +991,23 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange, editModels }: 
                 event.target.value = "";
                 if (!file) return;
                 const version = ++selectionVersionRef.current;
+                revokeBlobURL(sourcePreviewRef.current);
+                sourcePreviewRef.current = "";
+                uploadMutation.reset();
                 setSourceImage(null); setSourceError("");
                 if (!file.type.startsWith("image/")) { setSourceError(t("creativeConsole.errors.invalidImage")); return; }
-                // 参考图以 data URL 内联进 JSON 请求体（服务器上限 32 MiB，Base64 膨胀 4/3），
-                // 超过 20 MiB 的原始图片必然被拒，这里先给出可读提示而不是等 413。
-                if (file.size > imageEditInlineLimitBytes) { setSourceError(t("creativeConsole.errors.imageTooLarge")); return; }
-                const reader = new FileReader();
-                reader.onload = () => { if (version === selectionVersionRef.current && typeof reader.result === "string") setSourceImage({ name: file.name, url: reader.result }); };
-                reader.onerror = () => { if (version === selectionVersionRef.current) setSourceError(t("creativeConsole.imageReadError")); };
-                reader.readAsDataURL(file);
-              }} /><Button type="button" variant="ghost" size="sm" className="h-8" onClick={() => fileInputRef.current?.click()}><ImagePlus />{t("creativeConsole.uploadImage")}</Button></> : <CompactSelect value={count} options={["1", "2", "3", "4"]} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />}
+                // 临时输入区单文件上限 20 MiB，超限先给可读提示而不是等上游 413。
+                if (file.size > imageEditInputLimitBytes) { setSourceError(t("creativeConsole.errors.imageTooLarge")); return; }
+                const preview = URL.createObjectURL(file);
+                sourcePreviewRef.current = preview;
+                setSourceImage({ name: file.name, url: preview, fileId: "" });
+                uploadMutation.mutate({ file, version });
+              }} /><Button type="button" variant="ghost" size="sm" className="h-8" disabled={uploadMutation.isPending} onClick={() => fileInputRef.current?.click()}>{uploadMutation.isPending ? <Loader2 className="animate-spin" /> : <ImagePlus />}{t("creativeConsole.uploadImage")}</Button></> : <CompactSelect value={count} options={["1", "2", "3", "4"]} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />}
               {action === "generate" ? <CompactSelect value={aspectRatio} options={imageAspectRatios} onChange={setAspectRatio} ariaLabel={t("creativeConsole.aspectRatio")} icon={<TvMinimal />} /> : null}
               {action === "generate" ? <CompactSelect value={resolution} options={imageResolutions} onChange={setResolution} ariaLabel={t("creativeConsole.resolution")} icon={<ImageUpscale />} /> : null}
               {action === "generate" && supportsQuality ? <CompactSelect value={quality} options={["low", "medium"]} onChange={(value) => setQuality(value as "low" | "medium")} ariaLabel={t("creativeConsole.quality")} /> : null}
             </div>
-            {mutation.isPending ? <Button type="button" size="icon" variant="secondary" aria-label={t("creativeConsole.stopGenerating")} onClick={() => { requests.drop(); mutation.reset(); }}><Square className="size-3.5 fill-current" /></Button> : <Button type="submit" size="icon" aria-label={t(action === "edit" ? "creativeConsole.imageEditMode" : "creativeConsole.generateImage")} disabled={!apiKey || !activeModel || !prompt.trim() || (action === "edit" && !sourceImage)}><ArrowUp /></Button>}
+            {mutation.isPending ? <Button type="button" size="icon" variant="secondary" aria-label={t("creativeConsole.stopGenerating")} onClick={() => { requests.drop(); mutation.reset(); }}><Square className="size-3.5 fill-current" /></Button> : <Button type="submit" size="icon" aria-label={t(action === "edit" ? "creativeConsole.imageEditMode" : "creativeConsole.generateImage")} disabled={!apiKey || !activeModel || !prompt.trim() || uploadMutation.isPending || (action === "edit" && !sourceImage?.fileId)}><ArrowUp /></Button>}
           </div>
         </div>
         {sourceError ? <div className="mt-1 px-2 text-[11px] text-destructive">{sourceError}</div> : null}

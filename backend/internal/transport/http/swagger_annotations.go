@@ -43,23 +43,33 @@ type SwaggerImageGenerationRequest struct {
 	PartialImages  int    `json:"partial_images,omitempty" example:"0"`
 }
 
-// SwaggerImageReference 表示图片 URL 输入。
+// SwaggerImageReference 表示图片编辑里的单个图片输入：对象 {"url":...} 与
+// {"file_id":...} 两种写法，也允许直接把字符串当 url 传（等价于 {"url":...}）。
 type SwaggerImageReference struct {
-	URL string `json:"url" example:"https://example.com/source.png"`
+	// HTTP(S) 图片地址，或 data URL（如 data:image/png;base64,...）。
+	URL string `json:"url,omitempty" example:"https://example.com/source.png"`
+	// 临时输入资产 ID（input_ 前缀，由上传任务产生），与 url 二选一。
+	FileID string `json:"file_id,omitempty" example:"input_5q2t9b3xk1v8mN0pQrStUvWxYzAbCd"`
 }
 
 // SwaggerImageEditRequest 表示图片编辑请求。
+// image 与 images 至少提供一个，合计 1-8 张；字段本身可以是单对象、单字符串或数组。
 type SwaggerImageEditRequest struct {
-	Model          string                `json:"model" example:"grok-imagine-image-edit"`
-	Prompt         string                `json:"prompt" example:"Change the background to black"`
-	Image          SwaggerImageReference `json:"image"`
-	N              int                   `json:"n" example:"1"`
-	Size           string                `json:"size,omitempty" example:"1024x1024"`
-	AspectRatio    string                `json:"aspect_ratio,omitempty" example:"1:1"`
-	Resolution     string                `json:"resolution,omitempty" example:"1k"`
-	ResponseFormat string                `json:"response_format,omitempty" example:"url"`
-	Stream         bool                  `json:"stream,omitempty" example:"false"`
-	PartialImages  int                   `json:"partial_images,omitempty" example:"0"`
+	Model  string `json:"model" example:"grok-imagine-image-edit"`
+	Prompt string `json:"prompt" example:"Change the background to black"`
+	// 单张参考图：对象写法见 SwaggerImageReference，也可直接给字符串。
+	Image *SwaggerImageReference `json:"image,omitempty"`
+	// 多张参考图，元素写法与 image 相同。
+	Images         []SwaggerImageReference `json:"images,omitempty"`
+	N              int                     `json:"n" example:"1"`
+	Size           string                  `json:"size,omitempty" example:"1024x1024"`
+	AspectRatio    string                  `json:"aspect_ratio,omitempty" example:"1:1"`
+	Resolution     string                  `json:"resolution,omitempty" example:"1k"`
+	// 生成质量，仅 Console grok-imagine-image-2.0 路由接受 low/medium；Web 编辑路由不接受该字段。
+	Quality        string                  `json:"quality,omitempty" example:"medium"`
+	ResponseFormat string                  `json:"response_format,omitempty" example:"url"`
+	Stream         bool                    `json:"stream,omitempty" example:"false"`
+	PartialImages  int                     `json:"partial_images,omitempty" example:"0"`
 }
 
 // SwaggerVideoGenerationRequest 表示视频生成请求。
@@ -201,9 +211,13 @@ func swaggerGenerateImage() {}
 
 // swaggerEditImage godoc
 // @Summary 编辑图片
+// @Description 支持 application/json 与 multipart/form-data 两种传输形态。
+// @Description JSON 形态：image 与 images 至少提供一个，合计 1-8 张；每个元素支持对象 {"url":"https://..."}（也接受 data URL）、对象 {"file_id":"input_..."}（临时输入资产）以及直接传字符串三种写法。
+// @Description multipart 形态：图片放文件字段 image、images、image[]、images[]，只接受 PNG、JPEG、WebP、GIF，单文件上限 20 MiB；同一字段也可传 URL 或 file_id 文本。
+// @Description 全部参考图 Base64 后合计不超过 32 MiB（与请求体上限一致）。
 // @Tags Images
 // @Security BearerAuth
-// @Accept json
+// @Accept json,multipart/form-data
 // @Produce json
 // @Param request body SwaggerImageEditRequest true "请求"
 // @Success 200 {object} map[string]any

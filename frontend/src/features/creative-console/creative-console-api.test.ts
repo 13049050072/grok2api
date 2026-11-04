@@ -30,3 +30,25 @@ it("surfaces an image edit API error", async () => {
     fetchMock.mock.restore();
   }
 });
+
+it("references a staged input file id instead of inlining the image", async () => {
+  const fetchMock = mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
+    assert.equal(url, "/v1/images/edits");
+    assert.deepEqual(JSON.parse(String(init?.body)), {
+      model: "grok-imagine-image-edit", prompt: "make it blue",
+      image: { file_id: "input_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, n: 1,
+      resolution: "1k", response_format: "url", stream: false,
+    });
+    return Response.json({ data: [{ url: "/v1/media/images/result" }] });
+  });
+  try {
+    assert.deepEqual(await editImage({ apiKey: "test-key", model: "grok-imagine-image-edit", prompt: "make it blue", imageFileID: "input_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }), [{ url: "/v1/media/images/result", revisedPrompt: undefined }]);
+    assert.equal(fetchMock.mock.callCount(), 1);
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+it("rejects an image edit request without any input image", async () => {
+  await assert.rejects(editImage({ apiKey: "test-key", model: "model", prompt: "edit" }), /did not contain an input image/);
+});

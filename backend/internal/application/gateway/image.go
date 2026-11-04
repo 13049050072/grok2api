@@ -2,15 +2,19 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	"github.com/chenyme/grok2api/backend/internal/domain/media"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -56,6 +60,63 @@ type ImageEditInput struct {
 	Headers        map[string][]string
 }
 
+const imageInputJSONBaseBytes = int64(len(`{"images":[]}`))
+
+// ImageInputFileReference 将本地临时 file_id 编码为只在 Gateway 内部解释的引用。
+func ImageInputFileReference(fileID string) string {
+	return media.InputReference(fileID)
+}
+
+// resolveImageInputReferences 把临时输入引用物化为 data URI。图片编辑必须在这里
+// 完成物化：上游只接受 URL 或内联图片，而临时输入资产从不通过公开媒体路由暴露，
+// 也没必要让服务端绕公网把自己拉一遍。
+func (s *Service) resolveImageInputReferences(ctx context.Context, references []string) ([]string, error) {
+	resolved := make([]string, 0, len(references))
+	estimatedBytes := imageInputJSONBaseBytes
+	for _, reference := range references {
+		reference = strings.TrimSpace(reference)
+		fileID, local := media.ParseInputReference(reference)
+		if !strings.HasPrefix(reference, media.InputReferencePrefix) {
+			if !addInputReferenceBytes(&estimatedBytes, int64(len(reference))) {
+				return nil, ErrImageInputTooLarge
+			}
+			resolved = append(resolved, reference)
+			continue
+		}
+		if s.mediaAssets == nil || !local {
+			return nil, ErrImageInputUnavailable
+		}
+		asset, body, err := s.mediaAssets.OpenInputAsset(ctx, fileID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrImageInputUnavailable, err)
+		}
+		if asset.Kind != "image" {
+			_ = body.Close()
+			return nil, fmt.Errorf("%w: file_id 必须引用图片", ErrImageInputUnavailable)
+		}
+		if asset.SizeBytes > media.MaxInputJSONBytes {
+			_ = body.Close()
+			return nil, ErrImageInputTooLarge
+		}
+		data, readErr := io.ReadAll(io.LimitReader(body, media.MaxInputJSONBytes+1))
+		closeErr := body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取图片临时输入: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("关闭图片临时输入: %w", closeErr)
+		}
+		if len(data) == 0 || len(data) > media.MaxInputJSONBytes {
+			return nil, ErrImageInputTooLarge
+		}
+		if !addInputReferenceBytes(&estimatedBytes, materializedInputReferenceBytes(asset.MIMEType, int64(len(data)))) {
+			return nil, ErrImageInputTooLarge
+		}
+		resolved = append(resolved, "data:"+asset.MIMEType+";base64,"+base64.StdEncoding.EncodeToString(data))
+	}
+	return resolved, nil
+}
+
 type imageProviderSupport func(accountdomain.Provider) bool
 
 type imageExecution func(context.Context, accountdomain.Provider, accountdomain.Credential, string) (*provider.Response, error)
@@ -80,6 +141,11 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
 
 // EditImage 选择支持图片编辑的路由和账号，并返回可统一审计的上游响应。
 func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result, error) {
+	imageURLs, err := s.resolveImageInputReferences(ctx, input.ImageURLs)
+	if err != nil {
+		return nil, err
+	}
+	input.ImageURLs = imageURLs
 	return s.executeImage(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationImageEdit, modeldomain.CapabilityImageEdit, func(providerValue accountdomain.Provider) bool {
 		_, ok := s.providers.ImageEdit(providerValue)
 		return ok

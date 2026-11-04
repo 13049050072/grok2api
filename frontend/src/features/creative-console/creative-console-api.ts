@@ -117,18 +117,23 @@ export async function editImage(input: {
   apiKey: string;
   model: string;
   prompt: string;
-  imageURL: string;
+  // 二选一：imageFileID 引用临时输入区（input_...），imageURL 直接给地址或 data URL。
+  imageURL?: string;
+  imageFileID?: string;
   // 省略时按参考图原始比例编辑，避免把竖图强行重排成 1:1。
   aspectRatio?: string;
   signal?: AbortSignal;
 }): Promise<ImageResult[]> {
   const aspectRatio = (input.aspectRatio ?? "").trim();
+  const fileID = (input.imageFileID ?? "").trim();
+  const imageURL = (input.imageURL ?? "").trim();
+  if (!fileID && !imageURL) throw new CreativeApiError(0, "The image edit request did not contain an input image", "invalid_request");
   const payload = await publicApiRequest(input.apiKey, "/images/edits", {
     method: "POST",
     body: {
       model: input.model,
       prompt: input.prompt,
-      image: { url: input.imageURL },
+      image: fileID ? { file_id: fileID } : { url: imageURL },
       n: 1,
       ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
       resolution: "1k",

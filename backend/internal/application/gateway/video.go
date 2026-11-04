@@ -823,7 +823,7 @@ func (s *Service) validateVideoInputReferences(ctx context.Context, references [
 	for _, reference := range references {
 		fileID, local := media.ParseInputReference(reference)
 		if !strings.HasPrefix(reference, media.InputReferencePrefix) {
-			if !addVideoReferenceBytes(&estimatedBytes, int64(len(reference))) {
+			if !addInputReferenceBytes(&estimatedBytes, int64(len(reference))) {
 				return ErrVideoInputTooLarge
 			}
 			continue
@@ -839,7 +839,7 @@ func (s *Service) validateVideoInputReferences(ctx context.Context, references [
 		if asset.Kind != expectedKind {
 			return fmt.Errorf("%w: file_id 必须引用%s", ErrVideoInputUnavailable, expectedKind)
 		}
-		if !addVideoReferenceBytes(&estimatedBytes, materializedVideoReferenceBytes(asset.MIMEType, asset.SizeBytes)) {
+		if !addInputReferenceBytes(&estimatedBytes, materializedInputReferenceBytes(asset.MIMEType, asset.SizeBytes)) {
 			return ErrVideoInputTooLarge
 		}
 	}
@@ -883,7 +883,7 @@ func (s *Service) resolveVideoInputReferences(ctx context.Context, references []
 	for _, reference := range references {
 		fileID, local := media.ParseInputReference(reference)
 		if !strings.HasPrefix(reference, media.InputReferencePrefix) {
-			if !addVideoReferenceBytes(&estimatedBytes, int64(len(reference))) {
+			if !addInputReferenceBytes(&estimatedBytes, int64(len(reference))) {
 				return nil, ErrVideoInputTooLarge
 			}
 			resolved = append(resolved, reference)
@@ -911,7 +911,7 @@ func (s *Service) resolveVideoInputReferences(ctx context.Context, references []
 		if len(data) == 0 || len(data) > media.MaxInputJSONBytes {
 			return nil, ErrVideoInputTooLarge
 		}
-		if !addVideoReferenceBytes(&estimatedBytes, materializedVideoReferenceBytes(asset.MIMEType, int64(len(data)))) {
+		if !addInputReferenceBytes(&estimatedBytes, materializedInputReferenceBytes(asset.MIMEType, int64(len(data)))) {
 			return nil, ErrVideoInputTooLarge
 		}
 		resolved = append(resolved, "data:"+asset.MIMEType+";base64,"+base64.StdEncoding.EncodeToString(data))
@@ -919,14 +919,14 @@ func (s *Service) resolveVideoInputReferences(ctx context.Context, references []
 	return resolved, nil
 }
 
-func materializedVideoReferenceBytes(mimeType string, sizeBytes int64) int64 {
+func materializedInputReferenceBytes(mimeType string, sizeBytes int64) int64 {
 	if sizeBytes <= 0 || sizeBytes > int64(media.MaxInputJSONBytes) {
 		return -1
 	}
 	return int64(len("data:")+len(mimeType)+len(";base64,")) + ((sizeBytes+2)/3)*4
 }
 
-func addVideoReferenceBytes(total *int64, referenceBytes int64) bool {
+func addInputReferenceBytes(total *int64, referenceBytes int64) bool {
 	// 两个引号加一个逗号是保守的单元 JSON 开销（首项不需要逗号）。
 	const jsonElementOverhead = 3
 	addition := referenceBytes + jsonElementOverhead

@@ -3,11 +3,13 @@ package inference
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -760,12 +762,263 @@ func TestImageEditAcceptsOfficialJSONShape(t *testing.T) {
 		})
 	}
 
+	wrongMediaType := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{"model":"grok-imagine-image-edit","prompt":"test","image":{"url":"https://example.com/input.png"}}`))
+	wrongMediaType.Header.Set("Content-Type", "text/plain")
+	wrongMediaTypeRecorder := httptest.NewRecorder()
+	router.ServeHTTP(wrongMediaTypeRecorder, wrongMediaType)
+	if wrongMediaTypeRecorder.Code != http.StatusUnsupportedMediaType || !strings.Contains(wrongMediaTypeRecorder.Body.String(), "multipart/form-data") {
+		t.Fatalf("wrong content type status=%d body=%s", wrongMediaTypeRecorder.Code, wrongMediaTypeRecorder.Body.String())
+	}
+
+	// multipart/form-data 现在是官方形态之一，畸形的 multipart 请求体应落到 400 而不是 415。
 	multipartRequest := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader("ignored"))
 	multipartRequest.Header.Set("Content-Type", "multipart/form-data; boundary=test")
 	multipartRecorder := httptest.NewRecorder()
 	router.ServeHTTP(multipartRecorder, multipartRequest)
-	if multipartRecorder.Code != http.StatusUnsupportedMediaType || !strings.Contains(multipartRecorder.Body.String(), "application/json") {
-		t.Fatalf("multipart status=%d body=%s", multipartRecorder.Code, multipartRecorder.Body.String())
+	if multipartRecorder.Code != http.StatusBadRequest || !strings.Contains(multipartRecorder.Body.String(), "multipart") {
+		t.Fatalf("malformed multipart status=%d body=%s", multipartRecorder.Code, multipartRecorder.Body.String())
+	}
+}
+
+func TestImageEditAcceptsStringAndFileIDInputs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	NewHandler(nil, nil, 1<<20).Register(router.Group("/v1"))
+
+	const fileID = "input_abcdefghijklmnopqrstuvwxyz012345"
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "string image", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":"https://example.com/input.png"}`},
+		{name: "object images", body: `{"model":"grok-imagine-image-edit","prompt":"test","images":[{"url":"https://example.com/a.png"},{"url":"https://example.com/b.png"}]}`},
+		{name: "string images", body: `{"model":"grok-imagine-image-edit","prompt":"test","images":["https://example.com/a.png","https://example.com/b.png"]}`},
+		{name: "mixed array", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":["https://example.com/a.png",{"file_id":"` + fileID + `"}]}`},
+		{name: "file id input", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":{"file_id":"` + fileID + `"}}`},
+		{name: "image plus images", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":"https://example.com/a.png","images":["https://example.com/b.png"]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "url and file id", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":{"url":"https://example.com/a.png","file_id":"` + fileID + `"}}`, want: "url 或 file_id"},
+		{name: "invalid file id", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":{"file_id":"input_broken"}}`, want: "file_id 无效"},
+		{name: "empty input object", body: `{"model":"grok-imagine-image-edit","prompt":"test","image":{}}`, want: "url 或 file_id"},
+		{name: "too many inputs", body: `{"model":"grok-imagine-image-edit","prompt":"test","images":["https://example.com/1.png","https://example.com/2.png","https://example.com/3.png","https://example.com/4.png","https://example.com/5.png","https://example.com/6.png","https://example.com/7.png","https://example.com/8.png","https://example.com/9.png"]}`, want: "1 到 8"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.want) {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestImageEditInputsOrderImageBeforeImages(t *testing.T) {
+	inputs := imageEditInputs(imageEditJSONRequest{
+		Image:  imageEditJSONInput{{URL: "https://example.com/a.png"}},
+		Images: imageEditJSONInput{{URL: "https://example.com/b.png"}, {URL: "https://example.com/c.png"}},
+	})
+	if len(inputs) != 3 || inputs[0].URL != "https://example.com/a.png" || inputs[1].URL != "https://example.com/b.png" || inputs[2].URL != "https://example.com/c.png" {
+		t.Fatalf("inputs = %#v", inputs)
+	}
+}
+
+func TestResolveImageEditInputsEncodesFileIDReferences(t *testing.T) {
+	const fileID = "input_abcdefghijklmnopqrstuvwxyz012345"
+	urls, err := resolveImageEditInputs([]imageEditJSONImage{{URL: "https://example.com/a.png"}, {FileID: fileID}})
+	if err != nil {
+		t.Fatalf("resolve inputs: %v", err)
+	}
+	want := []string{"https://example.com/a.png", gateway.ImageInputFileReference(fileID)}
+	if len(urls) != len(want) || urls[0] != want[0] || urls[1] != want[1] {
+		t.Fatalf("urls = %#v, want %#v", urls, want)
+	}
+	if _, err := resolveImageEditInputs([]imageEditJSONImage{{URL: "https://example.com/a.png", FileID: fileID}}); err == nil || !strings.Contains(err.Error(), "url 或 file_id") {
+		t.Fatalf("ambiguous input err = %v", err)
+	}
+	if _, err := resolveImageEditInputs([]imageEditJSONImage{{FileID: "input_broken"}}); err == nil || !strings.Contains(err.Error(), "file_id 无效") {
+		t.Fatalf("invalid file id err = %v", err)
+	}
+}
+
+// 8 字节 PNG 签名 + 残缺 IHDR：足够让 http.DetectContentType 判定成 image/png。
+var testImageEditPNG = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 'I', 'H', 'D', 'R'}
+
+type imageEditMultipartPart struct {
+	field string
+	value string
+}
+
+type imageEditMultipartFile struct {
+	field string
+	name  string
+	data  []byte
+}
+
+func newImageEditMultipartRequest(t *testing.T, parts []imageEditMultipartPart, files []imageEditMultipartFile) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, part := range parts {
+		if err := writer.WriteField(part.field, part.value); err != nil {
+			t.Fatalf("write field %s: %v", part.field, err)
+		}
+	}
+	for _, file := range files {
+		part, err := writer.CreateFormFile(file.field, file.name)
+		if err != nil {
+			t.Fatalf("create form file %s: %v", file.field, err)
+		}
+		if _, err := part.Write(file.data); err != nil {
+			t.Fatalf("write form file %s: %v", file.field, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	return request
+}
+
+func serveImageEditMultipart(t *testing.T, router *gin.Engine, parts []imageEditMultipartPart, files []imageEditMultipartFile) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newImageEditMultipartRequest(t, parts, files))
+	return recorder
+}
+
+func TestDecodeMultipartImageEditRequestBuildsDataURI(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	request := newImageEditMultipartRequest(t,
+		[]imageEditMultipartPart{{field: "model", value: "grok-imagine-image-edit"}, {field: "prompt", value: "变成黑色 白字"}},
+		[]imageEditMultipartFile{{field: "image", name: "input.png", data: testImageEditPNG}},
+	)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = request
+	decoded, ok := handler.decodeImageEditRequest(context)
+	if !ok {
+		t.Fatalf("multipart decode failed status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if decoded.Model != "grok-imagine-image-edit" || decoded.Prompt != "变成黑色 白字" || len(decoded.Images) != 1 {
+		t.Fatalf("decoded request = %#v", decoded)
+	}
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(testImageEditPNG)
+	if decoded.Images[0].URL != want {
+		t.Fatalf("image url = %q, want %q", decoded.Images[0].URL, want)
+	}
+}
+
+func TestImageEditSupportsMultipartFormData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	NewHandler(nil, nil, 1<<20).Register(router.Group("/v1"))
+
+	baseParts := []imageEditMultipartPart{
+		{field: "model", value: "grok-imagine-image-edit"},
+		{field: "prompt", value: "变成黑色 白字"},
+		{field: "n", value: "1"},
+		{field: "resolution", value: "1k"},
+		{field: "response_format", value: "b64_json"},
+	}
+	pngFile := []imageEditMultipartFile{{field: "image", name: "input.png", data: testImageEditPNG}}
+
+	// 模型、prompt 和一张 PNG 都齐了，请求就能通过解析，落到缺少 client key 的 401。
+	if recorder := serveImageEditMultipart(t, router, baseParts, pngFile); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("png file part status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 常见 SDK 会用 images / image[] / images[] 作为文件字段名。
+	for _, field := range []string{"images", "image[]", "images[]"} {
+		files := []imageEditMultipartFile{{field: field, name: "input.png", data: testImageEditPNG}}
+		if recorder := serveImageEditMultipart(t, router, baseParts, files); recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s file field status=%d body=%s", field, recorder.Code, recorder.Body.String())
+		}
+	}
+	// 缺少图片沿用既有文案。
+	recorder := serveImageEditMultipart(t, router, baseParts, nil)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "image 或 images") {
+		t.Fatalf("missing image status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 文件名与 part Content-Type 都不可信，非图片内容一律 400。
+	notImage := []imageEditMultipartFile{{field: "image", name: "input.png", data: []byte("this is not an image")}}
+	recorder = serveImageEditMultipart(t, router, baseParts, notImage)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "PNG") {
+		t.Fatalf("non image status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 数值字段解析失败按 invalid_request 400。
+	badCount := append([]imageEditMultipartPart{}, baseParts...)
+	badCount[2] = imageEditMultipartPart{field: "n", value: "many"}
+	recorder = serveImageEditMultipart(t, router, badCount, pngFile)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "n 必须是整数") {
+		t.Fatalf("bad n status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 没有文件时 image 文本字段可以是 URL 或临时 file_id。
+	urlInput := append([]imageEditMultipartPart{}, baseParts...)
+	urlInput = append(urlInput, imageEditMultipartPart{field: "image", value: "https://example.com/input.png"})
+	if recorder := serveImageEditMultipart(t, router, urlInput, nil); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("url form value status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	fileIDInput := append([]imageEditMultipartPart{}, baseParts...)
+	fileIDInput = append(fileIDInput, imageEditMultipartPart{field: "images[]", value: "input_abcdefghijklmnopqrstuvwxyz012345"})
+	if recorder := serveImageEditMultipart(t, router, fileIDInput, nil); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("file id form value status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	brokenFileID := append([]imageEditMultipartPart{}, baseParts...)
+	brokenFileID = append(brokenFileID, imageEditMultipartPart{field: "image", value: "input_broken"})
+	recorder = serveImageEditMultipart(t, router, brokenFileID, nil)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "file_id 无效") {
+		t.Fatalf("invalid file id form value status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	// 请求体超过 maxBodyBytes 时在解析阶段就按 413 拒绝，不会读满磁盘。
+	smallBodyRouter := gin.New()
+	NewHandler(nil, nil, 1024).Register(smallBodyRouter.Group("/v1"))
+	oversize := []imageEditMultipartFile{{field: "image", name: "input.png", data: append(append([]byte{}, testImageEditPNG...), bytes.Repeat([]byte{0x00}, 8<<10)...)}}
+	recorder = serveImageEditMultipart(t, smallBodyRouter, baseParts, oversize)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize multipart status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestSniffImageInputMediaTypeAcceptsOnlySupportedImages(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "png", data: testImageEditPNG, want: "image/png"},
+		{name: "gif", data: []byte("GIF89a"), want: "image/gif"},
+		{name: "jpeg", data: []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10}, want: "image/jpeg"},
+		{name: "webp", data: []byte{'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P'}, want: "image/webp"},
+		{name: "empty", data: nil, want: ""},
+		{name: "svg", data: []byte("<svg xmlns="), want: ""},
+		{name: "text", data: []byte("hello"), want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sniffImageInputMediaType(test.data); got != test.want {
+				t.Fatalf("sniff %s = %q, want %q", test.name, got, test.want)
+			}
+		})
 	}
 }
 

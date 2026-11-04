@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -146,25 +148,78 @@ type imageGenerationRequest struct {
 	Stream         bool            `json:"stream"`
 }
 
+// imageEditJSONImage 表示 image/images 里的单个图片输入：官方对象形态
+// {"url":...} / {"file_id":...}，同时兼容直接把字符串当作 url 的简写形态。
 type imageEditJSONImage struct {
 	URL    string `json:"url"`
 	FileID string `json:"file_id"`
 }
 
+func (input *imageEditJSONImage) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*input = imageEditJSONImage{}
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var value string
+		if err := json.Unmarshal(trimmed, &value); err != nil {
+			return err
+		}
+		*input = imageEditJSONImage{URL: value}
+		return nil
+	}
+	if trimmed[0] != '{' {
+		return errors.New("image 输入必须是 url/file_id 对象或字符串")
+	}
+	type plainImageEditJSONImage imageEditJSONImage
+	var value plainImageEditJSONImage
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return err
+	}
+	*input = imageEditJSONImage(value)
+	return nil
+}
+
+// imageEditJSONInput 归一化 image 与 images 两个字段：单个对象、单个字符串或数组都合法。
+type imageEditJSONInput []imageEditJSONImage
+
+func (inputs *imageEditJSONInput) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*inputs = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var values []imageEditJSONImage
+		if err := json.Unmarshal(trimmed, &values); err != nil {
+			return err
+		}
+		*inputs = values
+		return nil
+	}
+	var single imageEditJSONImage
+	if err := single.UnmarshalJSON(trimmed); err != nil {
+		return err
+	}
+	*inputs = imageEditJSONInput{single}
+	return nil
+}
+
 type imageEditJSONRequest struct {
-	Model          string               `json:"model"`
-	Prompt         string               `json:"prompt"`
-	Image          *imageEditJSONImage  `json:"image"`
-	Images         []imageEditJSONImage `json:"images"`
-	Count          *int                 `json:"n"`
-	Size           string               `json:"size"`
-	AspectRatio    string               `json:"aspect_ratio"`
-	Resolution     string               `json:"resolution"`
-	Quality        string               `json:"quality"`
-	ResponseFormat string               `json:"response_format"`
-	StorageOptions json.RawMessage      `json:"storage_options"`
-	Stream         bool                 `json:"stream"`
-	PartialImages  *int                 `json:"partial_images"`
+	Model          string             `json:"model"`
+	Prompt         string             `json:"prompt"`
+	Image          imageEditJSONInput `json:"image"`
+	Images         imageEditJSONInput `json:"images"`
+	Count          *int               `json:"n"`
+	Size           string             `json:"size"`
+	AspectRatio    string             `json:"aspect_ratio"`
+	Resolution     string             `json:"resolution"`
+	Quality        string             `json:"quality"`
+	ResponseFormat string             `json:"response_format"`
+	StorageOptions json.RawMessage    `json:"storage_options"`
+	Stream         bool               `json:"stream"`
+	PartialImages  *int               `json:"partial_images"`
 }
 
 type videoGenerationImage struct {
@@ -582,18 +637,8 @@ func writeMediaBody(c *gin.Context, source io.Reader, contentType string, status
 
 func (h *Handler) editImage(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
-	if !isJSONRequest(c) {
-		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json")
-		return
-	}
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
-		return
-	}
-	var request imageEditJSONRequest
-	if err := decodeSingleJSON(bytes.NewReader(body), &request, false); err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 JSON 请求无效")
+	request, ok := h.decodeImageEditRequest(c)
+	if !ok {
 		return
 	}
 	if value := bytes.TrimSpace(request.StorageOptions); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
@@ -606,26 +651,14 @@ func (h *Handler) editImage(c *gin.Context) {
 	if request.Count != nil {
 		count = *request.Count
 	}
-	inputs := append([]imageEditJSONImage(nil), request.Images...)
-	if request.Image != nil {
-		inputs = append([]imageEditJSONImage{*request.Image}, inputs...)
-	}
+	inputs := imageEditInputs(request)
 	if len(inputs) == 0 || len(inputs) > 8 {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 或 images 数量必须在 1 到 8 之间")
 		return
 	}
-	imageURLs := make([]string, 0, len(inputs))
-	for _, input := range inputs {
-		if strings.TrimSpace(input.FileID) != "" {
-			writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前暂不支持 image.file_id，请使用 image.url")
-			return
-		}
-		if value := strings.TrimSpace(input.URL); value != "" {
-			imageURLs = append(imageURLs, value)
-		}
-	}
-	if len(imageURLs) != len(inputs) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 都必须提供有效 url")
+	imageURLs, err := resolveImageEditInputs(inputs)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if model == "" || prompt == "" {
@@ -687,6 +720,214 @@ func (h *Handler) editImage(c *gin.Context) {
 		return
 	}
 	h.writeResult(c, result, request.Stream, streamProtocolImage)
+}
+
+// imageEditInputs 把 image 与 images 拼成一次编辑的参考图序列：顺序固定 image 在前、
+// images 在后，上游解析参考图时依赖这个顺序。
+func imageEditInputs(request imageEditJSONRequest) []imageEditJSONImage {
+	inputs := make([]imageEditJSONImage, 0, len(request.Image)+len(request.Images))
+	inputs = append(inputs, request.Image...)
+	inputs = append(inputs, request.Images...)
+	return inputs
+}
+
+// resolveImageEditInputs 把每个参考图输入收敛成一个下游 URL：url 原样透传，file_id 先校验
+// 临时输入 ID 格式，再编码成只在网关内部解释的引用（网关负责物化成 data URI）。
+func resolveImageEditInputs(inputs []imageEditJSONImage) ([]string, error) {
+	urls := make([]string, 0, len(inputs))
+	for index, input := range inputs {
+		urlValue := strings.TrimSpace(input.URL)
+		fileID := strings.TrimSpace(input.FileID)
+		if (urlValue == "") == (fileID == "") {
+			return nil, fmt.Errorf("image 或 images[%d] 必须且只能提供 url 或 file_id", index)
+		}
+		if fileID != "" {
+			if !mediadomain.IsInputAssetID(fileID) {
+				return nil, fmt.Errorf("image 或 images[%d].file_id 无效", index)
+			}
+			urls = append(urls, gateway.ImageInputFileReference(fileID))
+			continue
+		}
+		urls = append(urls, urlValue)
+	}
+	return urls, nil
+}
+
+// imageEditMultipartFields 是官方 SDK 常用的图片文件字段名。
+var imageEditMultipartFields = []string{"image", "images", "image[]", "images[]"}
+
+// decodeImageEditRequest 把 application/json 与 multipart/form-data 两种官方传输形态
+// 归一化成同一个请求结构，之后的所有校验都不再关心 Content-Type。
+func (h *Handler) decodeImageEditRequest(c *gin.Context) (imageEditJSONRequest, bool) {
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err == nil {
+		switch {
+		case strings.EqualFold(mediaType, "application/json"):
+			body, readErr := io.ReadAll(c.Request.Body)
+			if readErr != nil {
+				writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
+				return imageEditJSONRequest{}, false
+			}
+			var request imageEditJSONRequest
+			if decodeErr := decodeSingleJSON(bytes.NewReader(body), &request, false); decodeErr != nil {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 JSON 请求无效")
+				return imageEditJSONRequest{}, false
+			}
+			return request, true
+		case strings.EqualFold(mediaType, "multipart/form-data"):
+			return h.decodeMultipartImageEditRequest(c)
+		}
+	}
+	writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json 或 multipart/form-data")
+	return imageEditJSONRequest{}, false
+}
+
+// decodeMultipartImageEditRequest 解析 multipart/form-data：标量字段直接绑定成请求结构，
+// 图片文件按内容嗅探 MIME 后编码成 data URI，和 JSON 形态的 url 走同一条下游链路。
+func (h *Handler) decodeMultipartImageEditRequest(c *gin.Context) (imageEditJSONRequest, bool) {
+	if parseErr := c.Request.ParseMultipartForm(h.maxBodyBytes); parseErr != nil {
+		var limitErr *http.MaxBytesError
+		if errors.As(parseErr, &limitErr) {
+			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
+			return imageEditJSONRequest{}, false
+		}
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 multipart 请求无效")
+		return imageEditJSONRequest{}, false
+	}
+	form := c.Request.MultipartForm
+	if form == nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 multipart 请求无效")
+		return imageEditJSONRequest{}, false
+	}
+	// 上传暂存文件可能在磁盘上，请求结束后必须清理。
+	defer form.RemoveAll()
+
+	request := imageEditJSONRequest{
+		Model:          firstMultipartValue(form, "model"),
+		Prompt:         firstMultipartValue(form, "prompt"),
+		Size:           firstMultipartValue(form, "size"),
+		AspectRatio:    firstMultipartValue(form, "aspect_ratio"),
+		Resolution:     firstMultipartValue(form, "resolution"),
+		Quality:        firstMultipartValue(form, "quality"),
+		ResponseFormat: firstMultipartValue(form, "response_format"),
+	}
+	if raw := firstMultipartValue(form, "n"); raw != "" {
+		count, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "n 必须是整数")
+			return imageEditJSONRequest{}, false
+		}
+		request.Count = &count
+	}
+	if raw := firstMultipartValue(form, "partial_images"); raw != "" {
+		partialImages, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "partial_images 必须是整数")
+			return imageEditJSONRequest{}, false
+		}
+		request.PartialImages = &partialImages
+	}
+	if raw := firstMultipartValue(form, "stream"); raw != "" {
+		stream, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "stream 必须是布尔值")
+			return imageEditJSONRequest{}, false
+		}
+		request.Stream = stream
+	}
+
+	inputs := make(imageEditJSONInput, 0, 4)
+	for _, field := range imageEditMultipartFields {
+		for _, header := range form.File[field] {
+			value, ok := readMultipartImageInput(c, header)
+			if !ok {
+				return imageEditJSONRequest{}, false
+			}
+			inputs = append(inputs, imageEditJSONImage{URL: value})
+		}
+	}
+	// 没上传文件时也接受 image 文本字段，客户端可以直接给 URL 或临时 file_id。
+	for _, field := range imageEditMultipartFields {
+		for _, raw := range form.Value[field] {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				continue
+			}
+			inputs = append(inputs, newImageEditTextInput(value))
+		}
+	}
+	request.Images = inputs
+	return request, true
+}
+
+func firstMultipartValue(form *multipart.Form, key string) string {
+	if form == nil {
+		return ""
+	}
+	if values := form.Value[key]; len(values) > 0 {
+		return strings.TrimSpace(values[0])
+	}
+	return ""
+}
+
+// readMultipartImageInput 把单个上传文件编码成 data URI。只信任内容嗅探结果：客户端
+// 声明的 part Content-Type 与文件名都可以伪造。
+func readMultipartImageInput(c *gin.Context, header *multipart.FileHeader) (string, bool) {
+	if header == nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片输入无效")
+		return "", false
+	}
+	limitMessage := fmt.Sprintf("单个图片输入不能超过 %d MiB", mediadomain.MaxInputAssetBytes>>20)
+	if header.Size > mediadomain.MaxInputAssetBytes {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", limitMessage)
+		return "", false
+	}
+	file, openErr := header.Open()
+	if openErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "读取图片输入失败")
+		return "", false
+	}
+	defer file.Close()
+	data, readErr := io.ReadAll(io.LimitReader(file, mediadomain.MaxInputAssetBytes+1))
+	if readErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "读取图片输入失败")
+		return "", false
+	}
+	if int64(len(data)) > mediadomain.MaxInputAssetBytes {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", limitMessage)
+		return "", false
+	}
+	mediaType := sniffImageInputMediaType(data)
+	if mediaType == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片输入仅支持 PNG、JPEG、WebP 或 GIF")
+		return "", false
+	}
+	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), true
+}
+
+func sniffImageInputMediaType(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	mediaType := http.DetectContentType(data)
+	if separator := strings.IndexByte(mediaType, ';'); separator >= 0 {
+		mediaType = mediaType[:separator]
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/webp", "image/gif":
+		return mediaType
+	}
+	return ""
+}
+
+// newImageEditTextInput 归一化 multipart 的 image 文本字段：input_ 前缀按临时输入 ID
+// 解释，其余按 URL 解释，是否合法交给统一校验判断。
+func newImageEditTextInput(value string) imageEditJSONImage {
+	if strings.HasPrefix(value, mediadomain.InputAssetIDPrefix) {
+		return imageEditJSONImage{FileID: value}
+	}
+	return imageEditJSONImage{URL: value}
 }
 
 func requestIdentity(c *gin.Context) (clientkeydomain.Key, string, bool) {
@@ -2315,7 +2556,8 @@ func writeGatewayError(c *gin.Context, err error) {
 	case errors.Is(err, gateway.ErrResponseStateUnsupported), errors.Is(err, gateway.ErrConversationUnsupported):
 		status, code = http.StatusBadRequest, "unsupported_parameter"
 		message = err.Error()
-	case errors.Is(err, gateway.ErrVideoInputTooLarge), errors.Is(err, gateway.ErrVideoInputUnavailable), errors.Is(err, gateway.ErrVideoParameterInvalid):
+	case errors.Is(err, gateway.ErrVideoInputTooLarge), errors.Is(err, gateway.ErrVideoInputUnavailable), errors.Is(err, gateway.ErrVideoParameterInvalid),
+		errors.Is(err, gateway.ErrImageInputTooLarge), errors.Is(err, gateway.ErrImageInputUnavailable):
 		status, code = http.StatusBadRequest, "invalid_request"
 		message = err.Error()
 	case errors.Is(err, gateway.ErrVideoOperationUnsupported):
