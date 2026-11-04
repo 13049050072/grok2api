@@ -1,8 +1,9 @@
-import { ApiError, apiDownload, apiDownloadResponse, apiEventStream, apiRequest, type PaginatedDTO } from "@/shared/api/client";
+import { ApiError, apiDownloadResponse, apiEventStream, apiRequest, type ApiDownloadResult, type PaginatedDTO } from "@/shared/api/client";
 import { createObjectDecoder, createPaginatedDecoder, createValidatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
 import { i18n } from "@/shared/i18n";
 import type { SortOrder } from "@/shared/lib/table-sort";
 import { createAccountTaskProgressController, type AccountTaskProgressDTO, type AccountTaskProgressPhase } from "@/features/accounts/account-task-progress";
+import { buildExportFallbackFilename, defaultAccountExportFormat, resolveExportFilename, type AccountExportFallbackName, type AccountExportFormat } from "@/features/accounts/export-formats";
 
 export type { AccountTaskProgressDTO } from "@/features/accounts/account-task-progress";
 
@@ -202,6 +203,7 @@ const accountValidator = hasShape({
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
 const decodeAccount = createValidatedDecoder<AccountDTO>("account", accountValidator);
 const decodeAccountPage = createPaginatedDecoder<AccountDTO>(accountValidator);
+const decodeAccountIds = createObjectDecoder<{ ids: string[] }>("account ids", { ids: isArrayOf(isString) });
 const decodeAccountSummary = createObjectDecoder<AccountSummaryDTO>("account summary", {
   total: isNumber, available: isNumber, recovering: isNumber, attention: isNumber, risk: isNumber,
   providers: isRecordOf(hasShape({ total: isNumber, available: isNumber })),
@@ -216,9 +218,7 @@ const decodeDevicePoll = createObjectDecoder<DevicePollDTO>("device poll", {
   status: isOneOf("pending", "succeeded", "syncFailed"), account: isOptional(accountValidator), synced: isOptional(isNumber), syncFailed: isOptional(isNumber),
 });
 
-type ListAccountsInput = {
-  page: number;
-  pageSize: number;
+type AccountFiltersInput = {
   search?: string;
   type?: string;
   status?: string;
@@ -229,12 +229,17 @@ type ListAccountsInput = {
   association?: string;
   // 为空时返回全部 provider 的账号，用于跨 provider 的通用名单（如请求审计筛选）。
   provider?: AccountProvider;
+};
+
+type ListAccountsInput = AccountFiltersInput & {
+  page: number;
+  pageSize: number;
   sortBy?: string;
   sortOrder?: SortOrder;
 };
 
-export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<AccountDTO>> {
-  const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });
+// 列表与导出/全选共用同一套筛选参数，避免两边口径漂移。
+function appendAccountFilters(query: URLSearchParams, input: AccountFiltersInput): void {
   if (input.search) query.set("search", input.search);
   if (input.type) query.set("type", input.type);
   if (input.status) query.set("status", input.status);
@@ -243,12 +248,25 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
   if (input.risk) query.set("risk", input.risk);
   if (input.agreement) query.set("agreement", input.agreement);
   if (input.association) query.set("association", input.association);
+  if (input.provider) query.set("provider", input.provider);
+}
+
+export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<AccountDTO>> {
+  const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });
+  appendAccountFilters(query, input);
   if (input.sortBy && input.sortOrder) {
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
   }
-  if (input.provider) query.set("provider", input.provider);
   return apiRequest(`/api/admin/v1/accounts?${query}`, {}, decodeAccountPage);
+}
+
+/** 全选用：按当前筛选取全部账号 id，不接受分页（后端超过 10000 个会直接 400）。 */
+export function listAccountIds(input: AccountFiltersInput): Promise<{ ids: string[] }> {
+  const query = new URLSearchParams();
+  appendAccountFilters(query, input);
+  const search = query.toString();
+  return apiRequest(`/api/admin/v1/accounts/ids${search ? `?${search}` : ""}`, {}, decodeAccountIds);
 }
 
 export function getAccountSummary(): Promise<AccountSummaryDTO> {
@@ -562,48 +580,38 @@ export function refreshAccountQuota(id: string): Promise<AccountDTO> {
   return apiRequest(`/api/admin/v1/accounts/${id}/refresh-quota`, { method: "POST" }, decodeAccount);
 }
 
-export type AccountExportBatch = {
+export type AccountExportFile = {
   blob: Blob;
-  count: number;
-  nextId: string;
-  snapshotMaxId: string;
-  hasMore: boolean;
+  filename: string;
+  /** 响应头 X-Exported-Accounts；缺失或不合法时为 undefined。 */
+  count?: number;
 };
 
-function requiredExportHeader(headers: Headers, name: string): string {
-  const value = headers.get(name);
-  if (value === null) {
-    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
-  }
-  return value;
+function optionalExportedCount(headers: Headers): number | undefined {
+  const value = headers.get("X-Exported-Accounts");
+  if (value === null) return undefined;
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : undefined;
 }
 
-export async function exportAccountBatch(provider: AccountProvider, limit: number, afterId: string, snapshotMaxId: string): Promise<AccountExportBatch> {
-  const query = new URLSearchParams({ provider, limit: String(limit), afterId, snapshotMaxId });
-  const result = await apiDownloadResponse(`/api/admin/v1/accounts/export?${query}`);
-  const count = Number(requiredExportHeader(result.headers, "X-Exported-Accounts"));
-  const nextId = requiredExportHeader(result.headers, "X-Export-Next-ID");
-  const nextSnapshotMaxId = requiredExportHeader(result.headers, "X-Export-Snapshot-Max-ID");
-  const hasMoreText = requiredExportHeader(result.headers, "X-Export-Has-More");
-  const validCursor = /^\d+$/.test(nextId) && /^\d+$/.test(nextSnapshotMaxId);
-  if (!Number.isSafeInteger(count) || count < 0 || !validCursor || (hasMoreText !== "true" && hasMoreText !== "false")) {
-    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
-  }
-  const hasMore = hasMoreText === "true";
-  if (hasMore && (count === 0 || BigInt(nextId) <= BigInt(afterId) || BigInt(nextId) > BigInt(nextSnapshotMaxId))) {
-    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
-  }
+async function downloadAccountExport(path: string, body: object, fallback: AccountExportFallbackName): Promise<AccountExportFile> {
+  const result: ApiDownloadResult = await apiDownloadResponse(path, { method: "POST", body });
   return {
     blob: result.blob,
-    count,
-    nextId,
-    snapshotMaxId: nextSnapshotMaxId,
-    hasMore,
+    // 文件名以服务端 Content-Disposition 为准；缺失或不可解析时回退本地拼接。
+    filename: resolveExportFilename(result.headers.get("Content-Disposition"), buildExportFallbackFilename(fallback)),
+    count: optionalExportedCount(result.headers),
   };
 }
 
-export function exportSelectedAccounts(provider: AccountProvider, ids: string[]): Promise<Blob> {
-  return apiDownload("/api/admin/v1/accounts/export", { method: "POST", body: { provider, ids } });
+/** POST /accounts/export：导出选中账号，单文件（json / txt / csv）。 */
+export function exportSelectedAccounts(provider: AccountProvider, ids: string[], format: AccountExportFormat = defaultAccountExportFormat): Promise<AccountExportFile> {
+  return downloadAccountExport("/api/admin/v1/accounts/export", { provider, ids, format }, { kind: "selected", provider, format });
+}
+
+/** POST /accounts/export/archive：全部账号按来源分文件打包成一个 ZIP。 */
+export function exportAllAccountsArchive(format: AccountExportFormat = defaultAccountExportFormat): Promise<AccountExportFile> {
+  return downloadAccountExport("/api/admin/v1/accounts/export/archive", { format }, { kind: "archive", format });
 }
 
 export function updateAccountsEnabled(ids: string[], enabled: boolean, provider: AccountProvider): Promise<{ updated: number }> {

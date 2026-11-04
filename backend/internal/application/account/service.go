@@ -298,6 +298,76 @@ type ExportPageResult struct {
 	HasMore       bool
 }
 
+// ExportFormat 是账号导出文件的渲染格式；json 保持各 Provider 现有导入格式。
+type ExportFormat string
+
+const (
+	ExportFormatJSON ExportFormat = "json"
+	ExportFormatText ExportFormat = "txt"
+	ExportFormatCSV  ExportFormat = "csv"
+)
+
+// ParseExportFormat 归一化管理端提交的 format；省略时默认 json。
+func ParseExportFormat(value string) (ExportFormat, error) {
+	switch format := ExportFormat(strings.ToLower(strings.TrimSpace(value))); format {
+	case "", ExportFormatJSON:
+		return ExportFormatJSON, nil
+	case ExportFormatText:
+		return ExportFormatText, nil
+	case ExportFormatCSV:
+		return ExportFormatCSV, nil
+	default:
+		return "", invalidInput("导出格式无效，仅支持 json、txt、csv")
+	}
+}
+
+// Extension 返回导出文件的扩展名。
+func (f ExportFormat) Extension() string {
+	switch f {
+	case ExportFormatText:
+		return "txt"
+	case ExportFormatCSV:
+		return "csv"
+	default:
+		return "json"
+	}
+}
+
+// ContentType 返回单文件导出的 Content-Type。
+func (f ExportFormat) ContentType() string {
+	switch f {
+	case ExportFormatText:
+		return "text/plain; charset=utf-8"
+	case ExportFormatCSV:
+		return "text/csv; charset=utf-8"
+	default:
+		return "application/json; charset=utf-8"
+	}
+}
+
+// ExportFile 是已按格式渲染完成的单文件导出结果。
+type ExportFile struct {
+	Data   []byte
+	Count  int
+	Format ExportFormat
+}
+
+// ProviderExport 是归档导出中单个账号来源的渲染结果。
+type ProviderExport struct {
+	Provider accountdomain.Provider
+	Format   ExportFormat
+	Data     []byte
+	Count    int
+}
+
+// exportCredentialRow 是已解密、可直接渲染为 txt/csv 的单账号凭据。
+type exportCredentialRow struct {
+	Credential        accountdomain.Credential
+	AccessToken       string
+	RefreshToken      string
+	CloudflareCookies string
+}
+
 type BuildConversionResult struct {
 	Created         int
 	Linked          int
@@ -552,45 +622,9 @@ func (s *Service) ProviderDefinition(value accountdomain.Provider) (provider.Def
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]View, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
-	egressMode, egressNodeID, egressSourceID, egressValid := parseEgressFilter(filter.Egress)
-	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
-		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
-		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
-		!egressValid ||
-		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
-		!oneOf(filter.Risk, "", "flagged", "normal") ||
-		(filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) ||
-		!oneOf(filter.Agreement, "", "nsfwEnabled", "nsfwDisabled", "termsAccepted", "termsNotAccepted", "allAccepted", "allNotAccepted") ||
-		(filter.Agreement != "" && filter.Provider != string(accountdomain.ProviderWeb)) ||
-		!validAssociationFilter(filter.Provider, filter.Association) ||
-		!repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
-		return nil, 0, ErrInvalidFilter
-	}
-	var refreshable *bool
-	if filter.Renewal != "" {
-		value := filter.Renewal == "refreshable"
-		refreshable = &value
-	}
-	repositoryFilter := repository.AccountListFilter{
-		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Egress: egressMode,
-		EgressNodeID: egressNodeID, EgressSourceID: egressSourceID,
-		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: s.now(),
-	}
-	if filter.Risk != "" {
-		if _, ok := s.accounts.(buildBotFlagIndexRepository); ok {
-			repositoryFilter.Risk = filter.Risk
-		} else {
-			flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
-			if err != nil {
-				return nil, 0, err
-			}
-			if filter.Risk == "flagged" {
-				repositoryFilter.AccountIDs = flaggedIDs
-				repositoryFilter.RestrictIDs = true
-			} else {
-				repositoryFilter.ExcludeIDs = flaggedIDs
-			}
-		}
+	repositoryFilter, err := s.accountRepositoryFilter(ctx, filter)
+	if err != nil {
+		return nil, 0, err
 	}
 	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
 		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
@@ -635,6 +669,52 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		views = append(views, view)
 	}
 	return views, total, nil
+}
+
+// accountRepositoryFilter 校验管理端筛选条件并转换为仓储过滤条件，供列表与「全选」共用。
+func (s *Service) accountRepositoryFilter(ctx context.Context, filter ListFilter) (repository.AccountListFilter, error) {
+	egressMode, egressNodeID, egressSourceID, egressValid := parseEgressFilter(filter.Egress)
+	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
+		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
+		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
+		!egressValid ||
+		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
+		!oneOf(filter.Risk, "", "flagged", "normal") ||
+		(filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) ||
+		!oneOf(filter.Agreement, "", "nsfwEnabled", "nsfwDisabled", "termsAccepted", "termsNotAccepted", "allAccepted", "allNotAccepted") ||
+		(filter.Agreement != "" && filter.Provider != string(accountdomain.ProviderWeb)) ||
+		!validAssociationFilter(filter.Provider, filter.Association) ||
+		!repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
+		return repository.AccountListFilter{}, ErrInvalidFilter
+	}
+	var refreshable *bool
+	if filter.Renewal != "" {
+		value := filter.Renewal == "refreshable"
+		refreshable = &value
+	}
+	repositoryFilter := repository.AccountListFilter{
+		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Egress: egressMode,
+		EgressNodeID: egressNodeID, EgressSourceID: egressSourceID,
+		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: s.now(),
+	}
+	if filter.Risk == "" {
+		return repositoryFilter, nil
+	}
+	if _, ok := s.accounts.(buildBotFlagIndexRepository); ok {
+		repositoryFilter.Risk = filter.Risk
+		return repositoryFilter, nil
+	}
+	flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
+	if err != nil {
+		return repository.AccountListFilter{}, err
+	}
+	if filter.Risk == "flagged" {
+		repositoryFilter.AccountIDs = flaggedIDs
+		repositoryFilter.RestrictIDs = true
+	} else {
+		repositoryFilter.ExcludeIDs = flaggedIDs
+	}
+	return repositoryFilter, nil
 }
 
 func (s *Service) buildBotFlaggedAccountIDs(ctx context.Context) ([]uint64, error) {
@@ -2258,16 +2338,103 @@ func (s *Service) ExportProviderCredentialsCursor(ctx context.Context, providerV
 
 // ExportProviderCredentialsByIDs 只导出管理端明确选择且属于指定 Provider 的账号。
 func (s *Service) ExportProviderCredentialsByIDs(ctx context.Context, providerValue accountdomain.Provider, ids []uint64) (ExportResult, error) {
-	values, err := normalizeIDs(ids, maxCredentialExportAccounts)
+	file, err := s.ExportProviderCredentialsByIDsFormatted(ctx, providerValue, ids, ExportFormatJSON)
 	if err != nil {
 		return ExportResult{}, err
 	}
-	return s.exportProviderCredentials(ctx, providerValue, repository.AccountListQuery{
+	return ExportResult{Data: file.Data, Count: file.Count}, nil
+}
+
+// ExportProviderCredentialsByIDsFormatted 只导出选中账号，并按 format 渲染文件内容。
+// json 必须与旧导出字节一致，因此直接复用各 Provider 的导入格式。
+func (s *Service) ExportProviderCredentialsByIDsFormatted(ctx context.Context, providerValue accountdomain.Provider, ids []uint64, format ExportFormat) (ExportFile, error) {
+	parsedFormat, err := ParseExportFormat(string(format))
+	if err != nil {
+		return ExportFile{}, err
+	}
+	values, err := s.selectedCredentialValues(ctx, providerValue, ids)
+	if err != nil {
+		return ExportFile{}, err
+	}
+	return s.renderProviderCredentials(providerValue, values, parsedFormat)
+}
+
+// selectedCredentialValues 读取选中账号；缺失或跨号池时统一返回参数错误。
+func (s *Service) selectedCredentialValues(ctx context.Context, providerValue accountdomain.Provider, ids []uint64) ([]accountdomain.Credential, error) {
+	values, err := normalizeIDs(ids, maxCredentialExportAccounts)
+	if err != nil {
+		return nil, err
+	}
+	if !providerValue.IsValid() {
+		return nil, invalidInput("账号来源无效")
+	}
+	credentials, total, err := s.accounts.List(ctx, repository.AccountListQuery{
 		Page: repository.PageQuery{Limit: len(values)},
 		Filter: repository.AccountListFilter{
 			Provider: string(providerValue), AccountIDs: values, RestrictIDs: true, Now: s.now(),
 		},
-	}, false, len(values))
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCredentialExportCount(len(values), total, len(credentials)); err != nil {
+		return nil, err
+	}
+	return credentials, nil
+}
+
+// ExportAllProvidersArchive 汇总全部来源的账号导出内容，供管理端打包成 ZIP。
+// 只包含有账号的来源；单来源超过单次上限时要求改用分批导出。
+func (s *Service) ExportAllProvidersArchive(ctx context.Context, format ExportFormat) ([]ProviderExport, error) {
+	parsedFormat, err := ParseExportFormat(string(format))
+	if err != nil {
+		return nil, err
+	}
+	exports := make([]ProviderExport, 0, len(accountdomain.Providers()))
+	for _, providerValue := range accountdomain.Providers() {
+		values, total, listErr := s.accounts.List(ctx, repository.AccountListQuery{
+			Page:   repository.PageQuery{Limit: maxCredentialExportAccounts + 1, Sort: repository.SortQuery{Field: "id", Direction: repository.SortAscending}},
+			Filter: repository.AccountListFilter{Provider: string(providerValue), Now: s.now()},
+		})
+		if listErr != nil {
+			return nil, listErr
+		}
+		if total > maxCredentialExportAccounts {
+			return nil, fmt.Errorf("%w: %s 账号超过 10000 个，请改用分批导出", ErrExportLimit, providerValue)
+		}
+		file, renderErr := s.renderProviderCredentials(providerValue, values, parsedFormat)
+		if renderErr != nil {
+			return nil, renderErr
+		}
+		if file.Count == 0 {
+			continue
+		}
+		exports = append(exports, ProviderExport{Provider: providerValue, Format: parsedFormat, Data: file.Data, Count: file.Count})
+	}
+	return exports, nil
+}
+
+// ListIDs 返回当前筛选下的全部账号 ID，供管理端「全选」使用；不接受分页。
+func (s *Service) ListIDs(ctx context.Context, search string, filter ListFilter) ([]uint64, error) {
+	repositoryFilter, err := s.accountRepositoryFilter(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
+		Page:   repository.PageQuery{Limit: maxCredentialExportAccounts + 1, Search: strings.TrimSpace(search), Sort: filter.Sort},
+		Filter: repositoryFilter,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if total > maxCredentialExportAccounts {
+		return nil, fmt.Errorf("%w: 当前筛选结果超过 10000 个账号，请缩小筛选范围", ErrExportLimit)
+	}
+	ids := make([]uint64, 0, len(values))
+	for _, value := range values {
+		ids = append(ids, value.ID)
+	}
+	return ids, nil
 }
 
 func (s *Service) exportProviderCredentials(ctx context.Context, providerValue accountdomain.Provider, query repository.AccountListQuery, enforceTotalLimit bool, expectedCount int) (ExportResult, error) {
@@ -2305,50 +2472,188 @@ func (s *Service) marshalProviderCredentials(providerValue accountdomain.Provide
 	if !ok {
 		return ExportResult{}, fmt.Errorf("Provider %s 不支持凭据导出", providerValue)
 	}
-	var err error
-	seeds := make([]provider.CredentialSeed, 0, len(values))
-	for _, value := range values {
-		if value.Provider != providerValue {
-			continue
-		}
-		accessToken := ""
-		if value.EncryptedAccessToken != "" {
-			accessToken, err = s.cipher.Decrypt(value.EncryptedAccessToken)
-			if err != nil {
-				return ExportResult{}, fmt.Errorf("解密账号 %d access token: %w", value.ID, err)
-			}
-		}
-		refreshToken := ""
-		if value.EncryptedRefreshToken != "" {
-			refreshToken, err = s.cipher.Decrypt(value.EncryptedRefreshToken)
-			if err != nil {
-				return ExportResult{}, fmt.Errorf("解密账号 %d refresh token: %w", value.ID, err)
-			}
-		}
-		cloudflareCookies := ""
-		if value.EncryptedCloudflareCookie != "" {
-			cloudflareCookies, err = s.cipher.Decrypt(value.EncryptedCloudflareCookie)
-			if err != nil {
-				return ExportResult{}, fmt.Errorf("解密账号 %d Cloudflare Cookie: %w", value.ID, err)
-			}
-		}
-		if accessToken == "" && refreshToken == "" {
-			return ExportResult{}, fmt.Errorf("账号 %d 没有可导出的凭据", value.ID)
-		}
-		seeds = append(seeds, provider.CredentialSeed{
-			Provider: value.Provider, AuthType: value.AuthType, WebTier: value.WebTier,
-			Name: value.Name, Email: value.Email, UserID: value.UserID, TeamID: value.TeamID,
-			OIDCClientID: value.OIDCClientID, AccessToken: accessToken, RefreshToken: refreshToken,
-			CloudflareCookies: cloudflareCookies, ExpiresAt: value.ExpiresAt,
-			WebNSFWEnabledAt: value.WebNSFWEnabledAt, WebTermsAcceptedAt: value.WebTermsAcceptedAt,
-			WebTermsAcceptedVersion: value.WebTermsAcceptedVersion, WebBirthDateSetAt: value.WebBirthDateSetAt,
-		})
+	seeds, err := s.providerCredentialSeeds(providerValue, values)
+	if err != nil {
+		return ExportResult{}, err
 	}
 	data, err := adapter.MarshalCredentials(seeds)
 	if err != nil {
 		return ExportResult{}, err
 	}
 	return ExportResult{Data: data, Count: len(seeds)}, nil
+}
+
+// renderProviderCredentials 按 format 渲染导出内容；json 复用各 Provider 的现有导入格式。
+func (s *Service) renderProviderCredentials(providerValue accountdomain.Provider, values []accountdomain.Credential, format ExportFormat) (ExportFile, error) {
+	switch format {
+	case ExportFormatText, ExportFormatCSV:
+		rows, err := s.decryptExportRows(providerValue, values)
+		if err != nil {
+			return ExportFile{}, err
+		}
+		if format == ExportFormatText {
+			data, count := renderCredentialText(rows)
+			return ExportFile{Data: data, Count: count, Format: format}, nil
+		}
+		return ExportFile{Data: renderCredentialCSV(rows), Count: len(rows), Format: format}, nil
+	default:
+		result, err := s.marshalProviderCredentials(providerValue, values)
+		if err != nil {
+			return ExportFile{}, err
+		}
+		return ExportFile{Data: result.Data, Count: result.Count, Format: ExportFormatJSON}, nil
+	}
+}
+
+// providerCredentialSeeds 解密账号凭据并还原成各 Provider 的导入种子。
+func (s *Service) providerCredentialSeeds(providerValue accountdomain.Provider, values []accountdomain.Credential) ([]provider.CredentialSeed, error) {
+	rows, err := s.decryptExportRows(providerValue, values)
+	if err != nil {
+		return nil, err
+	}
+	seeds := make([]provider.CredentialSeed, 0, len(rows))
+	for _, row := range rows {
+		value := row.Credential
+		seeds = append(seeds, provider.CredentialSeed{
+			Provider: value.Provider, AuthType: value.AuthType, WebTier: value.WebTier,
+			Name: value.Name, Email: value.Email, UserID: value.UserID, TeamID: value.TeamID,
+			OIDCClientID: value.OIDCClientID, AccessToken: row.AccessToken, RefreshToken: row.RefreshToken,
+			CloudflareCookies: row.CloudflareCookies, ExpiresAt: value.ExpiresAt,
+			WebNSFWEnabledAt: value.WebNSFWEnabledAt, WebTermsAcceptedAt: value.WebTermsAcceptedAt,
+			WebTermsAcceptedVersion: value.WebTermsAcceptedVersion, WebBirthDateSetAt: value.WebBirthDateSetAt,
+		})
+	}
+	return seeds, nil
+}
+
+// decryptExportRows 在服务层完成解密，txt/csv 渲染不再接触加密字段。
+func (s *Service) decryptExportRows(providerValue accountdomain.Provider, values []accountdomain.Credential) ([]exportCredentialRow, error) {
+	var err error
+	rows := make([]exportCredentialRow, 0, len(values))
+	for _, value := range values {
+		if value.Provider != providerValue {
+			continue
+		}
+		row := exportCredentialRow{Credential: value}
+		if value.EncryptedAccessToken != "" {
+			if row.AccessToken, err = s.cipher.Decrypt(value.EncryptedAccessToken); err != nil {
+				return nil, fmt.Errorf("解密账号 %d access token: %w", value.ID, err)
+			}
+		}
+		if value.EncryptedRefreshToken != "" {
+			if row.RefreshToken, err = s.cipher.Decrypt(value.EncryptedRefreshToken); err != nil {
+				return nil, fmt.Errorf("解密账号 %d refresh token: %w", value.ID, err)
+			}
+		}
+		if value.EncryptedCloudflareCookie != "" {
+			if row.CloudflareCookies, err = s.cipher.Decrypt(value.EncryptedCloudflareCookie); err != nil {
+				return nil, fmt.Errorf("解密账号 %d Cloudflare Cookie: %w", value.ID, err)
+			}
+		}
+		if row.AccessToken == "" && row.RefreshToken == "" {
+			return nil, fmt.Errorf("账号 %d 没有可导出的凭据", value.ID)
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// credentialCSVHeader 是 CSV 导出固定表头；token_type 与 token 已按来源归一化。
+const credentialCSVHeader = "id,provider,name,email,user_id,tier,status,enabled,token_type,token,created_at"
+
+// renderCredentialText 输出每行一个账号的纯文本：web/console 行是纯 SSO 令牌，
+// build 行是「邮箱<TAB>refresh token」（refresh 为空时用 access token）。
+// 空令牌行会被跳过，保证导出的 txt 能被对应导入接口读回。
+func renderCredentialText(rows []exportCredentialRow) ([]byte, int) {
+	var builder strings.Builder
+	written := 0
+	for _, row := range rows {
+		line := credentialTextLine(row)
+		if line == "" {
+			continue
+		}
+		builder.WriteString(line)
+		builder.WriteByte('\n')
+		written++
+	}
+	return []byte(builder.String()), written
+}
+
+func credentialTextLine(row exportCredentialRow) string {
+	token := exportAccountToken(row)
+	if token == "" {
+		return ""
+	}
+	if row.Credential.Provider == accountdomain.ProviderBuild {
+		return strings.TrimSpace(row.Credential.Email) + "\t" + token
+	}
+	return token
+}
+
+// exportAccountToken 返回 txt/csv 使用的令牌：web/console 是 access token（SSO），
+// build 优先 refresh token，refresh 为空时退回 access token。
+func exportAccountToken(row exportCredentialRow) string {
+	if row.Credential.Provider == accountdomain.ProviderBuild && strings.TrimSpace(row.RefreshToken) != "" {
+		return strings.TrimSpace(row.RefreshToken)
+	}
+	return strings.TrimSpace(row.AccessToken)
+}
+
+// exportTokenType 标注令牌语义；历史账号缺失 AuthType 时按来源回退。
+func exportTokenType(value accountdomain.Credential) accountdomain.AuthType {
+	if value.AuthType == accountdomain.AuthTypeOAuth || value.AuthType == accountdomain.AuthTypeSSO {
+		return value.AuthType
+	}
+	if value.Provider == accountdomain.ProviderBuild {
+		return accountdomain.AuthTypeOAuth
+	}
+	return accountdomain.AuthTypeSSO
+}
+
+func exportCreatedAt(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+// renderCredentialCSV 输出 RFC4180 CSV：CRLF 换行，必要字段加双引号并转义内部引号。
+func renderCredentialCSV(rows []exportCredentialRow) []byte {
+	var builder strings.Builder
+	builder.WriteString(credentialCSVHeader)
+	builder.WriteString("\r\n")
+	for _, row := range rows {
+		value := row.Credential
+		fields := [...]string{
+			strconv.FormatUint(value.ID, 10),
+			string(value.Provider),
+			value.Name,
+			value.Email,
+			value.UserID,
+			string(value.WebTier),
+			string(value.AuthStatus),
+			strconv.FormatBool(value.Enabled),
+			string(exportTokenType(value)),
+			exportAccountToken(row),
+			exportCreatedAt(value.CreatedAt),
+		}
+		for index, field := range fields {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			builder.WriteString(csvField(field))
+		}
+		builder.WriteString("\r\n")
+	}
+	return []byte(builder.String())
+}
+
+// csvField 只在字段包含分隔符、引号或换行时加双引号，内部引号按 RFC4180 双写。
+func csvField(value string) string {
+	if !strings.ContainsAny(value, ",\"\r\n") {
+		return value
+	}
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (View, error) {

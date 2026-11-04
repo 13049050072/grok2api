@@ -1,6 +1,7 @@
 package account
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -134,8 +135,11 @@ func (p *accountSyncPipeline) reportProgress() {
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/accounts", h.list)
 	router.GET("/accounts/summary", h.summary)
+	// /accounts/ids 与列表接口共享同一套筛选参数，供管理端「全选」拿到全部账号 ID。
+	router.GET("/accounts/ids", h.listIDs)
 	router.GET("/accounts/export", h.exportCredentials)
 	router.POST("/accounts/export", h.exportSelectedCredentials)
+	router.POST("/accounts/export/archive", h.exportArchive)
 	router.GET("/accounts/:id", h.get)
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
@@ -211,6 +215,13 @@ type batchDeleteRequest struct {
 type credentialExportRequest struct {
 	IDs      []string `json:"ids" binding:"required"`
 	Provider string   `json:"provider" binding:"required"`
+	// Format 可为空，默认 json；也支持 txt / csv。
+	Format string `json:"format"`
+}
+
+// accountExportArchiveRequest 只接受导出格式；省略 format 时默认 json。
+type accountExportArchiveRequest struct {
+	Format string `json:"format"`
 }
 
 type deletionPreviewRequest struct {
@@ -1217,27 +1228,120 @@ func (h *Handler) exportSelectedCredentials(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
+	format, err := accountapp.ParseExportFormat(request.Format)
+	if err != nil {
+		h.writeServiceError(c, "accountExportFailed", err, http.StatusBadRequest, "导出账号失败")
+		return
+	}
 	ids, err := parseIDs(request.IDs)
 	if err != nil {
 		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
 		return
 	}
 	providerValue := accountdomain.Provider(request.Provider)
-	result, err := h.service.ExportProviderCredentialsByIDs(c.Request.Context(), providerValue, ids)
+	result, err := h.service.ExportProviderCredentialsByIDsFormatted(c.Request.Context(), providerValue, ids, format)
 	if err != nil {
 		h.writeServiceError(c, "accountExportFailed", err, http.StatusInternalServerError, "导出账号失败")
 		return
 	}
-	h.writeCredentialExport(c, providerValue, result)
+	h.writeSelectedCredentialExport(c, providerValue, result)
 }
 
-func (h *Handler) writeCredentialExport(c *gin.Context, providerValue accountdomain.Provider, result accountapp.ExportResult) {
-	filename := "grok2api-" + string(providerValue) + "-accounts-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
+// exportArchive 把全部账号按来源打包成一个 ZIP 下载，避免逐来源多次请求。
+func (h *Handler) exportArchive(c *gin.Context) {
+	var request accountExportArchiveRequest
+	// 允许空请求体：format 省略时默认 json。
+	if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	format, err := accountapp.ParseExportFormat(request.Format)
+	if err != nil {
+		h.writeServiceError(c, "accountExportFailed", err, http.StatusBadRequest, "导出账号失败")
+		return
+	}
+	exports, err := h.service.ExportAllProvidersArchive(c.Request.Context(), format)
+	if err != nil {
+		h.writeServiceError(c, "accountExportFailed", err, http.StatusInternalServerError, "导出账号失败")
+		return
+	}
+	data, count, err := buildProviderArchive(exports)
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "accountExportFailed", "导出账号失败")
+		return
+	}
+	filename := "grok2api-accounts-" + time.Now().UTC().Format("20060102T150405Z") + ".zip"
+	h.writeCredentialDownloadHeaders(c, filename)
+	c.Header("X-Exported-Accounts", strconv.Itoa(count))
+	c.Data(http.StatusOK, "application/zip", data)
+}
+
+// buildProviderArchive 把各来源的渲染结果写成 ZIP 条目，并返回包内账号总数。
+func buildProviderArchive(exports []accountapp.ProviderExport) ([]byte, int, error) {
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	count := 0
+	for _, export := range exports {
+		if export.Count == 0 {
+			continue
+		}
+		entry, err := writer.Create(string(export.Provider) + "." + export.Format.Extension())
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, err := entry.Write(export.Data); err != nil {
+			return nil, 0, err
+		}
+		count += export.Count
+	}
+	if err := writer.Close(); err != nil {
+		return nil, 0, err
+	}
+	return buffer.Bytes(), count, nil
+}
+
+// listIDs 返回当前筛选下的全部账号 ID；不接受分页参数。
+func (h *Handler) listIDs(c *gin.Context) {
+	ids, err := h.service.ListIDs(c.Request.Context(), c.Query("search"), accountapp.ListFilter{
+		Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"),
+		Renewal: c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
+	if errors.Is(err, accountapp.ErrInvalidFilter) {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
+		return
+	}
+	if err != nil {
+		h.writeServiceError(c, "accountListFailed", err, http.StatusInternalServerError, "读取账号失败")
+		return
+	}
+	values := make([]string, 0, len(ids))
+	for _, id := range ids {
+		values = append(values, strconv.FormatUint(id, 10))
+	}
+	response.Success(c, http.StatusOK, gin.H{"ids": values})
+}
+
+// writeSelectedCredentialExport 输出「导出选中账号」，Content-Type 与扩展名随 format 变化。
+func (h *Handler) writeSelectedCredentialExport(c *gin.Context, providerValue accountdomain.Provider, result accountapp.ExportFile) {
+	filename := "grok2api-" + string(providerValue) + "-accounts-selected-" + time.Now().UTC().Format("20060102T150405Z") + "." + result.Format.Extension()
+	h.writeCredentialDownloadHeaders(c, filename)
+	c.Header("X-Exported-Accounts", strconv.Itoa(result.Count))
+	c.Data(http.StatusOK, result.Format.ContentType(), result.Data)
+}
+
+// writeCredentialDownloadHeaders 统一导出下载的缓存与暴露头，防止浏览器缓存真实凭据。
+func (h *Handler) writeCredentialDownloadHeaders(c *gin.Context, filename string) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("Pragma", "no-cache")
 	c.Header("Access-Control-Expose-Headers", "Content-Disposition, X-Exported-Accounts, X-Export-Next-ID, X-Export-Snapshot-Max-ID, X-Export-Has-More")
 	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
 	c.Header("X-Content-Type-Options", "nosniff")
+}
+
+func (h *Handler) writeCredentialExport(c *gin.Context, providerValue accountdomain.Provider, result accountapp.ExportResult) {
+	filename := "grok2api-" + string(providerValue) + "-accounts-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
+	h.writeCredentialDownloadHeaders(c, filename)
 	c.Header("X-Exported-Accounts", strconv.Itoa(result.Count))
 	c.Data(http.StatusOK, "application/json; charset=utf-8", result.Data)
 }

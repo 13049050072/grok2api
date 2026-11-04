@@ -45,12 +45,13 @@ import {
   enableWebAccountNSFW,
   convertWebAccountsToBuild,
   detectBuildAccounts,
-  exportAccountBatch,
+  exportAllAccountsArchive,
   exportSelectedAccounts,
   getAccountSummary,
   importAccounts,
   importConsoleAccounts,
   importWebAccounts,
+  listAccountIds,
   listAccounts,
   pollDeviceAuthorization,
   refreshAccountBilling,
@@ -87,6 +88,7 @@ import {
   type DeviceSessionDTO,
   type QuotaDTO,
 } from "@/features/accounts/accounts-api";
+import { accountExportFormats, defaultAccountExportFormat, withSelectedIds, type AccountExportFormat, type AccountExportScope } from "@/features/accounts/export-formats";
 import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/account-quota";
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { DuplicatePreview } from "@/features/accounts/duplicate-preview";
@@ -160,11 +162,8 @@ export function AccountsPage() {
   const [cleanupPreview, setCleanupPreview] = useState<{ key: string; data: CleanupPreviewDTO } | null>(null);
   const [cleanupPreviewError, setCleanupPreviewError] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
-  const [exportLimit, setExportLimit] = useState("1000");
-  const [exportCursor, setExportCursor] = useState("0");
-  const [exportSnapshotMaxId, setExportSnapshotMaxId] = useState("0");
-  const [exportBatchNumber, setExportBatchNumber] = useState(1);
-  const [exportCompletedCount, setExportCompletedCount] = useState(0);
+  const [exportScope, setExportScope] = useState<AccountExportScope>("all");
+  const [exportFormat, setExportFormat] = useState<AccountExportFormat>(defaultAccountExportFormat);
   const [syncAllOpen, setSyncAllOpen] = useState(false);
   const [detectDialogOpen, setDetectDialogOpen] = useState(false);
   const [detectMode, setDetectMode] = useState<"selected" | "all">("all");
@@ -234,16 +233,22 @@ export function AccountsPage() {
   const selected = selection.provider === provider ? selection.ids : new Set<string>();
   const selectedIdsKey = Array.from(selected).sort().join(",");
 
+  // 列表、导出与「全选」共用同一份筛选条件，避免三处口径漂移。
+  const accountFilters = {
+    provider,
+    search: debouncedSearch,
+    type: typeFilter,
+    status: statusFilter,
+    egress: egressFilter,
+    renewal: provider === "grok_build" ? renewalFilter : undefined,
+    risk: provider === "grok_build" ? riskFilter : undefined,
+    agreement: provider === "grok_web" ? agreementFilter : undefined,
+    association: associationFilter || undefined,
+  };
+
   const accountsQuery = useQuery({
     queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
-    queryFn: () => listAccounts({
-      provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
-      renewal: provider === "grok_build" ? renewalFilter : undefined,
-      risk: provider === "grok_build" ? riskFilter : undefined,
-      agreement: provider === "grok_web" ? agreementFilter : undefined,
-      association: associationFilter || undefined,
-      sortBy: sort.field, sortOrder: sort.order,
-    }),
+    queryFn: () => listAccounts({ ...accountFilters, page, pageSize, sortBy: sort.field, sortOrder: sort.order }),
   });
 
   const summaryQuery = useQuery({
@@ -696,32 +701,34 @@ export function AccountsPage() {
     },
   });
 
-  const exportMutation = useMutation({
-    mutationFn: async (input: { kind: "selected"; ids: string[] } | { kind: "batch"; limit: number; afterId: string; snapshotMaxId: string; batchNumber: number }) => {
-      if (input.kind === "selected") {
-        return { kind: input.kind, blob: await exportSelectedAccounts(provider, input.ids) } as const;
+  const selectAllMutation = useMutation({
+    mutationFn: () => listAccountIds(accountFilters),
+    onSuccess: ({ ids }) => {
+      setSelection({ provider, ids: withSelectedIds(ids) });
+      if (ids.length === 0) {
+        toast.info(t("accountExport.selectAllEmpty"));
+        return;
       }
-      return { kind: input.kind, batchNumber: input.batchNumber, batch: await exportAccountBatch(provider, input.limit, input.afterId, input.snapshotMaxId) } as const;
+      toast.success(t("accountExport.selectAllDone", { count: ids.length }));
+    },
+    onError: showError,
+  });
+
+  const exportMutation = useMutation({
+    mutationFn: async (input: { scope: AccountExportScope; format: AccountExportFormat; ids: string[] }) => {
+      if (input.scope === "selected") {
+        return { scope: input.scope, file: await exportSelectedAccounts(provider, input.ids, input.format) } as const;
+      }
+      return { scope: input.scope, file: await exportAllAccountsArchive(input.format) } as const;
     },
     onSuccess: (result) => {
-      if (result.kind === "selected") {
-        downloadAccountExport(result.blob, provider, "selected");
-        setExportOpen(false);
-        toast.success(t("accounts.exported"));
-        return;
-      }
-      downloadAccountExport(result.batch.blob, provider, `batch-${String(result.batchNumber).padStart(4, "0")}`);
-      const completed = exportCompletedCount + result.batch.count;
-      if (result.batch.hasMore) {
-        setExportCursor(result.batch.nextId);
-        setExportSnapshotMaxId(result.batch.snapshotMaxId);
-        setExportBatchNumber(result.batchNumber + 1);
-        setExportCompletedCount(completed);
-        toast.success(t("accountExport.batchCompleted", { count: result.batch.count }));
-        return;
-      }
+      downloadAccountExport(result.file.blob, result.file.filename);
       setExportOpen(false);
-      toast.success(t("accountExport.completed", { count: completed }));
+      if (result.scope === "selected") {
+        toast.success(result.file.count === undefined ? t("accountExport.selectedExported") : t("accountExport.selectedExportedCount", { count: result.file.count }));
+        return;
+      }
+      toast.success(result.file.count === undefined ? t("accountExport.archiveExported") : t("accountExport.archiveExportedCount", { count: result.file.count }));
     },
     onError: showError,
   });
@@ -1124,26 +1131,16 @@ export function AccountsPage() {
   const pageIDs = result?.items.map((account) => account.id) ?? [];
   const selectedOnPage = pageIDs.filter((id) => selected.has(id));
   const allPageSelected = pageIDs.length > 0 && selectedOnPage.length === pageIDs.length;
+  const effectiveExportScope: AccountExportScope = exportScope === "selected" && selected.size > 0 ? "selected" : "all";
 
   function clearSelection(): void {
     setSelection((current) => ({ provider: current.provider, ids: new Set() }));
   }
 
-  function resetExportProgress(): void {
-    setExportCursor("0");
-    setExportSnapshotMaxId("0");
-    setExportBatchNumber(1);
-    setExportCompletedCount(0);
-  }
-
-  function openProviderExport(): void {
-    clearSelection();
-    resetExportProgress();
-    setExportOpen(true);
-  }
-
-  function openSelectedExport(): void {
-    resetExportProgress();
+  function openExportDialog(scope: AccountExportScope): void {
+    // 没有选中项时范围只能落到「全部账号」。
+    setExportScope(scope === "selected" && selected.size === 0 ? "all" : scope);
+    setExportFormat(defaultAccountExportFormat);
     setExportOpen(true);
   }
 
@@ -1325,7 +1322,7 @@ export function AccountsPage() {
               {hasProviderAccounts ? (
                 <>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={openProviderExport}><Download />{t("accounts.exportAuth")}</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => openExportDialog("all")}><Download />{t("accountExport.action")}</DropdownMenuItem>
                 </>
               ) : null}
             </DropdownMenuContent>
@@ -1418,10 +1415,18 @@ export function AccountsPage() {
                 ] },
               ]} />
             </div>
+            {/* 全选/取消选择常驻：全选走 /accounts/ids，能跨页选中当前筛选下的全部账号。 */}
+            <div className="flex items-center gap-1.5">
+              <Button variant="secondary" size="sm" disabled={bulkTaskPending || selectAllMutation.isPending} onClick={() => selectAllMutation.mutate()}>
+                {selectAllMutation.isPending ? <Spinner /> : null}
+                {t("accountExport.selectAll")}
+              </Button>
+              <Button variant="secondary" size="sm" disabled={bulkTaskPending || selected.size === 0} onClick={clearSelection}>{t("accountExport.clearSelection")}</Button>
+            </div>
             {selected.size > 0 ? (
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selected.size })}</span>
-                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={openSelectedExport}><Download />{t("accounts.exportAuth")}</Button>
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openExportDialog("selected")}><Download />{t("accountExport.action")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(true)}>{t("common.enable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(false)}>{t("common.disable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {
@@ -1724,28 +1729,43 @@ export function AccountsPage() {
 
       <AlertDialog open={exportOpen} onOpenChange={(open) => { if (!open && !exportMutation.isPending) setExportOpen(false); }}>
         <AlertDialogContent>
-          <AlertDialogHeader><AlertDialogTitle>{t("accounts.exportTitle", { provider: provider === "grok_build" ? "Grok Build" : provider === "grok_web" ? "Grok Web" : "Grok Console" })}</AlertDialogTitle><AlertDialogDescription>{t("accounts.exportDescription")}</AlertDialogDescription></AlertDialogHeader>
-          {selected.size > 0 ? <p className="text-sm text-muted-foreground">{t("common.selectedCount", { count: selected.size })}</p> : <div className="grid gap-2">
-            <Label htmlFor="account-export-limit">{t("accounts.exportCount")}</Label>
-            <Input id="account-export-limit" type="number" min={1} max={10000} value={exportLimit} disabled={exportSnapshotMaxId !== "0"} onChange={(event) => setExportLimit(event.target.value)} />
-            <p className="text-xs text-muted-foreground">{t("accountExport.countDescription")}</p>
-            {exportCompletedCount > 0 ? <p className="text-sm text-muted-foreground">{t("accountExport.batchProgress", { count: exportCompletedCount, batch: exportBatchNumber })}</p> : null}
-          </div>}
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("accountExport.title")}</AlertDialogTitle>
+            <AlertDialogDescription>{t("accountExport.description")}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="account-export-scope">{t("accountExport.scope")}</Label>
+              <Select value={effectiveExportScope} onValueChange={(value) => setExportScope(value === "selected" ? "selected" : "all")} disabled={exportMutation.isPending}>
+                <SelectTrigger id="account-export-scope"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("accountExport.scopeAll")}</SelectItem>
+                  {selected.size > 0 ? <SelectItem value="selected">{t("accountExport.scopeSelected", { count: selected.size })}</SelectItem> : null}
+                </SelectContent>
+              </Select>
+              <p className="text-xs leading-5 text-muted-foreground">{t(effectiveExportScope === "all" ? "accountExport.scopeAllHint" : "accountExport.scopeSelectedHint")}</p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="account-export-format">{t("accountExport.format")}</Label>
+              <Select value={exportFormat} onValueChange={(value) => setExportFormat(value === "txt" || value === "csv" ? value : "json")} disabled={exportMutation.isPending}>
+                <SelectTrigger id="account-export-format"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {accountExportFormats.map((format) => <SelectItem key={format} value={format}>{t(accountExportFormatLabel(format))}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={exportMutation.isPending}>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction
-              disabled={exportMutation.isPending || (selected.size === 0 && (!Number.isInteger(Number(exportLimit)) || Number(exportLimit) < 1 || Number(exportLimit) > 10000))}
+              disabled={exportMutation.isPending}
               onClick={(event) => {
                 event.preventDefault();
-                if (selected.size > 0) {
-                  exportMutation.mutate({ kind: "selected", ids: [...selected] });
-                  return;
-                }
-                exportMutation.mutate({ kind: "batch", limit: Number(exportLimit), afterId: exportCursor, snapshotMaxId: exportSnapshotMaxId, batchNumber: exportBatchNumber });
+                exportMutation.mutate({ scope: effectiveExportScope, format: exportFormat, ids: [...selected] });
               }}
             >
               {exportMutation.isPending ? <Spinner /> : null}
-              {selected.size === 0 && exportCompletedCount > 0 ? t("accountExport.nextBatch") : t("accounts.exportAuth")}
+              {exportMutation.isPending ? t("accountExport.exportRunning") : t("accountExport.action")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -2270,13 +2290,20 @@ export function AccountsPage() {
   );
 }
 
-function downloadAccountExport(blob: Blob, provider: AccountProvider, suffix: string): void {
+// 文件名由 API 层按响应头 Content-Disposition 解析，缺失时才回退本地拼接。
+function downloadAccountExport(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `grok2api-${provider.replaceAll("_", "-")}-accounts-${suffix}-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.download = filename;
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function accountExportFormatLabel(format: AccountExportFormat): string {
+  if (format === "txt") return "accountExport.formatTxt";
+  if (format === "csv") return "accountExport.formatCsv";
+  return "accountExport.formatJson";
 }
 
 function scopeSupportsAccountProvider(scope: EgressScope, provider: AccountProvider): boolean {

@@ -1,9 +1,15 @@
 package account
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/csv"
+	"errors"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +20,7 @@ import (
 	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
 	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 func TestExportCredentialsRoundTripsImportFormat(t *testing.T) {
@@ -284,5 +291,271 @@ func TestExportProviderCredentialsRoundTripsSSOProviders(t *testing.T) {
 				t.Fatalf("reimported web metadata = %#v", stored)
 			}
 		})
+	}
+}
+
+// newExportTestDatabase 打开临时 SQLite 并返回账号仓储与密文，避免各格式用例重复样板。
+func newExportTestDatabase(t *testing.T, ctx context.Context) (*relational.AccountRepository, *security.Cipher) {
+	t.Helper()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "export-formats.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return relational.NewAccountRepository(database), cipher
+}
+
+func newExportTestService(accounts *relational.AccountRepository, cipher *security.Cipher, adapters ...provider.Adapter) *Service {
+	return NewService(accounts, nil, nil, nil, provider.NewRegistry(adapters...), cipher, nil)
+}
+
+func insertExportAccount(t *testing.T, ctx context.Context, accounts *relational.AccountRepository, value accountdomain.Credential) accountdomain.Credential {
+	t.Helper()
+	created, _, err := accounts.UpsertByIdentity(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func mustEncrypt(t *testing.T, cipher *security.Cipher, value string) string {
+	t.Helper()
+	encrypted, err := cipher.Encrypt(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encrypted
+}
+
+func TestParseExportFormatDefaultsToJSON(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  ExportFormat
+		err   bool
+	}{
+		{input: "", want: ExportFormatJSON},
+		{input: "json", want: ExportFormatJSON},
+		{input: " JSON ", want: ExportFormatJSON},
+		{input: "txt", want: ExportFormatText},
+		{input: "CSV", want: ExportFormatCSV},
+		{input: "xml", err: true},
+	} {
+		format, err := ParseExportFormat(test.input)
+		if test.err {
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("format %q error = %v", test.input, err)
+			}
+			continue
+		}
+		if err != nil || format != test.want {
+			t.Fatalf("format %q = %q, error = %v", test.input, format, err)
+		}
+	}
+}
+
+func TestExportFormattedTextCanBeImportedBack(t *testing.T) {
+	ctx := context.Background()
+	accounts, cipher := newExportTestDatabase(t, ctx)
+	webAdapter := webprovider.NewAdapter(webprovider.Config{}, nil, nil, nil, nil)
+	service := newExportTestService(accounts, cipher, webAdapter)
+
+	webAccount := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web", Email: "web@example.com",
+		SourceKey: "web-txt", WebTier: accountdomain.WebTierSuper,
+		EncryptedAccessToken: mustEncrypt(t, cipher, "sso-token"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	file, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderWeb, []uint64{webAccount.ID}, ExportFormatText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Count != 1 || file.Format != ExportFormatText || string(file.Data) != "sso-token\n" {
+		t.Fatalf("web txt export = %#v", file)
+	}
+	seeds, err := webAdapter.ParseImportedCredentials(file.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seeds) != 1 || seeds[0].AccessToken != "sso-token" || seeds[0].Provider != accountdomain.ProviderWeb {
+		t.Fatalf("web txt reimport = %#v", seeds)
+	}
+
+	buildAccount := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build", Email: "build@example.com", SourceKey: "build-txt",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "build-access"), EncryptedRefreshToken: mustEncrypt(t, cipher, "build-refresh"),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	buildFile, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderBuild, []uint64{buildAccount.ID}, ExportFormatText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buildFile.Data) != "build@example.com\tbuild-refresh\n" {
+		t.Fatalf("build txt export = %q", buildFile.Data)
+	}
+
+	// refresh token 为空时回退 access token，保证导出的 txt 仍可被读回。
+	fallback := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build-fallback", Email: "fallback@example.com", SourceKey: "build-txt-fallback",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "build-fallback-access"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	fallbackFile, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderBuild, []uint64{fallback.ID}, ExportFormatText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(fallbackFile.Data) != "fallback@example.com\tbuild-fallback-access\n" {
+		t.Fatalf("build txt fallback = %q", fallbackFile.Data)
+	}
+}
+
+func TestExportFormattedCSVQuotesRFC4180Fields(t *testing.T) {
+	ctx := context.Background()
+	accounts, cipher := newExportTestDatabase(t, ctx)
+	service := newExportTestService(accounts, cipher)
+	created := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "alpha, \"beta\"",
+		Email: "quoted\"mail@example.com", UserID: "user-1", SourceKey: "web-csv",
+		WebTier: accountdomain.WebTierSuper, EncryptedAccessToken: mustEncrypt(t, cipher, "sso-token"),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	file, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderWeb, []uint64{created.ID}, ExportFormatCSV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(file.Data)
+	rows, err := csv.NewReader(strings.NewReader(raw)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHeader := []string{"id", "provider", "name", "email", "user_id", "tier", "status", "enabled", "token_type", "token", "created_at"}
+	if len(rows) != 2 || !slices.Equal(rows[0], wantHeader) {
+		t.Fatalf("csv rows = %#v", rows)
+	}
+	row := rows[1]
+	if row[0] != strconv.FormatUint(created.ID, 10) || row[1] != string(accountdomain.ProviderWeb) || row[2] != "alpha, \"beta\"" ||
+		row[3] != "quoted\"mail@example.com" || row[4] != "user-1" || row[5] != string(accountdomain.WebTierSuper) ||
+		row[6] != string(accountdomain.AuthStatusActive) || row[7] != "true" || row[8] != "sso" || row[9] != "sso-token" {
+		t.Fatalf("csv row = %#v", row)
+	}
+	if _, err := time.Parse(time.RFC3339, row[10]); err != nil {
+		t.Fatalf("csv created_at %q: %v", row[10], err)
+	}
+	if !strings.Contains(raw, "\"alpha, \"\"beta\"\"\"") {
+		t.Fatalf("csv name field not escaped: %s", raw)
+	}
+	if strings.Contains(strings.ReplaceAll(raw, "\r\n", ""), "\n") {
+		t.Fatalf("csv must use CRLF line endings: %q", raw)
+	}
+	if !strings.HasSuffix(raw, "\r\n") {
+		t.Fatalf("csv must end with CRLF: %q", raw)
+	}
+	if len(file.Data) != len(raw) || file.Count != 1 || file.Format != ExportFormatCSV {
+		t.Fatalf("csv export = %#v", file)
+	}
+}
+
+func TestExportFormattedJSONMatchesLegacyBytes(t *testing.T) {
+	ctx := context.Background()
+	accounts, cipher := newExportTestDatabase(t, ctx)
+	service := newExportTestService(accounts, cipher, cliprovider.NewAdapter(cliprovider.Config{}, cipher))
+	created := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "primary", Email: "user@example.com", UserID: "user-1", SourceKey: "build-json",
+		OIDCClientID: "client-1", EncryptedAccessToken: mustEncrypt(t, cipher, "access-token"),
+		EncryptedRefreshToken: mustEncrypt(t, cipher, "refresh-token"),
+		ExpiresAt:             time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	legacy, err := service.ExportProviderCredentialsByIDs(ctx, accountdomain.ProviderBuild, []uint64{created.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []ExportFormat{ExportFormatJSON, ""} {
+		file, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderBuild, []uint64{created.ID}, format)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(file.Data, legacy.Data) || file.Count != legacy.Count || file.Format != ExportFormatJSON {
+			t.Fatalf("format %q changed json bytes: got %q, want %q", format, file.Data, legacy.Data)
+		}
+	}
+}
+
+func TestExportAllProvidersArchiveGroupsByProvider(t *testing.T) {
+	ctx := context.Background()
+	accounts, cipher := newExportTestDatabase(t, ctx)
+	service := newExportTestService(accounts, cipher,
+		cliprovider.NewAdapter(cliprovider.Config{}, cipher),
+		webprovider.NewAdapter(webprovider.Config{}, nil, nil, nil, nil),
+		consoleprovider.NewAdapter(consoleprovider.Config{}, nil, nil, nil),
+	)
+	insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-one", SourceKey: "archive-web-1",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "web-token-one"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-two", SourceKey: "archive-web-2",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "web-token-two"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build-one", Email: "build@example.com", SourceKey: "archive-build",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "build-access"), EncryptedRefreshToken: mustEncrypt(t, cipher, "build-refresh"),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderConsole, AuthType: accountdomain.AuthTypeSSO, Name: "console-one", SourceKey: "archive-console",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "console-token"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+
+	exports, err := service.ExportAllProvidersArchive(ctx, ExportFormatText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exports) != 3 {
+		t.Fatalf("archive sources = %#v", exports)
+	}
+	byProvider := make(map[accountdomain.Provider]ProviderExport, len(exports))
+	for _, export := range exports {
+		byProvider[export.Provider] = export
+	}
+	wantLines := map[accountdomain.Provider]string{
+		accountdomain.ProviderBuild:   "build@example.com\tbuild-refresh\n",
+		accountdomain.ProviderWeb:     "web-token-one\nweb-token-two\n",
+		accountdomain.ProviderConsole: "console-token\n",
+	}
+	wantCounts := map[accountdomain.Provider]int{accountdomain.ProviderBuild: 1, accountdomain.ProviderWeb: 2, accountdomain.ProviderConsole: 1}
+	for providerValue, wantLine := range wantLines {
+		export, ok := byProvider[providerValue]
+		if !ok {
+			t.Fatalf("missing archive source %s", providerValue)
+		}
+		if export.Count != wantCounts[providerValue] || string(export.Data) != wantLine || export.Format != ExportFormatText {
+			t.Fatalf("archive source %s = %#v", providerValue, export)
+		}
+	}
+}
+
+// oversizedExportRepository 只实现 List，用来验证导出上限在读取后的判定。
+type oversizedExportRepository struct {
+	repository.AccountRepository
+	values []accountdomain.Credential
+	total  int64
+}
+
+func (r oversizedExportRepository) List(context.Context, repository.AccountListQuery) ([]accountdomain.Credential, int64, error) {
+	return r.values, r.total, nil
+}
+
+func TestExportLimitsAskForNarrowerSelection(t *testing.T) {
+	ctx := context.Background()
+	service := NewService(oversizedExportRepository{total: maxCredentialExportAccounts + 1}, nil, nil, nil, nil, nil, nil)
+	if _, err := service.ListIDs(ctx, "", ListFilter{}); !errors.Is(err, ErrExportLimit) {
+		t.Fatalf("list ids error = %v", err)
+	}
+	if _, err := service.ExportAllProvidersArchive(ctx, ExportFormatJSON); !errors.Is(err, ErrExportLimit) {
+		t.Fatalf("archive error = %v", err)
 	}
 }

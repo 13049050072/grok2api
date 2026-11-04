@@ -1,6 +1,7 @@
 package account
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -24,6 +26,8 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	cliprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/cli"
+	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
+	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -567,5 +571,314 @@ func TestAccountSyncPipelineUsesFinalQueuedTotal(t *testing.T) {
 		if value[1] != 3 {
 			t.Fatalf("progress contains changing total: %#v", progress)
 		}
+	}
+}
+
+// newExportHTTPFixture 启动一套真实路由的账号导出测试服务，覆盖 handler 与 service 的契约。
+func newExportHTTPFixture(t *testing.T, ctx context.Context) (*httptest.Server, *relational.AccountRepository, *security.Cipher) {
+	t.Helper()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "export-http.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	registry := provider.NewRegistry(
+		cliprovider.NewAdapter(cliprovider.Config{}, cipher),
+		webprovider.NewAdapter(webprovider.Config{}, nil, nil, nil, nil),
+		consoleprovider.NewAdapter(consoleprovider.Config{}, nil, nil, nil),
+	)
+	handler := NewHandler(accountapp.NewService(accounts, nil, nil, nil, registry, cipher, nil), nil)
+	router := gin.New()
+	handler.Register(router.Group("/api/admin/v1"))
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	return server, accounts, cipher
+}
+
+func createExportTestAccount(t *testing.T, ctx context.Context, accounts *relational.AccountRepository, cipher *security.Cipher, value accountdomain.Credential) accountdomain.Credential {
+	t.Helper()
+	encrypt := func(plain string) string {
+		encrypted, err := cipher.Encrypt(plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encrypted
+	}
+	if value.EncryptedAccessToken != "" {
+		value.EncryptedAccessToken = encrypt(value.EncryptedAccessToken)
+	}
+	if value.EncryptedRefreshToken != "" {
+		value.EncryptedRefreshToken = encrypt(value.EncryptedRefreshToken)
+	}
+	created, _, err := accounts.UpsertByIdentity(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func readHTTPResponse(t *testing.T, response *http.Response) []byte {
+	t.Helper()
+	t.Cleanup(func() { _ = response.Body.Close() })
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestAccountExportArchiveReturnsZipWithEveryProvider(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	server, accounts, cipher := newExportHTTPFixture(t, ctx)
+	createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build", Email: "build@example.com", SourceKey: "http-archive-build",
+		EncryptedAccessToken: "build-access", EncryptedRefreshToken: "build-refresh",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web", SourceKey: "http-archive-web",
+		EncryptedAccessToken: "web-token", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderConsole, AuthType: accountdomain.AuthTypeSSO, Name: "console", SourceKey: "http-archive-console",
+		EncryptedAccessToken: "console-token", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+
+	postArchive := func(body string) (*http.Response, []byte) {
+		t.Helper()
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/admin/v1/accounts/export/archive", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response, readHTTPResponse(t, response)
+	}
+	readArchive := func(data []byte) map[string]string {
+		t.Helper()
+		reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := make(map[string]string, len(reader.File))
+		for _, file := range reader.File {
+			entry, err := file.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			content, err := io.ReadAll(entry)
+			_ = entry.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries[file.Name] = string(content)
+		}
+		return entries
+	}
+
+	response, data := postArchive(`{"format":"txt"}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, data)
+	}
+	if got := response.Header.Get("Content-Type"); got != "application/zip" {
+		t.Fatalf("content type = %q", got)
+	}
+	if got := response.Header.Get("X-Exported-Accounts"); got != "3" {
+		t.Fatalf("exported accounts header = %q", got)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("cache control = %q", got)
+	}
+	disposition := response.Header.Get("Content-Disposition")
+	if !strings.Contains(disposition, "grok2api-accounts-") || !strings.Contains(disposition, ".zip") {
+		t.Fatalf("content disposition = %q", disposition)
+	}
+	entries := readArchive(data)
+	wantEntries := map[string]string{
+		"grok_build.txt":   "build@example.com" + "\t" + "build-refresh" + "\n",
+		"grok_web.txt":     "web-token" + "\n",
+		"grok_console.txt": "console-token" + "\n",
+	}
+	if len(entries) != len(wantEntries) {
+		t.Fatalf("zip entries = %#v", entries)
+	}
+	for name, line := range wantEntries {
+		if entries[name] != line {
+			t.Fatalf("zip entry %s = %q, want %q", name, entries[name], line)
+		}
+	}
+
+	// 省略 format 时默认 json，条目扩展名随格式变化。
+	jsonResponse, jsonData := postArchive("")
+	if jsonResponse.StatusCode != http.StatusOK {
+		t.Fatalf("default archive status = %d, body = %s", jsonResponse.StatusCode, jsonData)
+	}
+	jsonEntries := readArchive(jsonData)
+	names := make([]string, 0, len(jsonEntries))
+	for name := range jsonEntries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != "grok_build.json,grok_console.json,grok_web.json" {
+		t.Fatalf("default archive entries = %#v", names)
+	}
+	if !strings.Contains(jsonEntries["grok_web.json"], `"accounts"`) {
+		t.Fatalf("web json entry = %q", jsonEntries["grok_web.json"])
+	}
+}
+
+func TestAccountIDsRoutePassesListFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	server, accounts, cipher := newExportHTTPFixture(t, ctx)
+	needle := createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "needle-build", SourceKey: "http-ids-needle",
+		EncryptedAccessToken: "needle-access", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "other-build", SourceKey: "http-ids-other",
+		EncryptedAccessToken: "other-access", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	web := createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "needle-web", SourceKey: "http-ids-web",
+		EncryptedAccessToken: "web-token", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+
+	get := func(query string) string {
+		t.Helper()
+		response, err := http.Get(server.URL + "/api/admin/v1/accounts/ids?" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := readHTTPResponse(t, response)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+		}
+		return string(body)
+	}
+
+	// page/pageSize 必须被忽略：筛选结果返回全部 ID。
+	if body := get("provider=grok_build&search=needle&page=2&pageSize=1"); body != `{"data":{"ids":["`+strconv.FormatUint(needle.ID, 10)+`"]}}` {
+		t.Fatalf("build ids = %s", body)
+	}
+	if body := get("provider=grok_web"); body != `{"data":{"ids":["`+strconv.FormatUint(web.ID, 10)+`"]}}` {
+		t.Fatalf("web ids = %s", body)
+	}
+	invalidResponse, err := http.Get(server.URL + "/api/admin/v1/accounts/ids?provider=not_a_provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidBody := string(readHTTPResponse(t, invalidResponse))
+	if invalidResponse.StatusCode != http.StatusBadRequest || !strings.Contains(invalidBody, `"code":"invalidFilter"`) {
+		t.Fatalf("invalid filter response = %d, body = %s", invalidResponse.StatusCode, invalidBody)
+	}
+}
+
+func TestAccountExportSelectedHonorsFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	server, accounts, cipher := newExportHTTPFixture(t, ctx)
+	build := createExportTestAccount(t, ctx, accounts, cipher, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build", Email: "build@example.com", SourceKey: "http-selected-build",
+		EncryptedAccessToken: "build-access", EncryptedRefreshToken: "build-refresh",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	id := strconv.FormatUint(build.ID, 10)
+
+	export := func(body string) (*http.Response, string) {
+		t.Helper()
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/admin/v1/accounts/export", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := readHTTPResponse(t, response)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", response.StatusCode, data)
+		}
+		return response, string(data)
+	}
+
+	response, jsonBody := export(`{"provider":"grok_build","ids":["` + id + `"]}`)
+	if got := response.Header.Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("json content type = %q", got)
+	}
+	if got := response.Header.Get("X-Exported-Accounts"); got != "1" {
+		t.Fatalf("json exported accounts = %q", got)
+	}
+	if disposition := response.Header.Get("Content-Disposition"); !strings.Contains(disposition, "-accounts-selected-") || !strings.Contains(disposition, ".json") {
+		t.Fatalf("json content disposition = %q", disposition)
+	}
+
+	// 默认 json 必须与旧的全量导出字节一致。
+	legacyResponse, err := http.Get(server.URL + "/api/admin/v1/accounts/export?provider=grok_build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBody := string(readHTTPResponse(t, legacyResponse))
+	if legacyBody != jsonBody {
+		t.Fatalf("default json body = %q, legacy = %q", jsonBody, legacyBody)
+	}
+
+	response, csvBody := export(`{"provider":"grok_build","ids":["` + id + `"],"format":"csv"}`)
+	if got := response.Header.Get("Content-Type"); got != "text/csv; charset=utf-8" {
+		t.Fatalf("csv content type = %q", got)
+	}
+	if disposition := response.Header.Get("Content-Disposition"); !strings.Contains(disposition, "-accounts-selected-") || !strings.Contains(disposition, ".csv") {
+		t.Fatalf("csv content disposition = %q", disposition)
+	}
+	if !strings.HasPrefix(csvBody, "id,provider,name,email,user_id,tier,status,enabled,token_type,token,created_at"+"\r\n") {
+		t.Fatalf("csv header = %q", csvBody)
+	}
+
+	response, textBody := export(`{"provider":"grok_build","ids":["` + id + `"],"format":"txt"}`)
+	if got := response.Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("txt content type = %q", got)
+	}
+	if disposition := response.Header.Get("Content-Disposition"); !strings.Contains(disposition, "-accounts-selected-") || !strings.Contains(disposition, ".txt") {
+		t.Fatalf("txt content disposition = %q", disposition)
+	}
+	if textBody != "build@example.com"+"\t"+"build-refresh"+"\n" {
+		t.Fatalf("txt body = %q", textBody)
+	}
+}
+
+func TestAccountExportRejectsUnknownFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name    string
+		request string
+		body    string
+		handler func(*Handler, *gin.Context)
+	}{
+		{name: "selected", request: "/api/admin/v1/accounts/export", body: `{"provider":"grok_build","ids":["1"],"format":"xml"}`, handler: (*Handler).exportSelectedCredentials},
+		{name: "archive", request: "/api/admin/v1/accounts/export/archive", body: `{"format":"xml"}`, handler: (*Handler).exportArchive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ginContext, _ := gin.CreateTestContext(recorder)
+			ginContext.Request = httptest.NewRequest("POST", test.request, strings.NewReader(test.body))
+			ginContext.Request.Header.Set("Content-Type", "application/json")
+			test.handler(new(Handler), ginContext)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"accountExportFailed"`) || !strings.Contains(recorder.Body.String(), "导出格式无效") {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }

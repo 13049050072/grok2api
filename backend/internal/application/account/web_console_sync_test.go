@@ -373,6 +373,15 @@ func (r *webConsoleBatchRepository) ListProviderAccountBatch(_ context.Context, 
 	return values, int64(len(r.values)), nil
 }
 
+// UpsertImportedCredentialsSafely 与生产仓储保持一致：批量导入走安全 upsert 接口，
+// 否则服务层会以「账号来源不支持该操作」拒绝同步。
+func (r *webConsoleBatchRepository) UpsertImportedCredentialsSafely(_ context.Context, values []accountdomain.Credential) ([]repository.AccountUpsertResult, error) {
+	results := make([]repository.AccountUpsertResult, len(values))
+	for index := range values {
+		results[index] = repository.AccountUpsertResult{ID: 10_000 + r.nextID.Add(1), Created: true}
+	}
+	return results, nil
+}
 func (r *webConsoleBatchRepository) UpsertManyByIdentity(_ context.Context, values []accountdomain.Credential) ([]repository.AccountUpsertResult, error) {
 	results := make([]repository.AccountUpsertResult, len(values))
 	for index := range values {
