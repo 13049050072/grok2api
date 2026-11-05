@@ -851,6 +851,18 @@ func TestImageEditRejectsUnsupportedCountAndStreamingOptions(t *testing.T) {
 	}
 }
 
+func TestInspectImageEditOutput(t *testing.T) {
+	frames := []byte(`{"result":{"response":{"userResponse":{"message":"edit"}}}}` + `{"result":{"response":{"streamingImageGenerationResponse":{"imageUrl":"users/test/generated/final/image.jpg","progress":100}}}}`)
+	prompt, seen, matched := inspectImageEditOutput(frames, "edit", []string{"https://assets.grok.com/users/test/generated/final/image.jpg"})
+	if !prompt || !seen || !matched {
+		t.Fatalf("prompt=%v seen=%v matched=%v", prompt, seen, matched)
+	}
+	prompt, seen, matched = inspectImageEditOutput(frames, "different", []string{"https://assets.grok.com/users/test/generated/other/image.jpg"})
+	if prompt || !seen || matched {
+		t.Fatalf("prompt=%v seen=%v matched=%v", prompt, seen, matched)
+	}
+}
+
 func TestInspectImageEditBinding(t *testing.T) {
 	frame := []byte(`{"result":{"response":{"userResponse":{"mediaGenInput":{"imageToImage":{"inputAssets":["asset-1"]}},"metadata":{"modelConfigOverride":{"modelMap":{"imageEditModelConfig":{"resolvedImageReferences":["https://example.test/image"]}}}}}}}}`)
 	matched, seen, resolved := inspectImageEditBinding(frame, []string{"asset-1"})

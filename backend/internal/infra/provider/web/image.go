@@ -911,7 +911,8 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 	}
 	urls := imageEditResultURLs(&parsed, capture.Bytes())
 	confirmed, echoed, resolvedCount := inspectImageEditBinding(capture.Bytes(), references)
-	a.log().Info("web_image_edit_reference_binding", "reference_count", len(references), "user_response_seen", echoed, "references_match", confirmed, "resolved_reference_count", resolvedCount, "output_image_count", len(urls))
+	promptMatched, finalSeen, finalMatched := inspectImageEditOutput(capture.Bytes(), request.Prompt, urls)
+	a.log().Info("web_image_edit_reference_binding", "reference_count", len(references), "user_response_seen", echoed, "references_match", confirmed, "resolved_reference_count", resolvedCount, "prompt_match", promptMatched, "final_frame_seen", finalSeen, "selected_matches_final", finalMatched, "output_image_count", len(urls))
 	if len(urls) == 0 {
 		return jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
 			"message": "上游未返回可用的编辑图片",
@@ -923,6 +924,31 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		result.QuotaUnits = 1
 	}
 	return result, err
+}
+
+// Report structural matches only; never log prompts or media URLs.
+func inspectImageEditOutput(captured []byte, prompt string, selected []string) (bool, bool, bool) {
+	promptMatched, finalSeen, finalMatched := false, false, false
+	_ = consumeJSONObjects(bytes.NewReader(captured), 8<<20, func(frame []byte) error {
+		var root map[string]any
+		if json.Unmarshal(frame, &root) != nil {
+			return nil
+		}
+		result, _ := root["result"].(map[string]any)
+		response, _ := result["response"].(map[string]any)
+		if user, ok := response["userResponse"].(map[string]any); ok {
+			promptMatched = user["message"] == prompt
+		}
+		image, ok := parseImageEditStreamFrame(frame)
+		if ok && !image.Moderated && image.Progress >= 100 {
+			finalSeen = true
+			if len(selected) > 0 && image.URL == selected[0] {
+				finalMatched = true
+			}
+		}
+		return nil
+	})
+	return promptMatched, finalSeen, finalMatched
 }
 
 // inspectImageEditBinding reports only structural metadata, never input IDs,
