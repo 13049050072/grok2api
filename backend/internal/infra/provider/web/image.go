@@ -869,12 +869,12 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		if uploadErr != nil {
 			return nil, uploadErr
 		}
-		// 当前浏览器编辑请求用 imageEditModelConfig.imageReferences 传参考图，
-		// 值是资产地址（ASSET_SERVER_URL + fileUri），不再是 inputAssets 里的元数据 ID。
-		reference := uploaded.URI
+		// Imagine imageToImage.inputAssets uses the uploaded fileMetadataId.
+		// An uploadId alone is an asynchronous task, not an image asset reference.
+		reference := uploaded.MetadataID
 		if reference == "" {
 			return jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
-				"message": "参考图上传完成但上游未返回文件地址",
+				"message": "参考图上传完成但上游未返回文件元数据标识",
 				"type":    "upstream_error", "code": "image_edit_upload_reference_missing",
 			}}), nil
 		}
@@ -923,33 +923,21 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 	return result, err
 }
 
-// buildImageEditPayload 复刻 grok.com Imagine 的直出编辑请求：参考图放在
-// responseMetadata.modelConfigOverride.modelMap.imageEditModelConfig.imageReferences，
-// 值是资产地址。旧实现的 mediaGenInput.imageToImage.inputAssets 只是媒体帖的读取字段，
-// 上游不会据此绑定输入图，编辑会退化成只用 message 的文生图。
+// buildImageEditPayload follows the Imagine request sent by grok.com after a
+// direct image upload. inputAssets contains fileMetadataId values, not URLs.
 func buildImageEditPayload(prompt string, references []string, aspectRatio string) map[string]any {
-	imageEditModelConfig := map[string]any{"imageReferences": references}
+	imageToImage := map[string]any{"prompt": prompt, "inputAssets": references}
 	if aspectRatio != "" {
-		imageEditModelConfig["aspectRatio"] = aspectRatio
+		imageToImage["aspectRatio"] = aspectRatio
 	}
 	return map[string]any{
-		"modelName":             "imagine-image-edit",
-		"message":               prompt,
-		"temporary":             true,
-		"fileAttachments":       []any{},
-		"imageGenerationCount":  1,
-		"enableImageGeneration": true,
-		"enableImageStreaming":  true,
-		"enableSideBySide":      false,
-		"sendFinalMetadata":     true,
+		"modelName": "imagine-image-edit", "message": prompt,
+		"enableImageStreaming": true, "enableSideBySide": true, "sendFinalMetadata": true,
 		"responseMetadata": map[string]any{
-			"modelConfigOverride": map[string]any{
-				"modelMap": map[string]any{
-					"imageEditModel":       "imagine",
-					"imageEditModelConfig": imageEditModelConfig,
-				},
-			},
+			"modelConfigOverride": map[string]any{"modelMap": map[string]any{"imageEditModel": "imagine"}},
 		},
+		"mediaGenInput": map[string]any{"imageToImage": imageToImage},
+		"kind":          "CONVERSATION_KIND_IMAGINE",
 	}
 }
 

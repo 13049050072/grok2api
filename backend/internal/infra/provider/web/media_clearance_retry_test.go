@@ -438,10 +438,8 @@ func TestImageEditStructuredForbiddenDoesNotRetryOrRefresh(t *testing.T) {
 	}
 }
 
-// 编辑请求的参考图走 imageEditModelConfig.imageReferences，值必须是可寻址的资产地址
-// （ASSET_SERVER_URL + fileUri）。上传只返回 uploadId 时上游没有可用地址，必须明确
-// 报错而不是把空引用发下去，否则编辑会退化成纯文生图。
-func TestImageEditRequiresAssetURIForImageReferences(t *testing.T) {
+// 编辑请求需要上传响应中的 fileMetadataId；uploadId 不能作为图片资产 ID。
+func TestImageEditRequiresFileMetadataID(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		uploadBody string
@@ -449,8 +447,14 @@ func TestImageEditRequiresAssetURIForImageReferences(t *testing.T) {
 		wantCode   string
 	}{
 		{
-			name:       "missing file uri",
+			name:       "missing metadata id",
 			uploadBody: `{"uploadId":"upload-1"}`,
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "image_edit_upload_reference_missing",
+		},
+		{
+			name:       "file uri without metadata id",
+			uploadBody: `{"uploadId":"upload-1","fileMetadata":{"fileUri":"users/test/reference/content"}}`,
 			wantStatus: http.StatusBadGateway,
 			wantCode:   "image_edit_upload_reference_missing",
 		},
@@ -500,9 +504,8 @@ func TestImageEditRequiresAssetURIForImageReferences(t *testing.T) {
 	}
 }
 
-// 参考图地址必须出现在 imageEditModelConfig.imageReferences 里，且不能再带旧的
-// mediaGenInput.imageToImage.inputAssets 形态。
-func TestImageEditSendsImageReferencesForUploadedAsset(t *testing.T) {
+// The uploaded metadata ID must reach the Imagine inputAssets array.
+func TestImageEditSendsMetadataIDForUploadedAsset(t *testing.T) {
 	var generationCalls atomic.Int32
 	var payload map[string]any
 	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
@@ -541,19 +544,17 @@ func TestImageEditSendsImageReferencesForUploadedAsset(t *testing.T) {
 	if generationCalls.Load() != 1 {
 		t.Fatalf("generation calls = %d, want 1", generationCalls.Load())
 	}
-	if _, exists := payload["mediaGenInput"]; exists {
-		t.Fatalf("legacy mediaGenInput leaked: %#v", payload["mediaGenInput"])
+	if payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
+		t.Fatalf("kind = %#v", payload["kind"])
 	}
-	metadata, _ := payload["responseMetadata"].(map[string]any)
-	override, _ := metadata["modelConfigOverride"].(map[string]any)
-	modelMap, _ := override["modelMap"].(map[string]any)
-	config, _ := modelMap["imageEditModelConfig"].(map[string]any)
-	references, _ := config["imageReferences"].([]any)
-	if len(references) != 1 || references[0] != "https://assets.grok.com/users/test/reference/content" {
-		t.Fatalf("imageReferences = %#v", config["imageReferences"])
+	input, _ := payload["mediaGenInput"].(map[string]any)
+	imageToImage, _ := input["imageToImage"].(map[string]any)
+	assets, _ := imageToImage["inputAssets"].([]any)
+	if len(assets) != 1 || assets[0] != "file-1" {
+		t.Fatalf("inputAssets = %#v", imageToImage["inputAssets"])
 	}
-	if config["aspectRatio"] != "9:16" {
-		t.Fatalf("aspectRatio = %#v", config["aspectRatio"])
+	if imageToImage["aspectRatio"] != "9:16" {
+		t.Fatalf("aspectRatio = %#v", imageToImage["aspectRatio"])
 	}
 }
 

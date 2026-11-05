@@ -852,49 +852,27 @@ func TestImageEditRejectsUnsupportedCountAndStreamingOptions(t *testing.T) {
 }
 
 func TestBuildImageEditPayloadMatchesImagineDirectGenerationShape(t *testing.T) {
-	references := []string{"https://assets.grok.com/users/u1/content", "https://assets.grok.com/users/u2/content"}
-	payload := buildImageEditPayload("改成兔子", references, "1:1")
-	if len(payload) != 10 || payload["modelName"] != "imagine-image-edit" || payload["message"] != "改成兔子" ||
-		payload["temporary"] != true || payload["imageGenerationCount"] != 1 ||
-		payload["enableImageGeneration"] != true || payload["enableImageStreaming"] != true ||
-		payload["enableSideBySide"] != false || payload["sendFinalMetadata"] != true {
+	assets := []string{"metadata-1", "metadata-2"}
+	payload := buildImageEditPayload("改成兔子", assets, "1:1")
+	if len(payload) != 8 || payload["modelName"] != "imagine-image-edit" || payload["message"] != "改成兔子" ||
+		payload["enableImageStreaming"] != true || payload["enableSideBySide"] != true ||
+		payload["sendFinalMetadata"] != true || payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
 		t.Fatalf("payload = %#v", payload)
 	}
-	if attachments, ok := payload["fileAttachments"].([]any); !ok || len(attachments) != 0 {
-		t.Fatalf("fileAttachments = %#v", payload["fileAttachments"])
+	metadata := payload["responseMetadata"].(map[string]any)
+	override := metadata["modelConfigOverride"].(map[string]any)
+	modelMap := override["modelMap"].(map[string]any)
+	if modelMap["imageEditModel"] != "imagine" {
+		t.Fatalf("modelMap = %#v", modelMap)
 	}
-	metadata, ok := payload["responseMetadata"].(map[string]any)
-	if !ok {
-		t.Fatalf("responseMetadata = %#v", payload["responseMetadata"])
+	imageToImage := payload["mediaGenInput"].(map[string]any)["imageToImage"].(map[string]any)
+	if imageToImage["prompt"] != "改成兔子" || imageToImage["aspectRatio"] != "1:1" || !slices.Equal(imageToImage["inputAssets"].([]string), assets) {
+		t.Fatalf("imageToImage = %#v", imageToImage)
 	}
-	override, ok := metadata["modelConfigOverride"].(map[string]any)
-	if !ok {
-		t.Fatalf("modelConfigOverride = %#v", metadata["modelConfigOverride"])
-	}
-	modelMap, ok := override["modelMap"].(map[string]any)
-	if !ok || modelMap["imageEditModel"] != "imagine" {
-		t.Fatalf("modelMap = %#v", override["modelMap"])
-	}
-	config, ok := modelMap["imageEditModelConfig"].(map[string]any)
-	if !ok {
-		t.Fatalf("imageEditModelConfig = %#v", modelMap["imageEditModelConfig"])
-	}
-	if !slices.Equal(config["imageReferences"].([]string), references) || config["aspectRatio"] != "1:1" {
-		t.Fatalf("imageEditModelConfig = %#v", config)
-	}
-	// 旧形态（媒体帖读取字段）不能被发送，否则上游会退化成纯文生图。
-	for _, field := range []string{"mediaGenInput", "kind", "experiments"} {
-		if _, exists := payload[field]; exists {
-			t.Fatalf("legacy field %q leaked into payload: %#v", field, payload)
-		}
-	}
-	withoutRatio := buildImageEditPayload("edit", references, "")
-	metadata = withoutRatio["responseMetadata"].(map[string]any)
-	override = metadata["modelConfigOverride"].(map[string]any)
-	modelMap = override["modelMap"].(map[string]any)
-	config = modelMap["imageEditModelConfig"].(map[string]any)
-	if _, exists := config["aspectRatio"]; exists {
-		t.Fatalf("empty aspect ratio leaked into payload: %#v", config)
+	withoutRatio := buildImageEditPayload("edit", assets, "")
+	imageToImage = withoutRatio["mediaGenInput"].(map[string]any)["imageToImage"].(map[string]any)
+	if _, exists := imageToImage["aspectRatio"]; exists {
+		t.Fatalf("empty aspect ratio leaked: %#v", imageToImage)
 	}
 }
 
