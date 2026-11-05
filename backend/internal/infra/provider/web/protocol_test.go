@@ -851,6 +851,22 @@ func TestImageEditRejectsUnsupportedCountAndStreamingOptions(t *testing.T) {
 	}
 }
 
+func TestInspectImageEditBinding(t *testing.T) {
+	frame := []byte(`{"result":{"response":{"userResponse":{"mediaGenInput":{"imageToImage":{"inputAssets":["asset-1"]}},"metadata":{"modelConfigOverride":{"modelMap":{"imageEditModelConfig":{"resolvedImageReferences":["https://example.test/image"]}}}}}}}}`)
+	matched, seen, resolved := inspectImageEditBinding(frame, []string{"asset-1"})
+	if !matched || !seen || resolved != 1 {
+		t.Fatalf("match=%v seen=%v resolved=%d", matched, seen, resolved)
+	}
+	matched, seen, _ = inspectImageEditBinding(frame, []string{"asset-2"})
+	if matched || !seen {
+		t.Fatalf("mismatched asset: match=%v seen=%v", matched, seen)
+	}
+	matched, seen, _ = inspectImageEditBinding([]byte(`{"result":{"response":{}}}`), []string{"asset-1"})
+	if matched || seen {
+		t.Fatalf("missing response: match=%v seen=%v", matched, seen)
+	}
+}
+
 func TestBuildImageEditPayloadMatchesImagineDirectGenerationShape(t *testing.T) {
 	assets := []string{"metadata-1", "metadata-2"}
 	payload := buildImageEditPayload("改成兔子", assets, "1:1")

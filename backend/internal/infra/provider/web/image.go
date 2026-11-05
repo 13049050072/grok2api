@@ -910,6 +910,8 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		return nil, consumeErr
 	}
 	urls := imageEditResultURLs(&parsed, capture.Bytes())
+	confirmed, echoed, resolvedCount := inspectImageEditBinding(capture.Bytes(), references)
+	a.log().Info("web_image_edit_reference_binding", "reference_count", len(references), "user_response_seen", echoed, "references_match", confirmed, "resolved_reference_count", resolvedCount, "output_image_count", len(urls))
 	if len(urls) == 0 {
 		return jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
 			"message": "上游未返回可用的编辑图片",
@@ -921,6 +923,45 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 		result.QuotaUnits = 1
 	}
 	return result, err
+}
+
+// inspectImageEditBinding reports only structural metadata, never input IDs,
+// prompts, image URLs, or account credentials.
+func inspectImageEditBinding(captured []byte, expected []string) (bool, bool, int) {
+	matched, seen, resolved := false, false, 0
+	_ = consumeJSONObjects(bytes.NewReader(captured), 8<<20, func(frame []byte) error {
+		var root map[string]any
+		if json.Unmarshal(frame, &root) != nil {
+			return nil
+		}
+		result, _ := root["result"].(map[string]any)
+		response, _ := result["response"].(map[string]any)
+		userResponse, _ := response["userResponse"].(map[string]any)
+		if userResponse == nil {
+			return nil
+		}
+		seen = true
+		media, _ := userResponse["mediaGenInput"].(map[string]any)
+		imageToImage, _ := media["imageToImage"].(map[string]any)
+		assets, _ := imageToImage["inputAssets"].([]any)
+		if len(assets) == len(expected) && len(expected) > 0 {
+			matched = true
+			for i, id := range expected {
+				if assets[i] != id {
+					matched = false
+					break
+				}
+			}
+		}
+		metadata, _ := userResponse["metadata"].(map[string]any)
+		override, _ := metadata["modelConfigOverride"].(map[string]any)
+		modelMap, _ := override["modelMap"].(map[string]any)
+		config, _ := modelMap["imageEditModelConfig"].(map[string]any)
+		values, _ := config["resolvedImageReferences"].([]any)
+		resolved = len(values)
+		return nil
+	})
+	return matched, seen, resolved
 }
 
 // buildImageEditPayload follows the Imagine request sent by grok.com after a
