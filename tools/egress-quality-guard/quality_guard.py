@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import fcntl
 import json
 import os
 import random
+import re
 import signal
 import ssl
 import sys
@@ -52,6 +54,13 @@ LEASE_SCAN_MAX_PAGES = 1000
 LEASE_RECOVERY_MAX_PER_CYCLE = 8
 LEASE_RECOVERY_BACKOFF_BASE_SECONDS = 30
 LEASE_RECOVERY_BACKOFF_MAX_SECONDS = 1800
+ROTATION_BACKOFF_BASE_SECONDS = 300
+ROTATION_BACKOFF_MAX_SECONDS = 3600
+PASSIVE_CONFIRM_COOLDOWN_SECONDS = 300
+# Audits are committed asynchronously after completion, so a row can appear
+# behind newer rows that an earlier poll already saw.
+PASSIVE_AUDIT_OVERLAP_SECONDS = 120
+PASSIVE_SEEN_AUDIT_IDS_MIN = 2000
 
 
 class GuardDisabled(RuntimeError):
@@ -265,10 +274,21 @@ class ApiError(RuntimeError):
         self.code = code
 
 
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Surface 3xx responses as errors; urllib would replay Authorization to the new URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect refused: {msg}", headers, fp)
+
+
 class ApiClient:
     def __init__(self, config: Config):
         self.config = config
         self.ssl_context = ssl.create_default_context()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=self.ssl_context),
+            RejectRedirectHandler(),
+        )
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
@@ -278,7 +298,7 @@ class ApiClient:
         headers["Authorization"] = f"Bearer {self.config.internal_token}"
         request = urllib.request.Request(self.config.base_url + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds, context=self.ssl_context) as response:
+            with self.opener.open(request, timeout=self.config.request_timeout_seconds) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
             try:
@@ -394,11 +414,7 @@ class ApiClient:
             headers["Authorization"] = f"Bearer {self.config.rotation_token}"
         request = urllib.request.Request(self.config.rotation_url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(
-                request,
-                timeout=self.config.rotation_timeout_seconds,
-                context=self.ssl_context,
-            ) as response:
+            with self.opener.open(request, timeout=self.config.rotation_timeout_seconds) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
             try:
@@ -558,6 +574,22 @@ def generation_window_ms(first_token_ms: int, duration_ms: int, reasoning_tokens
     return generation_ms
 
 
+AUDIT_TIME_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$", re.IGNORECASE)
+
+
+def parse_audit_time(value: Any) -> float | None:
+    """Parse an RFC 3339 audit timestamp (Go emits up to nanoseconds) as epoch seconds."""
+    match = AUDIT_TIME_PATTERN.match(str(value or "").strip())
+    if match is None:
+        return None
+    zone = match.group(3) or "Z"
+    text = match.group(1) + (match.group(2) or "")[:7] + ("+00:00" if zone.upper() == "Z" else zone)
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
 def default_node_state() -> dict[str, Any]:
     return {
         "observe_only": False,
@@ -580,9 +612,11 @@ def default_node_state() -> dict[str, Any]:
         "last_rotation_at": 0.0,
         "last_rotation_exit_ip": "",
         "rotation_failures": 0,
+        "next_rotation_at": 0.0,
         "last_no_account_log_at": 0.0,
         "quarantine_source": "",
         "passive_degrade_repeats": 0,
+        "last_passive_confirm_at": 0.0,
     }
 
 
@@ -764,10 +798,16 @@ class Guard:
         return result
 
     def _can_quarantine(self, nodes: list[dict[str, Any]], node_id: str) -> bool:
-        enabled = sum(1 for node in nodes if bool(node.get("enabled")))
         target_enabled = any(str(node.get("id")) == node_id and bool(node.get("enabled")) for node in nodes)
         if self.config.fail_closed:
             return target_enabled
+        # The floor covers only nodes this guard could itself disable: direct,
+        # unmanaged, protected, and account-bound nodes are not substitutes.
+        protected_node_ids = {str(value) for value in self.state.get("protected_node_ids", [])}
+        enabled = sum(
+            1 for node in self._eligible_nodes(nodes, protected_node_ids)
+            if bool(node.get("enabled")) and not self._is_lease_scoped(node)
+        )
         return target_enabled and enabled - 1 >= self.config.min_healthy_nodes
 
     def _should_rotate(self, node_id: str, reason: str) -> bool:
@@ -780,6 +820,42 @@ class Guard:
                 "recovery_probe_error", "rotation_error",
             }
         )
+
+    def _rotate(self, node: dict[str, Any], now: float, trigger: str) -> bool:
+        """Rotate the exit IP unless an earlier webhook failure is still backing off."""
+        node_id = str(node["id"])
+        state = self._state_for(node_id)
+        retry_at = float(state.get("next_rotation_at", 0.0))
+        if now < retry_at:
+            log_event("node_rotation_deferred", node_id=node_id, node_name=node.get("name"), trigger=trigger, retry_after_seconds=round(retry_at - now, 3))
+            return False
+        try:
+            rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
+        except Exception as exc:
+            failures = min(16, int(state.get("rotation_failures", 0)) + 1)
+            delay = min(ROTATION_BACKOFF_MAX_SECONDS, ROTATION_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)))
+            state["rotation_failures"] = failures
+            state["next_rotation_at"] = now + delay
+            log_event(
+                "node_rotation_failed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                error_type=type(exc).__name__,
+                trigger=trigger,
+                failures=failures,
+                retry_after_seconds=delay,
+            )
+            return False
+        exit_ip = str(rotation.get("newExitIp") or "")
+        state.update({
+            "last_rotation_at": time.time(),
+            "last_rotation_exit_ip": exit_ip,
+            "rotation_failures": 0,
+            "next_rotation_at": 0.0,
+        })
+        append_state_event(self.state, "node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=exit_ip)
+        log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=exit_ip, trigger=trigger)
+        return True
 
     @staticmethod
     def _probe_account_unavailable(exc: Exception) -> bool:
@@ -1050,20 +1126,8 @@ class Guard:
             elif self._should_rotate(node_id, reason):
                 self._recover_quarantined(node, time.time(), rotate=True)
         elif self._should_rotate(node_id, reason):
-            try:
-                rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
-            except Exception as exc:
-                state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
-                log_event("node_rotation_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__, trigger="passive_hold")
-            else:
-                state.update({
-                    "last_rotation_at": time.time(),
-                    "last_rotation_exit_ip": str(rotation.get("newExitIp") or ""),
-                    "rotation_failures": 0,
-                })
-                append_state_event(self.state, "node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""))
-                self._save()
-                log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""), trigger="passive_hold")
+            self._rotate(node, now, trigger="passive_hold")
+            self._save()
 
     def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
         node_id = str(node["id"])
@@ -1146,27 +1210,9 @@ class Guard:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         if rotate:
-            try:
-                rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
-            except Exception as exc:
-                state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
-                state["quarantined_until"] = now + self.config.quarantine_seconds
-                state["last_reason"] = "rotation_error"
-                log_event("node_rotation_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
-                return
-            state.update({
-                "last_rotation_at": time.time(),
-                "last_rotation_exit_ip": str(rotation.get("newExitIp") or ""),
-                "rotation_failures": 0,
-            })
-            append_state_event(
-                self.state,
-                "node_rotated",
-                node_id=node_id,
-                node_name=node.get("name"),
-                exit_ip=str(rotation.get("newExitIp") or ""),
-            )
-            log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""))
+            # A failed or deferred rotation still probes the current exit, so
+            # an unavailable webhook cannot keep a recovered node isolated.
+            self._rotate(node, now, trigger="recovery")
         try:
             try:
                 connectivity = self.api.connectivity_test(node_id)
@@ -1192,8 +1238,8 @@ class Guard:
             state["quarantined_until"] = now + self.config.quarantine_seconds
             state["last_reason"] = reason
             log_event("quarantine_extended", node_id=node_id, node_name=node.get("name"), reason=reason)
-            if rotate_on_failure and self._should_rotate(node_id, reason):
-                self._recover_quarantined(node, time.time(), rotate=True)
+            if rotate_on_failure and self._should_rotate(node_id, reason) and self._rotate(node, time.time(), trigger="probe_failure"):
+                self._recover_quarantined(node, time.time(), rotate=False)
             return
         after_passive = self._is_passive_quarantine(state)
         updated = self.api.set_enabled(node_id, True)
@@ -1412,46 +1458,60 @@ class Guard:
         self._save()
 
     def _fetch_new_audits(self) -> list[dict[str, Any]]:
-        known = set(str(value) for value in self.state.get("seen_audit_ids", []))
+        previous_ids = [str(value) for value in self.state.get("seen_audit_ids", [])]
+        known = set(previous_ids)
+        previous_newest = float(self.state.get("passive_newest_audit_at") or 0.0)
+        # Keep reading past already-seen rows down to the overlap boundary so
+        # late-committed audits are not hidden behind them.
+        cutoff = previous_newest - PASSIVE_AUDIT_OVERLAP_SECONDS if previous_newest > 0 else None
+        newest = previous_newest
         fetched_ids: list[str] = []
         collected: list[dict[str, Any]] = []
         cursor = ""
-        reached_known = False
+        complete = False
         for _page in range(self.config.passive_max_pages):
             page = self.api.list_audits(cursor)
             items = list(page.get("items") or [])
             if not items:
+                complete = True
                 break
+            page_has_unseen = False
             for item in items:
                 audit_id = str(item.get("id") or item.get("requestId") or "")
                 if not audit_id:
                     continue
-                fetched_ids.append(audit_id)
+                created_at = parse_audit_time(item.get("createdAt"))
+                if created_at is not None:
+                    if cutoff is not None and created_at < cutoff:
+                        complete = True
+                        break
+                    newest = max(newest, created_at)
                 if audit_id in known:
-                    reached_known = True
-                    break
+                    continue
+                known.add(audit_id)
+                page_has_unseen = True
+                fetched_ids.append(audit_id)
                 collected.append(item)
-            if reached_known or not page.get("hasMore"):
+            if complete or not page.get("hasMore"):
+                complete = True
+                break
+            # Without timestamps, a page containing only seen rows bounds the overlap.
+            if cutoff is None and previous_ids and not page_has_unseen:
+                complete = True
                 break
             cursor = str(page.get("nextCursor") or "")
             if not cursor:
                 break
 
-        combined = []
-        seen = set()
-        for audit_id in [*fetched_ids, *self.state.get("seen_audit_ids", [])]:
-            audit_id = str(audit_id)
-            if audit_id and audit_id not in seen:
-                seen.add(audit_id)
-                combined.append(audit_id)
-            if len(combined) >= 2000:
-                break
-        self.state["seen_audit_ids"] = combined
+        limit = max(PASSIVE_SEEN_AUDIT_IDS_MIN, 2 * self.config.passive_max_pages * self.config.passive_page_size)
+        self.state["seen_audit_ids"] = list(dict.fromkeys([*fetched_ids, *previous_ids]))[:limit]
+        if newest > 0:
+            self.state["passive_newest_audit_at"] = newest
         if not self.state.get("passive_initialized"):
             self.state["passive_initialized"] = True
             log_event("passive_baseline_initialized", audit_count=len(fetched_ids))
             return []
-        if collected and not reached_known and known:
+        if not complete and previous_ids:
             log_event("passive_audit_gap", collected=len(collected), max_pages=self.config.passive_max_pages)
         collected.reverse()
         return collected
@@ -1506,6 +1566,8 @@ class Guard:
         )
         if self._is_lease_scoped(node):
             self._quarantine_lease(node, audit_value, reason, now)
+        elif classification == "soft" and not self.config.fail_closed:
+            self._confirm_passive_soft(all_nodes, node, reason, now)
         else:
             log_event(
                 "passive_immediate_quarantine",
@@ -1516,6 +1578,17 @@ class Guard:
                 output_tps=round(speed, 3),
             )
             self._quarantine(all_nodes, node, reason, now, recover_now=False)
+
+    def _confirm_passive_soft(self, all_nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float) -> None:
+        """Re-test a passive soft hit with one ordinary active probe; its verdict decides quarantine."""
+        node_id = str(node["id"])
+        state = self._state_for(node_id)
+        last_confirm_at = float(state.get("last_passive_confirm_at", 0.0))
+        if last_confirm_at > 0 and now - last_confirm_at < PASSIVE_CONFIRM_COOLDOWN_SECONDS:
+            return
+        state["last_passive_confirm_at"] = now
+        log_event("passive_confirmation_probe", node_id=node_id, node_name=node.get("name"), reason=reason)
+        self._probe_active(all_nodes, node, now, trigger="passive_soft")
 
     def run_passive_cycle(self) -> None:
         now = time.time()

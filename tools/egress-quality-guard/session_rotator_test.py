@@ -1,8 +1,10 @@
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("session_rotator.py")
@@ -110,6 +112,50 @@ class SessionRotatorTests(unittest.TestCase):
             result = rotator.rotate("8", expected_old_exit_ip="203.0.113.10")
             self.assertEqual(result["oldExitIp"], "203.0.113.20")
             self.assertEqual(result["newExitIp"], "203.0.113.21")
+
+    def test_rotation_proceeds_when_pre_rotation_exit_is_unreachable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials = root / "credentials.list"
+            mihomo = root / "mihomo.yaml"
+            credentials.write_text("proxy.example:3000:user-sid-old1111-t-10:secret\n", encoding="utf-8")
+            mihomo.write_text("username: user-sid-old1111-t-10\n", encoding="utf-8")
+            cfg = session_rotator.Config(
+                listen="127.0.0.1", port=19099, token="", credentials_file=credentials,
+                mihomo_config_file=mihomo, mihomo_controller_url="http://127.0.0.1:9099",
+                mihomo_reload_path="/root/.config/mihomo/config.yaml", node_id_base=8,
+                listener_port_base=7951, sticky_minutes=10, max_attempts=1,
+                verify_timeout_seconds=5,
+            )
+            rotator = session_rotator.Rotator(cfg)
+
+            def dead_session(_index):
+                raise OSError("session is dead")
+
+            rotator._exit_ip = dead_session
+            rotator._wait_for_exit_ip = lambda _index: "203.0.113.21"
+            updates = []
+            rotator._update_session = lambda index, session: updates.append(index)
+            rotator._reload_mihomo = lambda: None
+            result = rotator.rotate("8", expected_old_exit_ip="203.0.113.10")
+            self.assertEqual(updates, [0])
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["oldExitIp"], "")
+            self.assertEqual(result["newExitIp"], "203.0.113.21")
+
+    def test_non_loopback_listener_requires_token(self):
+        cases = [
+            ("127.0.0.1", "", True), ("127.0.0.2", "", True), ("::1", "", True), ("localhost", "", True),
+            ("0.0.0.0", "", False), ("::", "", False), ("10.0.0.5", "", False), ("rotator.internal", "", False),
+            ("0.0.0.0", "rotation-secret", True),
+        ]
+        for listen, token, allowed in cases:
+            with self.subTest(listen=listen, token=bool(token)), mock.patch.dict(os.environ, {"ROTATOR_LISTEN": listen, "ROTATOR_TOKEN": token}):
+                if allowed:
+                    self.assertEqual(session_rotator.Config.from_env().listen, listen)
+                else:
+                    with self.assertRaisesRegex(ValueError, "ROTATOR_TOKEN"):
+                        session_rotator.Config.from_env()
 
 
 if __name__ == "__main__":

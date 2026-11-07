@@ -8,8 +8,11 @@ Egress Quality Guard is an internal control-plane sidecar. It can run real model
 - The main service provisions a hidden, Build-only system identity for probes. It cannot authenticate through public `/v1` routes and cannot be listed, exported, edited, disabled, or deleted through Client Key administration.
 - Keep the shared volume private. Its bootstrap file contains a derived, quality-guard-only internal credential; state also contains node names, IDs, timing data, and operational history.
 - The internal credential must remain limited to the dedicated quality-guard route group. Never register the general administrator API under this middleware.
+- The internal batch node update accepts only the `enabled` field, only for `grok_build` nodes, and only for `qualityGuard.nodeIDs` when that list is set. A node removed from `nodeIDs` after the guard disabled it must be re-enabled from the admin console.
 - The passive-audit route exposes only performance metadata. It replaces Client Key identity with a server-computed `qualityProbe` marker, allowing the sidecar to ignore its own probes without learning other key IDs or names.
 - Run both containers as the matching unprivileged UID. The provided images use UID 10001 and directory mode `0700`.
+- The guard's internal API client and rotation webhook client refuse HTTP redirects, so neither bearer token can be replayed to a redirect target.
+- The optional `session_rotator.py` refuses to start on a non-loopback `ROTATOR_LISTEN` without `ROTATOR_TOKEN`.
 
 ## Data handling
 

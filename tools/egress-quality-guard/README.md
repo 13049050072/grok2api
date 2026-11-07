@@ -2,8 +2,9 @@
 
 Egress Quality Guard combines passive production-audit monitoring with active
 Grok Build probes through each fixed egress node. A complete production request
-at either passive threshold quarantines the node immediately and holds it until
-the fixed recovery probe is healthy.
+at the passive hard threshold quarantines the node immediately and holds it
+until the fixed recovery probe is healthy; a passive soft hit is first confirmed
+by one active probe.
 
 This is a heuristic circuit breaker, not a model-quality oracle. Very high
 reported throughput can be caused by upstream or intermediary buffering. Start
@@ -36,9 +37,11 @@ your own traffic before allowing automatic quarantine.
    model name.
 4. The fixed probe checks output tokens, chunk cadence, first-token time,
    instruction-marker compliance, and panel-equivalent output-token throughput.
-5. A production request at either passive TPS threshold quarantines the node
-   immediately and starts the hold. Active hard results quarantine immediately;
-   active soft results must reach the configured strike count.
+5. A production request at the passive hard TPS threshold quarantines the node
+   immediately and starts the hold. A passive soft hit triggers one active
+   confirmation probe of that node (at most one per node every 5 minutes),
+   handled exactly like a scheduled probe: active hard results quarantine
+   immediately; active soft results must reach the configured strike count.
 6. Quarantined nodes remain available only to administrator probes. Recovery
    records a generic connectivity probe for diagnosis, then uses the real
    model-quality probe as the authority before re-enabling the node.
@@ -67,16 +70,20 @@ credential, account-block, and quota signals retain their normal transitions.
 `qualityGuard.mode` accepts:
 
 - `passive`: inspect ordinary request audits every few seconds. Routine polling
-  adds no model requests. Soft and hard anomalies quarantine immediately;
-  recovery probes run only after the hold for nodes quarantined by the guard.
+  adds no model requests. Hard anomalies quarantine immediately; soft anomalies
+  spend one active confirmation probe (at most one per node every 5 minutes)
+  and quarantine only when that probe confirms them. Recovery probes run only
+  after the hold for nodes quarantined by the guard.
 - `active`: run only fixed per-node probes at the configured interval.
 - `hybrid`: enable both detectors. This is the recommended default.
 
 Passive monitoring ignores non-streaming requests, failed requests, responses
 with fewer than 32 output tokens, and audits created by the guard's own client
 key. On first startup it records a baseline without replaying historical
-anomalies. Cursor pagination and a persistent bounded ID set prevent duplicate
-processing across polls and restarts.
+anomalies. Audits are committed asynchronously, so each poll keeps reading past
+already-seen rows until it is two minutes older than the newest audit of the
+previous poll; a persistent bounded ID set prevents duplicate processing across
+polls and restarts.
 
 Generic IP/Cloudflare probes are intentionally not recovery gates: some
 residential exits can reach Grok normally while a probe endpoint is blocked.
@@ -85,16 +92,22 @@ The model-quality request is the authoritative recovery signal.
 ## Strict quarantine and IP rotation
 
 With `qualityGuard.failClosed: true`, soft, hard, and indeterminate samples
-leave scheduling before confirmation. The minimum healthy-node floor no longer
-suppresses quarantine. A short buffered burst is first retested on the same IP
+leave scheduling before confirmation, including passive soft hits. The minimum
+healthy-node floor no longer suppresses quarantine. A short buffered burst is first retested on the same IP
 and is restored immediately when that one real-model probe is healthy, avoiding
 an unnecessary rotation for a measurement artifact.
 
 `qualityGuard.rotationURL` enables a trusted internal rotation webhook scoped
 by `qualityGuard.rotatableNodeIDs`. Confirmed suspect nodes are rotated, the
 exit-IP change is verified by the webhook, and one real-model quality probe must
-pass before restoration. The optional `session_rotator.py` implements this
-contract for 1024Proxy-style usernames containing `sid-...-t-...`.
+pass before restoration. A failed webhook call backs off exponentially
+(5 minutes, doubling up to 1 hour) and the recovery probe still runs against
+the current exit, so an unavailable webhook cannot keep a healthy node
+isolated. The optional `session_rotator.py` implements this contract for
+1024Proxy-style usernames containing `sid-...-t-...`. It refuses to start
+without `ROTATOR_TOKEN` unless `ROTATOR_LISTEN` is a loopback address. Neither
+the guard nor its rotation client follows HTTP redirects, so bearer tokens are
+never replayed to another URL.
 
 Probe failures require `qualityGuard.consecutiveErrors` consecutive attempts
 before quarantine. Account-selection failures are reported separately: if the
@@ -130,12 +143,14 @@ probe prompt, or model response body.
   legacy quarantine still owned by the guard is released during reconciliation.
 - Lease recovery is pinned to the same account and node and uses an opaque CAS
   version so stale probes cannot clear a newer quarantine.
-- Refuses to quarantine below `qualityGuard.minimumHealthyNodes`.
+- Refuses to quarantine below `qualityGuard.minimumHealthyNodes`, counting only
+  enabled nodes the guard manages as whole nodes (direct, unmanaged, fixed
+  fallback, and account-bound `{account}` nodes do not count).
 - Strict mode overrides that floor rather than scheduling an unverified exit.
 - Uses an exclusive process lock to prevent duplicate guards.
 - Writes state atomically with mode `0600`.
 - Logs metrics and node metadata, never credentials, proxy URLs, or response text.
-- Uses a constant-time-checked internal credential scoped to six egress/audit routes.
+- Uses a constant-time-checked internal credential scoped to six egress/audit routes; the batch node route changes only `enabled` on `grok_build` nodes, limited to `nodeIDs` when that list is set.
 
 ## Configuration
 
@@ -176,10 +191,11 @@ Default hybrid policy:
 - inspect ordinary request audits every 5 seconds;
 - run active per-node probes every 1,800 seconds, with up to 30 seconds of jitter;
 - quarantine immediately at 1000 visible tokens/second;
-- require two consecutive active-probe observations at 500 tokens/second;
+- require two consecutive active-probe observations at 500 tokens/second; a
+  passive hit at 500 tokens/second triggers one such probe;
 - require two consecutive probe errors;
 - quarantine for 300 seconds;
-- retain at least three enabled proxied Build nodes.
+- retain at least three enabled managed proxied Build nodes.
 
 Five nodes probed every 30 minutes produce 240 model requests per day. Passive
 monitoring adds database reads but no model tokens or residential inference
@@ -224,7 +240,7 @@ API remains available.
 - HTTPS/SSE audits cannot provide reliable proxy transfer-byte counts. The UI reports active-probe output Tokens and does not label them as network traffic.
 - Intermediary buffering can produce unusually high instantaneous Token/s, so thresholds require calibration for each route.
 - Passive monitoring processes only complete successful streaming requests with enough output to calculate speed. Short and failed requests are ignored.
-- A real request may legitimately return cached content, an existing file, or a long constant. Passive soft and hard anomalies therefore isolate immediately and hold the node until a controlled recovery probe succeeds; raise the thresholds when false positives are more costly.
+- A real request may legitimately return cached content, an existing file, or a long constant. Passive hard anomalies therefore isolate immediately and hold the node until a controlled recovery probe succeeds, while passive soft anomalies wait for an active confirmation probe; raise the thresholds when false positives are more costly. Account-bound `{account}` leases are isolated on any passive anomaly because the hold is per account and is lifted by an account-pinned recovery probe.
 - Missing-thinking detection applies only to controlled probe profiles that explicitly require thinking. Arbitrary user traffic may legitimately use a non-reasoning model or disable reasoning and is never isolated solely because `reasoningTokens` is zero.
 - The first run establishes an audit baseline. Cumulative statistics also begin when this version first writes state.
 - Manual quality tests are diagnostic. They are excluded from automatic statistics and do not directly change quarantine state.

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hmac
+import ipaddress
 import json
 import os
 import random
@@ -36,6 +37,16 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
     return value
+
+
+def is_loopback_listen(value: str) -> bool:
+    host = value.strip()
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,6 +82,8 @@ class Config:
         )
         if not value.listen or not value.mihomo_reload_path:
             raise ValueError("rotator listen address and Mihomo reload path are required")
+        if not value.token and not is_loopback_listen(value.listen):
+            raise ValueError("ROTATOR_TOKEN is required when ROTATOR_LISTEN is not a loopback address")
         return value
 
 
@@ -199,19 +212,24 @@ class Rotator:
         with self.lock:
             original_credentials = self.config.credentials_file.read_text(encoding="utf-8")
             original_mihomo = self.config.mihomo_config_file.read_text(encoding="utf-8")
-            # The caller's value is historical node metadata and may be stale.
-            # A rotation can only be verified against an exit IP observed
-            # immediately before changing the session.
-            old_exit_ip = self._exit_ip(proxy_index)
-            expected_old_exit_ip = expected_old_exit_ip.strip()
-            if expected_old_exit_ip and expected_old_exit_ip != old_exit_ip:
-                log_event(
-                    "stale_expected_exit_ip",
-                    node_id=node_id,
-                    expected_exit_ip=expected_old_exit_ip,
-                    observed_exit_ip=old_exit_ip,
-                )
             try:
+                # The caller's value is historical node metadata and may be stale.
+                # A rotation can only be verified against an exit IP observed
+                # immediately before changing the session. A dead session is a
+                # common reason to rotate, so an unreachable exit means "unknown".
+                try:
+                    old_exit_ip = self._exit_ip(proxy_index)
+                except Exception as exc:
+                    old_exit_ip = ""
+                    log_event("old_exit_ip_unavailable", node_id=node_id, error_type=type(exc).__name__)
+                expected_old_exit_ip = expected_old_exit_ip.strip()
+                if old_exit_ip and expected_old_exit_ip and expected_old_exit_ip != old_exit_ip:
+                    log_event(
+                        "stale_expected_exit_ip",
+                        node_id=node_id,
+                        expected_exit_ip=expected_old_exit_ip,
+                        observed_exit_ip=old_exit_ip,
+                    )
                 for attempt in range(1, self.config.max_attempts + 1):
                     self._update_session(proxy_index, self._new_session_id())
                     self._reload_mihomo()
@@ -287,7 +305,10 @@ def main() -> int:
         _, entries = read_credentials(config.credentials_file)
         if not entries:
             raise RuntimeError("no sticky sessions configured")
-    except (ValueError, RuntimeError, OSError) as exc:
+    except ValueError as exc:
+        log_event("rotator_start_failed", error_type=type(exc).__name__, reason=str(exc))
+        return 2
+    except (RuntimeError, OSError) as exc:
         log_event("rotator_start_failed", error_type=type(exc).__name__)
         return 2
     server = ThreadingHTTPServer((config.listen, config.port), Handler)
