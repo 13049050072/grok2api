@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +50,15 @@ const (
 )
 
 const unlimitedRoutingAttempts = -1
+
+// 更短的可信代理网段会把大量公网地址当作代理，使其可以伪造 X-Forwarded-For。
+const (
+	minTrustedProxyIPv4PrefixBits = 8
+	minTrustedProxyIPv6PrefixBits = 32
+)
+
+// minJWTSecretDistinctChars 拒绝 "aaaa…" 一类的低熵签名密钥；openssl 生成的 Hex/Base64 密钥远高于该值。
+const minJWTSecretDistinctChars = 8
 
 var buildForbiddenCodePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
@@ -233,14 +243,15 @@ type RoutingConfig struct {
 	// AutoAssignMaxNodeShare optionally caps how many active accounts one
 	// healthy node may absorb during auto assignment. 0 keeps the historical
 	// unbounded first-pass evacuation. Values in [0.05, 1] are a fraction of
-	// the active provider pool. GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE overrides
-	// this field when set to a valid value.
+	// the active provider pool. A non-empty GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE
+	// overrides this field at load time and must satisfy the same bounds.
 	AutoAssignMaxNodeShare float64 `yaml:"autoAssignMaxNodeShare"`
 	// AutoAssignMaxMigrationShare optionally caps how many already-bound
 	// accounts may move in one maintenance cycle. 0 keeps the historical
 	// unbounded first-pass evacuation and the existing 200-move ceiling for
-	// capacity/rebalance repair. GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE
-	// overrides this field when set to a valid value.
+	// capacity/rebalance repair. A non-empty
+	// GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE overrides this field at load time
+	// and must satisfy the same bounds.
 	AutoAssignMaxMigrationShare float64 `yaml:"autoAssignMaxMigrationShare"`
 }
 
@@ -391,6 +402,7 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	normalizeTrustedProxies(cfg.Server.TrustedProxies)
 	if err := applyEnvironmentOverrides(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -400,10 +412,21 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+const (
+	AutoAssignMaxNodeShareEnv      = "GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE"
+	AutoAssignMaxMigrationShareEnv = "GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE"
+)
+
 // applyEnvironmentOverrides applies typed, application-owned environment
 // overrides after YAML and before CLI overrides. Empty values are ignored so
 // Compose can pass an optional variable without changing existing deployments.
 func applyEnvironmentOverrides(cfg *Config) error {
+	if err := applyAutoAssignShareOverride(AutoAssignMaxNodeShareEnv, &cfg.Routing.AutoAssignMaxNodeShare); err != nil {
+		return err
+	}
+	if err := applyAutoAssignShareOverride(AutoAssignMaxMigrationShareEnv, &cfg.Routing.AutoAssignMaxMigrationShare); err != nil {
+		return err
+	}
 	value := strings.TrimSpace(os.Getenv(DatabaseURLEnv))
 	if value == "" {
 		return nil
@@ -414,6 +437,21 @@ func applyEnvironmentOverrides(cfg *Config) error {
 	}
 	cfg.Database.Driver = "postgres"
 	cfg.Database.Postgres.DSN = dsn
+	return nil
+}
+
+// applyAutoAssignShareOverride rejects malformed values instead of falling
+// back to YAML, so a typo cannot silently disable the configured cap.
+func applyAutoAssignShareOverride(name string, target *float64) error {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || !validAutoAssignShare(value) {
+		return fmt.Errorf("%s 必须为 0 或 0.05 到 1 之间的数字", name)
+	}
+	*target = value
 	return nil
 }
 
@@ -480,15 +518,8 @@ func (c Config) Validate() error {
 		if trimmed != value {
 			return fmt.Errorf("server.trustedProxies %q 不能包含首尾空白", value)
 		}
-		if net.ParseIP(trimmed) != nil {
-			continue
-		}
-		_, network, err := net.ParseCIDR(trimmed)
-		if err != nil {
-			return fmt.Errorf("server.trustedProxies %q 必须是 IP 或 CIDR", value)
-		}
-		if ones, _ := network.Mask.Size(); ones == 0 {
-			return fmt.Errorf("server.trustedProxies %q 不能信任整个互联网", value)
+		if err := validateTrustedProxy(trimmed); err != nil {
+			return err
 		}
 	}
 	for _, item := range []struct {
@@ -573,16 +604,22 @@ func (c Config) Validate() error {
 	if c.Media.CleanupInterval.Value() < time.Minute || c.Media.CleanupInterval.Value() > 24*time.Hour {
 		return errors.New("media.cleanupInterval 必须在 1 分钟到 24 小时之间")
 	}
+	if isPlaceholderSecret(c.Secrets.JWTSecret) {
+		return errors.New("secrets.jwtSecret 不能使用示例占位值")
+	}
 	if len(c.Secrets.JWTSecret) < 32 {
 		return errors.New("secrets.jwtSecret 至少需要 32 个字符")
 	}
-	if isExampleSecret(c.Secrets.JWTSecret) {
-		return errors.New("secrets.jwtSecret 不能使用示例占位值")
+	if distinctChars(c.Secrets.JWTSecret) < minJWTSecretDistinctChars {
+		return fmt.Errorf("secrets.jwtSecret 熵过低，至少需要包含 %d 种不同字符，请使用 openssl rand -hex 32 生成", minJWTSecretDistinctChars)
+	}
+	if isPlaceholderSecret(c.Secrets.CredentialEncryptionKey) {
+		return errors.New("secrets.credentialEncryptionKey 不能使用示例占位值")
 	}
 	if !validCredentialEncryptionKey(c.Secrets.CredentialEncryptionKey) {
 		return errors.New("secrets.credentialEncryptionKey 必须是 Base64 编码的 32 字节密钥")
 	}
-	if isExampleSecret(c.BootstrapAdmin.Password) {
+	if isPlaceholderSecret(c.BootstrapAdmin.Password) {
 		return errors.New("bootstrapAdmin.password 不能使用示例占位值")
 	}
 	if c.Auth.AccessTokenTTL.Value() <= 0 || c.Auth.RefreshTokenTTL.Value() <= 0 {
@@ -1000,11 +1037,108 @@ func validCredentialEncryptionKey(value string) bool {
 	return err == nil && len(decoded) == 32
 }
 
-func isExampleSecret(value string) bool {
-	switch strings.TrimSpace(value) {
-	case "replace-with-at-least-32-characters", "replace-with-base64-key", "replace-with-a-strong-password":
-		return true
-	default:
-		return false
+// isPlaceholderSecret 识别 README 与示例配置中的占位值（replace-with-…、“替换为…”等），
+// 避免照抄文档后以公开已知的密钥启动。英文标记后紧跟字母时属于普通单词（replacement、
+// exchangemeeting），不视为占位值。
+func isPlaceholderSecret(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	for _, prefix := range []string{"replace-with", "replace_with", "replace with", "replace-me", "replace_me", "replaceme"} {
+		if rest, ok := strings.CutPrefix(normalized, prefix); ok && !startsWithASCIILetter(rest) {
+			return true
+		}
+	}
+	for _, marker := range []string{"替换", "占位"} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	for _, marker := range []string{"change-me", "change_me", "changeme", "placeholder"} {
+		if containsPlaceholderMarker(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPlaceholderMarker(value, marker string) bool {
+	for {
+		index := strings.Index(value, marker)
+		if index < 0 {
+			return false
+		}
+		value = value[index+len(marker):]
+		if !startsWithASCIILetter(value) {
+			return true
+		}
+	}
+}
+
+func startsWithASCIILetter(value string) bool {
+	return value != "" && value[0] >= 'a' && value[0] <= 'z'
+}
+
+func distinctChars(value string) int {
+	seen := make(map[rune]struct{}, len(value))
+	for _, character := range value {
+		seen[character] = struct{}{}
+	}
+	return len(seen)
+}
+
+func validateTrustedProxy(value string) error {
+	network, err := canonicalTrustedProxy(value)
+	if err != nil {
+		return fmt.Errorf("server.trustedProxies %q 必须是 IP 或 CIDR", value)
+	}
+	ones, bits := network.Mask.Size()
+	if bits == 8*net.IPv4len && ones < minTrustedProxyIPv4PrefixBits {
+		return fmt.Errorf("server.trustedProxies %q 等价于 IPv4 网段 %s，前缀不能短于 /%d", value, network, minTrustedProxyIPv4PrefixBits)
+	}
+	if bits == 8*net.IPv6len && ones < minTrustedProxyIPv6PrefixBits {
+		return fmt.Errorf("server.trustedProxies %q 的 IPv6 前缀不能短于 /%d", value, minTrustedProxyIPv6PrefixBits)
+	}
+	return nil
+}
+
+// canonicalTrustedProxy 将 IPv4 映射的 IPv6 地址或网段改写为等价的 IPv4 网段。
+// Go 与 Gin 按 IPv4 匹配这类网段，::ffff:0:0/96 实际等价于 0.0.0.0/0。
+func canonicalTrustedProxy(value string) (*net.IPNet, error) {
+	if ip := net.ParseIP(value); ip != nil {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return &net.IPNet{IP: ipv4, Mask: net.CIDRMask(8*net.IPv4len, 8*net.IPv4len)}, nil
+		}
+		return &net.IPNet{IP: ip, Mask: net.CIDRMask(8*net.IPv6len, 8*net.IPv6len)}, nil
+	}
+	_, network, err := net.ParseCIDR(value)
+	if err != nil {
+		return nil, err
+	}
+	ipv4 := network.IP.To4()
+	if ipv4 == nil {
+		return network, nil
+	}
+	ones, bits := network.Mask.Size()
+	if bits == 8*net.IPv6len {
+		ones -= 8 * (net.IPv6len - net.IPv4len)
+	}
+	return &net.IPNet{IP: ipv4, Mask: net.CIDRMask(ones, 8*net.IPv4len)}, nil
+}
+
+// normalizeTrustedProxies 原地把 IPv4 映射的 IPv6 条目改写为 IPv4 形式，避免 Gin 将
+// 裸地址 ::ffff:a.b.c.d 误解析为 IPv6 网段；无效条目保持原样，由 Validate 报错。
+func normalizeTrustedProxies(values []string) {
+	for index, value := range values {
+		if !strings.Contains(value, ":") || strings.TrimSpace(value) != value {
+			continue
+		}
+		network, err := canonicalTrustedProxy(value)
+		if err != nil || network.IP.To4() == nil {
+			continue
+		}
+		if strings.Contains(value, "/") {
+			values[index] = network.String()
+		} else {
+			values[index] = network.IP.String()
+		}
 	}
 }

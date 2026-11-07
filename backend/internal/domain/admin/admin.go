@@ -19,4 +19,7 @@ type Session struct {
 	ExpiresAt        time.Time
 	LastUsedAt       *time.Time
 	CreatedAt        time.Time
+
+	// PreviousRefreshTokenHash 为空表示会话尚未轮换。
+	PreviousRefreshTokenHash string
 }

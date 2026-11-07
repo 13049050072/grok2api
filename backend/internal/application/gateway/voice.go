@@ -318,7 +318,7 @@ func (s *Service) executeVoice(
 		return nil, err
 	}
 	if reservation.CostInUSDTicks > 0 {
-		if _, err := s.clientKeys.ReserveBilling(ctx, key, eventID, reservation.CostInUSDTicks, mediaBillingReservationTTL); err != nil {
+		if _, err := s.clientKeys.ReserveBilling(ctx, key, eventID, reservation.CostInUSDTicks, s.syncBillingReservationTTL()); err != nil {
 			return nil, err
 		}
 	}
@@ -487,7 +487,9 @@ func (s *Service) executeVoice(
 			record.ErrorCode = errorCode
 			record.DurationMS, record.CreatedAt = time.Since(startedAt).Milliseconds(), time.Now().UTC()
 			applyAuditEgress(&record, egressTrace, route.Provider)
-			if successful && completedPricing.CostInUSDTicks > 0 {
+			// Voice responses are fully buffered before delivery, so a 2xx whose
+			// write to the client failed still consumed the upstream work.
+			if (successful || mediaDeliveryInterrupted(response.StatusCode, errorCode)) && completedPricing.CostInUSDTicks > 0 {
 				record.EstimatedCostInUSDTicks = completedPricing.CostInUSDTicks
 				record.PricingModel = completedPricing.Model
 				record.PricingVersion = audit.OfficialPricingAsOf

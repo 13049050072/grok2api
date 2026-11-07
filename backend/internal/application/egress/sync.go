@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	"github.com/chenyme/grok2api/backend/internal/pkg/netguard"
+	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
 )
 
 var ErrSubscriptionSync = errors.New("代理订阅同步失败")
@@ -44,6 +49,8 @@ func (s *Service) syncSource(ctx context.Context, operations OperationsRepositor
 		recordFailure()
 		return ImportResult{}, ErrSubscriptionSync
 	}
+	entries, nonPublic := withoutNonPublicLiteralProxies(entries)
+	skipped += nonPublic
 	userAgent := ""
 	if source.Scope != domain.ScopeBuild {
 		s.mu.RLock()
@@ -72,7 +79,45 @@ func (s *Service) syncSource(ctx context.Context, operations OperationsRepositor
 	if err := operations.UpdateEgressSourceSync(ctx, source.ID, now, nextSyncAt, imported, ""); err != nil {
 		return ImportResult{}, err
 	}
-	return ImportResult{Imported: imported, Skipped: skipped}, nil
+	return ImportResult{Imported: imported, Skipped: skipped, NonPublic: nonPublic}, nil
+}
+
+// withoutNonPublicLiteralProxies drops remote entries whose proxy server is a
+// literal loopback, private, link-local or otherwise non-public IP, so a remote
+// subscription cannot point this server's egress at internal services. Names
+// are not resolved; administrators can still add such nodes by hand.
+func withoutNonPublicLiteralProxies(entries []subscriptionEntry) ([]subscriptionEntry, int) {
+	kept := entries[:0]
+	dropped := 0
+	for _, entry := range entries {
+		if isNonPublicLiteralProxy(entry.ProxyURL) {
+			dropped++
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept, dropped
+}
+
+func isNonPublicLiteralProxy(proxyURL string) bool {
+	var host string
+	if scheme, _, _ := strings.Cut(proxyURL, "://"); tunnelproxy.IsSupportedScheme(scheme) {
+		config, err := tunnelproxy.Parse(proxyURL)
+		if err != nil {
+			return true
+		}
+		if host, _, err = net.SplitHostPort(config.Server); err != nil {
+			return true
+		}
+	} else {
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
+			return true
+		}
+		host = parsed.Hostname()
+	}
+	address, err := netip.ParseAddr(host)
+	return err == nil && !netguard.IsPublicAddress(address)
 }
 
 func sourceNextSyncAt(source domain.SubscriptionSource, now time.Time) time.Time {

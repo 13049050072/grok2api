@@ -362,6 +362,17 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 			t.Fatalf("scoped owned response error = %#v, attempts = %#v, err = %v", unavailable, adapter.attempts, err)
 		}
 	}
+	modelRevokedKey := clientKey
+	modelRevokedKey.AllowedModels = []uint64{ownership.ModelRouteID + 1000}
+	if _, err := service.GetResponse(ctx, ResourceInput{ClientKey: modelRevokedKey, ResponseID: "resp-test"}); !errors.Is(err, clientkeyapp.ErrModelNotAllowed) || len(adapter.attempts) != 0 {
+		t.Fatalf("owned response GET after model revocation err = %v, attempts = %#v", err, adapter.attempts)
+	}
+	if _, err := service.DeleteResponse(ctx, ResourceInput{ClientKey: modelRevokedKey, ResponseID: "resp-test"}); !errors.Is(err, clientkeyapp.ErrModelNotAllowed) || len(adapter.attempts) != 0 {
+		t.Fatalf("owned response DELETE after model revocation err = %v, attempts = %#v", err, adapter.attempts)
+	}
+	if _, err := responseRepo.Get(ctx, "resp-test", clientKey.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("rejected DELETE removed ownership: %v", err)
+	}
 	resource, err := service.GetResponse(ctx, ResourceInput{ClientKey: clientKey, ResponseID: "resp-test", RawQuery: "include=reasoning.encrypted_content"})
 	if err != nil {
 		t.Fatal(err)

@@ -5,11 +5,17 @@ services:
     container_name: grok2api
     image: "${GROK2API_IMAGE:-ghcr.io/chenyme/grok2api:latest}"
     ports:
+      # 默认监听所有网卡。置于同机反向代理之后时，可改为仅监听本机：
+      # - "127.0.0.1:${GROK2API_PORT:-8000}:8000"
       - "${GROK2API_PORT:-8000}:8000"
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       # 非空时覆盖 config.yaml 的 PostgreSQL DSN，并自动启用 postgres。
       GROK2API_DATABASE_URL: "${GROK2API_DATABASE_URL:-}"
+      # 非空时覆盖 routing.autoAssignMaxNodeShare / autoAssignMaxMigrationShare；
+      # 取值须为 0 或 0.05 到 1，非法值会导致启动失败。
+      GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE: "${GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE:-}"
+      GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE: "${GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE:-}"
       GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
     volumes:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"

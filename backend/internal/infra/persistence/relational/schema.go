@@ -59,6 +59,7 @@ var schemaModels = []any{
 var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin_created ON admin_sessions(admin_id, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)",
+	"CREATE INDEX IF NOT EXISTS idx_admin_sessions_previous_token_hash ON admin_sessions(previous_refresh_token_hash) WHERE previous_refresh_token_hash IS NOT NULL",
 	// SQLite 通过重建表修改 CHECK 约束，重建会删除独立存储的 GORM 唯一索引；
 	// 在统一索引阶段显式恢复这些数据完整性约束。
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_identity_key ON provider_accounts(identity_key)",

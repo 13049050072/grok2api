@@ -2,10 +2,36 @@ package inference
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	clientws "github.com/gorilla/websocket"
 )
+
+func TestVoiceWSUpgraderRejectsPerMessageCompression(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := voiceWSUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	dialer := clientws.Dialer{EnableCompression: true, HandshakeTimeout: 5 * time.Second}
+	conn, response, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if extensions := response.Header.Get("Sec-WebSocket-Extensions"); extensions != "" {
+		t.Fatalf("voice websocket negotiated extensions %q, want none", extensions)
+	}
+}
 
 func TestWatchRequestTimeoutClosesQuietSessionOnDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)

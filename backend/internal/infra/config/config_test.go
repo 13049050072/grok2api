@@ -1,7 +1,9 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
 func TestLoadDatabaseURLOverridesYAMLAndSelectsPostgres(t *testing.T) {
@@ -484,7 +487,7 @@ func TestValidateRejectsInvalidAutoAssignShareConfig(t *testing.T) {
 }
 
 func TestValidateTrustedProxies(t *testing.T) {
-	for _, values := range [][]string{nil, {"127.0.0.1", "10.0.0.0/8", "2001:db8::/32"}} {
+	for _, values := range [][]string{nil, {"127.0.0.1", "10.0.0.0/8", "2001:db8::/32"}, {"::ffff:10.0.0.0/104", "::ffff:127.0.0.1", "fd00::/32"}} {
 		cfg := defaultConfig()
 		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
 		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -494,7 +497,11 @@ func TestValidateTrustedProxies(t *testing.T) {
 			t.Fatalf("trusted proxies %v: %v", values, err)
 		}
 	}
-	for _, value := range []string{"", " proxy.internal", "proxy.internal", "10.0.0.0/99", "0.0.0.0/0", "::/0"} {
+	for _, value := range []string{
+		"", " proxy.internal", "proxy.internal", "10.0.0.0/99", "0.0.0.0/0", "::/0",
+		"::ffff:0:0/96", "::ffff:0.0.0.0/97", "::ffff:10.0.0.0/103", "0.0.0.0/1", "128.0.0.0/1", "10.0.0.0/7",
+		"::/1", "8000::/1", "2001:db8::/31",
+	} {
 		cfg := defaultConfig()
 		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
 		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -503,6 +510,45 @@ func TestValidateTrustedProxies(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("trusted proxy %q should be rejected", value)
 		}
+	}
+}
+
+func TestValidateTrustedProxyPrefixErrorsNameMinimum(t *testing.T) {
+	for value, want := range map[string]string{
+		"::ffff:0:0/96": "0.0.0.0/0，前缀不能短于 /8",
+		"0.0.0.0/1":     "前缀不能短于 /8",
+		"::/1":          "IPv6 前缀不能短于 /32",
+	} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.BootstrapAdmin.Password = "password123"
+		cfg.Server.TrustedProxies = []string{value}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("trusted proxy %q error = %v, want %q", value, err, want)
+		}
+	}
+}
+
+func TestLoadNormalizesIPv4MappedTrustedProxies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`server:
+  trustedProxies: ["::ffff:10.0.0.0/104", "::ffff:127.0.0.1", "192.168.0.0/16", "2001:db8::/32", "::1"]
+secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"10.0.0.0/8", "127.0.0.1", "192.168.0.0/16", "2001:db8::/32", "::1"}
+	if strings.Join(cfg.Server.TrustedProxies, ",") != strings.Join(want, ",") {
+		t.Fatalf("trustedProxies = %v, want %v", cfg.Server.TrustedProxies, want)
 	}
 }
 
@@ -604,6 +650,123 @@ func TestValidateRejectsExampleSecrets(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateRejectsDocumentedPlaceholderSecrets(t *testing.T) {
+	base := defaultConfig()
+	base.Secrets.JWTSecret = "12345678901234567890123456789012"
+	base.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	base.BootstrapAdmin.Password = "password123"
+	if err := base.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]func(*Config, string){
+		"secrets.jwtSecret":               func(cfg *Config, value string) { cfg.Secrets.JWTSecret = value },
+		"secrets.credentialEncryptionKey": func(cfg *Config, value string) { cfg.Secrets.CredentialEncryptionKey = value },
+		"bootstrapAdmin.password":         func(cfg *Config, value string) { cfg.BootstrapAdmin.Password = value },
+	}
+	placeholders := []string{
+		// README.md
+		"replace-with-the-generated-hex-value",
+		"replace-with-the-generated-base64-key",
+		"replace-with-a-strong-password",
+		// README.zh-CN.md
+		"替换为生成的 Hex 密钥",
+		"替换为生成的 Base64 密钥",
+		"替换为强密码",
+		// config.example.yaml
+		"replace-with-at-least-32-characters",
+		"replace-with-base64-key",
+		"REPLACE-WITH-A-RANDOM-SECRET-0123456789abcdef",
+		"  replace_with_random_hex_0123456789abcdef  ",
+		"please-change-me-0123456789abcdef0123456789",
+		"jwt-secret-placeholder-0123456789abcdef0123",
+	}
+	for field, set := range fields {
+		for _, value := range placeholders {
+			cfg := base
+			set(&cfg, value)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), field) || !strings.Contains(err.Error(), "占位") {
+				t.Fatalf("%s = %q error = %v", field, value, err)
+			}
+		}
+	}
+}
+
+func TestValidatePlaceholderMarkersIgnoreOrdinaryWords(t *testing.T) {
+	for password, placeholder := range map[string]bool{
+		"Replacement-Strong-Password-2024": false,
+		"ExchangeMeeting#2024":             false,
+		"Changement-2024!":                 false,
+		"replaceme":                        true,
+		"replace-me-now":                   true,
+		"PleaseChangeMe!":                  true,
+		"changeme123":                      true,
+		"my-placeholder":                   true,
+	} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.BootstrapAdmin.Password = password
+		err := cfg.Validate()
+		if !placeholder && err != nil {
+			t.Fatalf("password %q rejected: %v", password, err)
+		}
+		if placeholder && (err == nil || !strings.Contains(err.Error(), "占位")) {
+			t.Fatalf("password %q error = %v", password, err)
+		}
+	}
+}
+
+func TestValidateRejectsLowEntropyJWTSecret(t *testing.T) {
+	for _, value := range []string{strings.Repeat("a", 64), strings.Repeat("ab", 16), strings.Repeat("password", 4), strings.Repeat("abcdefg", 5)} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = value
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.BootstrapAdmin.Password = "password123"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "熵过低") {
+			t.Fatalf("jwtSecret %q error = %v", value, err)
+		}
+	}
+}
+
+func TestValidateAcceptsGeneratedSecrets(t *testing.T) {
+	for range 200 {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = hex.EncodeToString(randomBytes(t, 32))
+		cfg.Secrets.CredentialEncryptionKey = base64.StdEncoding.EncodeToString(randomBytes(t, 32))
+		cfg.BootstrapAdmin.Password = base64.RawURLEncoding.EncodeToString(randomBytes(t, 24))
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("generated secrets rejected: %v (%#v)", err, cfg.Secrets)
+		}
+		cfg.Secrets.JWTSecret = base64.StdEncoding.EncodeToString(randomBytes(t, 32))
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("generated base64 jwtSecret rejected: %v", err)
+		}
+	}
+}
+
+// Bootstrap enforces the length only when it creates the first administrator;
+// a leftover value in an existing deployment must not block startup.
+func TestValidateLeavesBootstrapPasswordLengthToBootstrap(t *testing.T) {
+	for _, password := range []string{"", strings.Repeat("p", security.MinPasswordBytes-1), strings.Repeat("密", security.MaxPasswordBytes/3+1)} {
+		cfg := defaultConfig()
+		cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+		cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		cfg.BootstrapAdmin.Password = password
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%d-byte bootstrap password rejected: %v", len(password), err)
+		}
+	}
+}
+
+func randomBytes(t *testing.T, size int) []byte {
+	t.Helper()
+	value := make([]byte, size)
+	if _, err := rand.Read(value); err != nil {
+		t.Fatal(err)
+	}
+	return value
 }
 
 func TestValidateStatsigModes(t *testing.T) {

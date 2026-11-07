@@ -137,6 +137,9 @@ func TestQualityGuardAuditListMarksOwnProbeWithoutExposingKeyIdentity(t *testing
 	if !strings.Contains(body, `"requestId":"guard-probe","qualityProbe":true`) || !strings.Contains(body, `"requestId":"user-request","qualityProbe":false`) {
 		t.Fatalf("probe markers missing: %s", body)
 	}
+	if !strings.Contains(body, `"createdAt":"`) || strings.Contains(body, `"createdAt":"0001-01-01`) {
+		t.Fatalf("audit timestamp missing for passive overlap scan: %s", body)
+	}
 	if strings.Contains(body, "clientKeyId") || strings.Contains(body, "clientKeyName") || strings.Contains(body, "secret-") {
 		t.Fatalf("client key identity leaked: %s", body)
 	}

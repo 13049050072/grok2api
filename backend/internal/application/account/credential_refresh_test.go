@@ -70,8 +70,7 @@ func TestEnsureCredentialPreservesBotFlagWhenRefreshedTokenCannotBeInspected(t *
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	service, credential, _ := newCredentialRefreshTestService(t, now)
 	service.now = func() time.Time { return now }
-	credential.BuildBotFlagSource = 2
-	credential, err := service.accounts.Update(ctx, credential)
+	credential, err := service.accounts.UpdateTokens(ctx, credential.ID, credential.EncryptedAccessToken, credential.EncryptedRefreshToken, credential.ExpiresAt, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,12 +90,16 @@ func TestEnsureCredentialPersistsRotatedTokenAfterRequestCancellation(t *testing
 	service.now = func() time.Time { return now }
 	adapter.afterRefresh = cancel
 
-	refreshed, err := service.EnsureCredential(ctx, credential, true)
-	if err != nil {
+	// The cancelled caller may stop waiting, but the rotation it started must still be persisted.
+	if _, err := service.EnsureCredential(ctx, credential, true); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("refresh after request cancellation = %v", err)
 	}
-	if refreshed.EncryptedAccessToken != "access-1" || refreshed.EncryptedRefreshToken != "refresh-1" {
-		t.Fatalf("refreshed credential = %#v", refreshed)
+	refreshed, err := service.EnsureCredential(context.Background(), credential, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.EncryptedAccessToken != "access-1" || refreshed.EncryptedRefreshToken != "refresh-1" || adapter.refreshCount.Load() != 1 {
+		t.Fatalf("refreshed credential = %#v, refreshes = %d", refreshed, adapter.refreshCount.Load())
 	}
 	stored, err := service.accounts.Get(context.Background(), credential.ID)
 	if err != nil {
@@ -213,9 +216,7 @@ func TestCredentialRefreshSchedulerRefreshesOnlyDueAccounts(t *testing.T) {
 	service, credential, adapter := newCredentialRefreshTestService(t, now)
 	service.now = func() time.Time { return time.Now().UTC() }
 	dueAt := now.Add(-time.Minute)
-	credential.RefreshDueAt = &dueAt
-	credential, err := service.accounts.Update(ctx, credential)
-	if err != nil {
+	if err := service.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, repository.CredentialRefreshFailure{RetryAt: dueAt}); err != nil {
 		t.Fatal(err)
 	}
 	far, _, err := service.accounts.UpsertByIdentity(ctx, accountdomain.Credential{

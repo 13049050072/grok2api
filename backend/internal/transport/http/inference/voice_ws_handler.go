@@ -24,7 +24,9 @@ var voiceWSUpgrader = clientws.Upgrader{
 	CheckOrigin: func(*http.Request) bool {
 		return true
 	},
-	EnableCompression: true,
+	// SetReadLimit bounds compressed frame bytes only; permessage-deflate would
+	// let a client inflate one message far beyond voiceWSMessageLimit.
+	EnableCompression: false,
 }
 
 func (h *Handler) proxyRealtimeWebSocket(c *gin.Context) {

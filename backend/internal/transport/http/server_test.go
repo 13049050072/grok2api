@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,6 +59,92 @@ func TestReadinessEndpointReturns503WhileReconciling(t *testing.T) {
 	router.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"state":"reconciling"`) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestReadinessEndpointHidesDetailsAndSharesCachedSnapshot(t *testing.T) {
+	var computations atomic.Int32
+	release := make(chan struct{})
+	deps := testDependencies()
+	deps.Readiness = func(context.Context) ReadinessSnapshot {
+		computations.Add(1)
+		<-release
+		return ReadinessSnapshot{
+			Ready: true, State: "degraded", UpdatedAt: time.Now().UTC(),
+			Components: map[string]ReadinessComponent{
+				"billing_ledger": {State: "degraded", Detail: "审计账本不可用；连续失败 0 次，丢失 3 条，队列 7/8"},
+				"model_routes":   {State: "ready", Detail: "12 条已启用路由"},
+			},
+			Startup: &ReadinessStartupReport{ErrorCount: 2},
+		}
+	}
+	router := New(deps)
+	const probes = 8
+	var wg sync.WaitGroup
+	bodies := make(chan string, probes)
+	for range probes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if recorder.Code != http.StatusOK {
+				t.Errorf("status = %d", recorder.Code)
+			}
+			bodies <- recorder.Body.String()
+		}()
+	}
+	deadline := time.Now().Add(time.Second)
+	for computations.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(bodies)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if got := computations.Load(); got != 1 {
+		t.Fatalf("readiness computations = %d, want 1", got)
+	}
+	for body := range bodies {
+		if strings.Contains(body, "detail") || strings.Contains(body, "丢失") || strings.Contains(body, "startup") {
+			t.Fatalf("anonymous readiness exposed details: %s", body)
+		}
+		var snapshot ReadinessSnapshot
+		if err := json.Unmarshal([]byte(body), &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if !snapshot.Ready || snapshot.State != "degraded" || snapshot.Components["billing_ledger"].State != "degraded" || snapshot.Components["model_routes"].State != "ready" {
+			t.Fatalf("anonymous readiness = %#v", snapshot)
+		}
+	}
+}
+
+func TestReadinessProbeExpiresCacheAndDetachesComputation(t *testing.T) {
+	var computations atomic.Int32
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	probe := newReadinessProbe(func(ctx context.Context) ReadinessSnapshot {
+		computations.Add(1)
+		cancelCaller()
+		if ctx.Err() != nil {
+			return ReadinessSnapshot{State: "not_ready"}
+		}
+		return ReadinessSnapshot{Ready: true, State: "ready"}
+	})
+	now := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	probe.now = func() time.Time { return now }
+	snapshot, err := probe.snapshot(callerCtx)
+	if err != nil || !snapshot.Ready {
+		t.Fatalf("snapshot after caller cancellation = %#v, err=%v", snapshot, err)
+	}
+	now = now.Add(readinessCacheTTL - time.Millisecond)
+	if _, err := probe.snapshot(context.Background()); err != nil || computations.Load() != 1 {
+		t.Fatalf("cached snapshot recomputed: computations=%d err=%v", computations.Load(), err)
+	}
+	now = now.Add(time.Millisecond)
+	if _, err := probe.snapshot(context.Background()); err != nil || computations.Load() != 2 {
+		t.Fatalf("expired snapshot reused: computations=%d err=%v", computations.Load(), err)
 	}
 }
 

@@ -96,6 +96,14 @@ func (r *AdminSessionRepository) GetByTokenHash(ctx context.Context, tokenHash s
 	return toSessionDomain(row), nil
 }
 
+func (r *AdminSessionRepository) GetByPreviousTokenHash(ctx context.Context, tokenHash string) (admin.Session, error) {
+	var row adminSessionModel
+	if err := r.db.db.WithContext(ctx).Where("previous_refresh_token_hash = ?", tokenHash).First(&row).Error; err != nil {
+		return admin.Session{}, mapError(err)
+	}
+	return toSessionDomain(row), nil
+}
+
 func (r *AdminSessionRepository) GetByID(ctx context.Context, id uint64) (admin.Session, error) {
 	var row adminSessionModel
 	if err := r.db.db.WithContext(ctx).First(&row, id).Error; err != nil {
@@ -110,9 +118,10 @@ func (r *AdminSessionRepository) Rotate(ctx context.Context, id uint64, expected
 		Model(&adminSessionModel{}).
 		Where("id = ? AND refresh_token_hash = ? AND expires_at > ?", id, expectedTokenHash, now).
 		Updates(map[string]any{
-			"refresh_token_hash": newTokenHash,
-			"expires_at":         expiresAt,
-			"last_used_at":       &now,
+			"refresh_token_hash":          newTokenHash,
+			"previous_refresh_token_hash": expectedTokenHash,
+			"expires_at":                  expiresAt,
+			"last_used_at":                &now,
 		})
 	if result.Error != nil {
 		return mapError(result.Error)

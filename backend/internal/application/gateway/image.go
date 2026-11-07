@@ -249,7 +249,7 @@ func (s *Service) executeImage(
 	}
 	reserved := false
 	if priced {
-		reserved, err = s.clientKeys.ReserveBilling(ctx, key, eventID, reservation.CostInUSDTicks, mediaBillingReservationTTL)
+		reserved, err = s.clientKeys.ReserveBilling(ctx, key, eventID, reservation.CostInUSDTicks, s.syncBillingReservationTTL())
 		if err != nil {
 			return nil, err
 		}
@@ -383,15 +383,27 @@ func (s *Service) executeImage(
 			record.ErrorCode = errorCode
 			record.DurationMS, record.CreatedAt = time.Since(startedAt).Milliseconds(), time.Now().UTC()
 			applyAuditEgress(&record, egressTrace, route.Provider)
+			billedCount := 0
 			if successful {
-				record.MediaOutputImages = int64(max(0, requestedCount))
+				billedCount = requestedCount
+			} else if !streaming && mediaDeliveryInterrupted(response.StatusCode, errorCode) {
+				// Non-streaming image bodies are generated in full before the
+				// handler writes them; only delivery failed, so the images the
+				// upstream charged quota for are billed.
+				billedCount = response.QuotaUnits
+				if billedCount <= 0 {
+					billedCount = requestedCount
+				}
+			}
+			if billedCount > 0 {
+				record.MediaOutputImages = int64(billedCount)
 				var pricing audit.PricingResult
 				var priced bool
 				switch operation {
 				case audit.OperationImage:
-					pricing, priced = audit.EstimateOfficialImageCost(pricingModel, pricingResolution, pricingQuality, requestedCount)
+					pricing, priced = audit.EstimateOfficialImageCost(pricingModel, pricingResolution, pricingQuality, billedCount)
 				case audit.OperationImageEdit:
-					pricing, priced = audit.EstimateOfficialImageEditCost(pricingModel, pricingResolution, pricingQuality, requestedCount, inputImageCount)
+					pricing, priced = audit.EstimateOfficialImageEditCost(pricingModel, pricingResolution, pricingQuality, billedCount, inputImageCount)
 				}
 				if priced {
 					record.EstimatedCostInUSDTicks = pricing.CostInUSDTicks

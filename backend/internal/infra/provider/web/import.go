@@ -107,7 +107,13 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 			if err != nil || address.Address != email {
 				return nil, fmt.Errorf("第 %d 行邮箱无效", index+1)
 			}
-			tokenValue = parts[2]
+			// email----password----sso: the password may contain "----", so the
+			// SSO is the last field unless the line carries Console-style caches.
+			ssoIndex, ok := provider.RegistrationSSOIndex(parts)
+			if !ok {
+				ssoIndex = len(parts) - 1
+			}
+			tokenValue = parts[ssoIndex]
 			if strings.TrimSpace(tokenValue) == "" {
 				return nil, fmt.Errorf("第 %d 行缺少 SSO", index+1)
 			}

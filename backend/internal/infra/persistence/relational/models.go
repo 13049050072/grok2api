@@ -20,6 +20,9 @@ type adminSessionModel struct {
 	LastUsedAt       *time.Time
 	CreatedAt        time.Time   `gorm:"not null"`
 	Admin            *adminModel `gorm:"foreignKey:AdminID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+
+	// 可空且不带 CHECK：AutoMigrate 在 SQLite/PostgreSQL 上都以 ADD COLUMN 增量升级，无需重建表。
+	PreviousRefreshTokenHash *string `gorm:"size:64"`
 }
 
 func (adminSessionModel) TableName() string { return "admin_sessions" }

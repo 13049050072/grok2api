@@ -1882,44 +1882,56 @@ func nextInternalSSEMarker(value []byte) (int, int) {
 }
 
 func copyJSON(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol) (responseMetadata, error) {
-	buffer := make([]byte, responseCopyBufferBytes)
-	metadataBody := make([]byte, 0, responseCopyBufferBytes)
-	metadataComplete := true
+	// Usage sits at the end of the body. Reading the inspection window before
+	// the first client write keeps it billable when the client disconnects
+	// mid-write; the upstream read is cancelled together with the client.
+	head, readErr := io.ReadAll(io.LimitReader(source, maxJSONMetadataInspectionBytes+1))
+	complete := readErr == nil && len(head) <= maxJSONMetadataInspectionBytes
+	if complete && len(head) == 0 {
+		return responseMetadata{}, neterror.ErrUpstreamResponseEmpty
+	}
+	var metadata responseMetadata
+	if complete {
+		metadata = normalizeMetadataUsage(extractMetadata(head), protocol)
+	}
 	transferred := 0
+	write := func(chunk []byte) error {
+		if transferred+len(chunk) > maxJSONResponseTransferBytes {
+			return fmt.Errorf("%w: 非流式响应超过 %d MiB", errResponseTransferLimit, maxJSONResponseTransferBytes>>20)
+		}
+		if err := setResponseWriteDeadline(writer); err != nil {
+			return err
+		}
+		if _, err := writer.Write(chunk); err != nil {
+			return err
+		}
+		transferred += len(chunk)
+		return nil
+	}
+	if len(head) > 0 {
+		if err := write(head); err != nil {
+			return metadata, err
+		}
+	}
+	if complete {
+		return metadata, nil
+	}
+	if readErr != nil {
+		return responseMetadata{Usage: gateway.Usage{OutputObserved: transferred > 0}}, readErr
+	}
+	buffer := make([]byte, responseCopyBufferBytes)
 	for {
-		n, readErr := source.Read(buffer)
+		n, err := source.Read(buffer)
 		if n > 0 {
-			if transferred+n > maxJSONResponseTransferBytes {
-				return responseMetadata{}, fmt.Errorf("%w: 非流式响应超过 %d MiB", errResponseTransferLimit, maxJSONResponseTransferBytes>>20)
-			}
-			chunk := buffer[:n]
-			if err := setResponseWriteDeadline(writer); err != nil {
-				return responseMetadata{}, err
-			}
-			if _, err := writer.Write(chunk); err != nil {
-				return responseMetadata{}, err
-			}
-			transferred += n
-			if metadataComplete {
-				if len(metadataBody)+len(chunk) <= maxJSONMetadataInspectionBytes {
-					metadataBody = append(metadataBody, chunk...)
-				} else {
-					metadataBody = nil
-					metadataComplete = false
-				}
+			if writeErr := write(buffer[:n]); writeErr != nil {
+				return responseMetadata{}, writeErr
 			}
 		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				if transferred == 0 {
-					return responseMetadata{}, neterror.ErrUpstreamResponseEmpty
-				}
-				if metadataComplete {
-					return normalizeMetadataUsage(extractMetadata(metadataBody), protocol), nil
-				}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
 				return responseMetadata{}, nil
 			}
-			return responseMetadata{Usage: gateway.Usage{OutputObserved: transferred > 0}}, readErr
+			return responseMetadata{Usage: gateway.Usage{OutputObserved: transferred > 0}}, err
 		}
 	}
 }
@@ -1970,8 +1982,9 @@ func (i *responseInspector) Inspect(chunk []byte) {
 		}
 		if bytes.HasPrefix(line, []byte("data:")) {
 			value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-			if containsGeneratedDelta(value, i.protocol) {
+			if generated, visibleBytes := generatedDelta(value, i.protocol); generated {
 				i.metadata.Usage.OutputObserved = true
+				i.metadata.Usage.ForwardedOutputBytes = saturatingUsageSum(i.metadata.Usage.ForwardedOutputBytes, int64(visibleBytes))
 			}
 			i.observeFirstToken(value)
 			i.observeTerminal(value)
@@ -2033,6 +2046,13 @@ func (i *responseInspector) markFirstTokenForwarded() {
 }
 
 func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
+	generated, _ := generatedDelta(data, protocol)
+	return generated
+}
+
+// generatedDelta reports whether an SSE data payload carries generated output
+// and how many bytes of visible text it contains.
+func generatedDelta(data []byte, protocol streamProtocol) (bool, int) {
 	switch protocol {
 	case streamProtocolResponses:
 		var event struct {
@@ -2044,17 +2064,17 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 			} `json:"item"`
 		}
 		if json.Unmarshal(data, &event) != nil {
-			return false
+			return false, 0
 		}
 		switch event.Type {
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-			return event.Delta != ""
+			return event.Delta != "", len(event.Delta)
 		case "response.output_item.added":
 			// Native Responses can stream an identified reasoning item with no
 			// text delta when only encrypted_content is requested. That item is
 			// still generation start; waiting for output_text kicks thinking
 			// time out of the TPS denominator.
-			return event.Item.Type == "reasoning" && event.Item.ID != ""
+			return event.Item.Type == "reasoning" && event.Item.ID != "", 0
 		}
 	case streamProtocolChat:
 		var event struct {
@@ -2074,19 +2094,24 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 			} `json:"choices"`
 		}
 		if json.Unmarshal(data, &event) != nil {
-			return false
+			return false, 0
 		}
+		generated := false
+		visible := 0
 		for _, choice := range event.Choices {
 			delta := choice.Delta
-			if delta.Content != "" || delta.Reasoning != "" || delta.ReasoningContent != "" || delta.ThinkingContent != "" || delta.Refusal != "" {
-				return true
-			}
+			// Reasoning aliases may carry the same text twice for compatibility.
+			reasoning := max(len(delta.Reasoning), len(delta.ReasoningContent), len(delta.ThinkingContent))
+			choiceVisible := len(delta.Content) + reasoning + len(delta.Refusal)
 			for _, call := range delta.ToolCalls {
-				if call.Function.Arguments != "" {
-					return true
-				}
+				choiceVisible += len(call.Function.Arguments)
+			}
+			if choiceVisible > 0 {
+				generated = true
+				visible += choiceVisible
 			}
 		}
+		return generated, visible
 	case streamProtocolAnthropic:
 		var event struct {
 			Type         string `json:"type"`
@@ -2101,24 +2126,24 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 			} `json:"delta"`
 		}
 		if json.Unmarshal(data, &event) != nil {
-			return false
+			return false, 0
 		}
 		if event.Type == "content_block_start" {
-			return event.ContentBlock.Type == "thinking"
+			return event.ContentBlock.Type == "thinking", 0
 		}
 		if event.Type != "content_block_delta" {
-			return false
+			return false, 0
 		}
 		switch event.Delta.Type {
 		case "text_delta":
-			return event.Delta.Text != ""
+			return event.Delta.Text != "", len(event.Delta.Text)
 		case "thinking_delta":
-			return event.Delta.Thinking != ""
+			return event.Delta.Thinking != "", len(event.Delta.Thinking)
 		case "input_json_delta":
-			return event.Delta.PartialJSON != ""
+			return event.Delta.PartialJSON != "", len(event.Delta.PartialJSON)
 		}
 	}
-	return false
+	return false, 0
 }
 
 func normalizeMetadataUsage(metadata responseMetadata, protocol streamProtocol) responseMetadata {

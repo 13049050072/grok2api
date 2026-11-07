@@ -148,6 +148,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		return nil, err
 	}
 	var rateLimiter repository.RateLimiter
+	var loginRateLimiter repository.RateLimiter
 	var concurrency repository.ConcurrencyLimiter
 	var sticky repository.StickySessionRepository
 	var reasoningReplayStore repository.ReasoningReplayRepository
@@ -166,7 +167,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			Address: cfg.RuntimeStore.Redis.Address, Username: cfg.RuntimeStore.Redis.Username,
 			Password: cfg.RuntimeStore.Redis.Password, Database: cfg.RuntimeStore.Redis.Database,
 			KeyPrefix: cfg.RuntimeStore.Redis.KeyPrefix, TLS: cfg.RuntimeStore.Redis.TLS,
-			ConcurrencyLease: cfg.Server.RequestTimeout.Value() + time.Minute,
+			ConcurrencyLease: max(cfg.Server.RequestTimeout.Value(), 2*time.Hour) + time.Minute, // 视频任务最长持有账号并发租约 2 小时（gateway videoJobTimeout）
 		})
 		if openErr != nil {
 			database.Close()
@@ -176,6 +177,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		invalidationBus = redisStore
 		runtimeHealth = redisStore.Ping
 		rateLimiter = redisStore
+		loginRateLimiter = redisStore
 		concurrency = redisruntime.NewConcurrencyLimiter(redisStore)
 		sticky = redisStore
 		reasoningReplayStore = redisruntime.NewReasoningReplayStore(redisStore)
@@ -187,6 +189,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		observedModelStore = redisStore
 	case "memory":
 		rateLimiter = memory.NewRateLimiter()
+		// 独立实例：客户端 Key 的 RPM 窗口不会挤占管理员登录限流的分片容量。
+		loginRateLimiter = memory.NewRateLimiter()
 		concurrency = memory.NewConcurrencyLimiter()
 		sticky = memory.NewStickyStore()
 		reasoningReplayStore = memory.NewReasoningReplayStore(cfg.Routing.ReasoningReplayMaxEntries)
@@ -236,7 +240,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		return nil, fmt.Errorf("校验 Provider 注册表: %w", err)
 	}
 	adminService := adminauth.NewService(adminRepo, sessionRepo, security.NewTokenService(cfg.Secrets.JWTSecret), cfg.Auth.AccessTokenTTL.Value(), cfg.Auth.RefreshTokenTTL.Value())
-	adminService.SetLoginRateLimiter(rateLimiter)
+	adminService.SetLoginRateLimiter(loginRateLimiter)
 	if err := adminService.Bootstrap(ctx, cfg.BootstrapAdmin.Username, cfg.BootstrapAdmin.Password); err != nil {
 		if runtimeStore != nil {
 			_ = runtimeStore.Close()
@@ -312,6 +316,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	accountSyncService.UpdateConcurrency(cfg.Batch.ImportConcurrency)
 	egressService := egressapp.NewService(egressRepo, cipher, infraegress.DefaultUserAgent, accountRepo)
 	egressService.ConfigureAutoAssignBounds(cfg.Routing.AutoAssignMaxNodeShare, cfg.Routing.AutoAssignMaxMigrationShare)
+	egressService.SetAssignmentLock(refreshLock)
 	egressService.SetClearanceManager(egressManager)
 	egressService.SetNodeProber(egressManager)
 	egressService.SetOperationsConfigInvalidator(egressManager)
@@ -436,7 +441,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			MaxOutputTokens: cfg.QualityGuard.MaxOutputTokens,
 		}
 	}
-	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, TrustedProxies: cfg.Server.TrustedProxies, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, QualityGuardStatePath: qualityGuardPath("state.json"), QualityGuardConfigPath: qualityGuardPath("runtime-config.json"), QualityGuardToken: qualityGuardToken, QualityGuardProbe: qualityGuardProbe, Updates: updateService})
+	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, TrustedProxies: cfg.Server.TrustedProxies, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, QualityGuardStatePath: qualityGuardPath("state.json"), QualityGuardConfigPath: qualityGuardPath("runtime-config.json"), QualityGuardToken: qualityGuardToken, QualityGuardProbe: qualityGuardProbe, QualityGuardNodeIDs: cfg.QualityGuard.NodeIDs, Updates: updateService})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	return &Application{
 		logger: logger, database: database, server: server,

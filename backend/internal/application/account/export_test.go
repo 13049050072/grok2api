@@ -249,9 +249,7 @@ func TestExportProviderCredentialsRoundTripsSSOProviders(t *testing.T) {
 			}
 			// 模拟旧账号先按 SSO 来源创建，后续身份同步再补齐邮箱与 user_id；
 			// 回导必须命中原账号，不能因新身份字段生成重复记录。
-			created.Email = test.name + "@example.com"
-			created.UserID = test.name + "-user-id"
-			if _, err := repository.Update(ctx, created); err != nil {
+			if err := repository.UpdateIdentityMetadata(ctx, created.ID, test.name+"@example.com", test.name+"-user-id", ""); err != nil {
 				t.Fatal(err)
 			}
 			service := NewService(repository, nil, nil, nil, provider.NewRegistry(test.adapter), cipher, nil)
@@ -364,7 +362,8 @@ func TestExportFormattedTextCanBeImportedBack(t *testing.T) {
 	ctx := context.Background()
 	accounts, cipher := newExportTestDatabase(t, ctx)
 	webAdapter := webprovider.NewAdapter(webprovider.Config{}, nil, nil, nil, nil)
-	service := newExportTestService(accounts, cipher, webAdapter)
+	buildAdapter := cliprovider.NewAdapter(cliprovider.Config{}, cipher)
+	service := newExportTestService(accounts, cipher, webAdapter, buildAdapter)
 
 	webAccount := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
 		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web", Email: "web@example.com",
@@ -388,6 +387,7 @@ func TestExportFormattedTextCanBeImportedBack(t *testing.T) {
 
 	buildAccount := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
 		Provider: accountdomain.ProviderBuild, Name: "build", Email: "build@example.com", SourceKey: "build-txt",
+		OIDCClientID:         buildAdapter.DefaultOAuthClientID(),
 		EncryptedAccessToken: mustEncrypt(t, cipher, "build-access"), EncryptedRefreshToken: mustEncrypt(t, cipher, "build-refresh"),
 		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
 	})
@@ -398,18 +398,38 @@ func TestExportFormattedTextCanBeImportedBack(t *testing.T) {
 	if string(buildFile.Data) != "build@example.com\tbuild-refresh\n" {
 		t.Fatalf("build txt export = %q", buildFile.Data)
 	}
-
-	// refresh token 为空时回退 access token，保证导出的 txt 仍可被读回。
-	fallback := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
-		Provider: accountdomain.ProviderBuild, Name: "build-fallback", Email: "fallback@example.com", SourceKey: "build-txt-fallback",
-		EncryptedAccessToken: mustEncrypt(t, cipher, "build-fallback-access"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	customClient := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build-custom", UserID: "custom-user", SourceKey: "build-txt-custom",
+		OIDCClientID: "custom-client", EncryptedAccessToken: mustEncrypt(t, cipher, "custom-access"),
+		EncryptedRefreshToken: mustEncrypt(t, cipher, "custom-refresh"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
 	})
-	fallbackFile, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderBuild, []uint64{fallback.ID}, ExportFormatText)
+	customFile, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderBuild, []uint64{customClient.ID}, ExportFormatText)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(fallbackFile.Data) != "fallback@example.com\tbuild-fallback-access\n" {
-		t.Fatalf("build txt fallback = %q", fallbackFile.Data)
+	if string(customFile.Data) != "\tcustom-refresh\tcustom-client\n" {
+		t.Fatalf("build txt custom client export = %q", customFile.Data)
+	}
+	buildSeeds, err := buildAdapter.ParseImportedCredentials(append(append([]byte{}, customFile.Data...), buildFile.Data...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buildSeeds) != 2 || buildSeeds[0].RefreshToken != "custom-refresh" || buildSeeds[0].OIDCClientID != "custom-client" || buildSeeds[0].Email != "" ||
+		buildSeeds[1].RefreshToken != "build-refresh" || buildSeeds[1].OIDCClientID != buildAdapter.DefaultOAuthClientID() || buildSeeds[1].Email != "build@example.com" {
+		t.Fatalf("build txt reimport = %#v", buildSeeds)
+	}
+
+	// 只有 access token 的 build 账号无法按 refresh token 导入读回，txt 导出直接跳过。
+	accessOnly := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build-fallback", Email: "fallback@example.com", SourceKey: "build-txt-fallback",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "build-fallback-access"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	accessOnlyFile, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderBuild, []uint64{accessOnly.ID}, ExportFormatText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accessOnlyFile.Data) != 0 || accessOnlyFile.Count != 0 {
+		t.Fatalf("build access-only txt export = %#v", accessOnlyFile)
 	}
 }
 
@@ -456,6 +476,43 @@ func TestExportFormattedCSVQuotesRFC4180Fields(t *testing.T) {
 	}
 	if len(file.Data) != len(raw) || file.Count != 1 || file.Format != ExportFormatCSV {
 		t.Fatalf("csv export = %#v", file)
+	}
+}
+
+func TestExportFormattedCSVNeutralizesSpreadsheetFormulas(t *testing.T) {
+	ctx := context.Background()
+	accounts, cipher := newExportTestDatabase(t, ctx)
+	service := newExportTestService(accounts, cipher)
+	created := insertExportAccount(t, ctx, accounts, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: `=HYPERLINK("http://evil.example","x")`,
+		Email: "@mail.example", UserID: "-1+1", SourceKey: "web-csv-formula",
+		EncryptedAccessToken: mustEncrypt(t, cipher, "+sso-token"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	file, err := service.ExportProviderCredentialsByIDsFormatted(ctx, accountdomain.ProviderWeb, []uint64{created.ID}, ExportFormatCSV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.HasPrefix(file.Data, []byte("\xef\xbb\xbf")) {
+		t.Fatal("csv export must keep its plain header without a BOM")
+	}
+	rows, err := csv.NewReader(bytes.NewReader(file.Data)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("csv rows = %#v", rows)
+	}
+	row := rows[1]
+	if row[2] != `'=HYPERLINK("http://evil.example","x")` || row[3] != "'@mail.example" || row[4] != "'-1+1" || row[9] != "'+sso-token" {
+		t.Fatalf("formula cells were not neutralized: %#v", row)
+	}
+	if row[0] != strconv.FormatUint(created.ID, 10) || row[7] != "true" || row[8] != "sso" {
+		t.Fatalf("plain cells changed: %#v", row)
+	}
+	for value, want := range map[string]string{"\tcmd": "'\tcmd", "\rcmd": "\"'\rcmd\"", "safe": "safe", "": ""} {
+		if got := csvField(value); got != want {
+			t.Fatalf("csvField(%q) = %q, want %q", value, got, want)
+		}
 	}
 }
 

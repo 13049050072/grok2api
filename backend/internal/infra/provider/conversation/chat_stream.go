@@ -58,7 +58,7 @@ func (c *streamConverter) toolStartChat(item responseItem, _ int) error {
 	if _, exists := c.tools[item.ID]; exists {
 		return nil
 	}
-	tool := streamTool{Index: len(c.tools), ID: item.CallID, Name: item.Name, Arguments: item.Arguments}
+	tool := streamTool{Index: len(c.tools), ID: item.CallID, CallID: strings.TrimSpace(item.CallID), Name: item.Name, Arguments: item.Arguments}
 	c.tools[item.ID] = tool
 	return c.chatDelta(map[string]any{"tool_calls": []any{map[string]any{
 		"index": tool.Index, "id": tool.ID, "type": "function", "function": map[string]any{"name": tool.Name, "arguments": ""},

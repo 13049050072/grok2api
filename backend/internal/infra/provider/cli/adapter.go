@@ -1028,7 +1028,12 @@ func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential)
 }
 
 func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Credential) (provider.RefreshedCredential, error) {
-	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	if err := ctx.Err(); err != nil {
+		return provider.RefreshedCredential{}, err
+	}
+	// xAI may rotate the refresh token as soon as it receives the request, so a started
+	// exchange outlives the caller and returns the replacement for persistence.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildControlTimeout)
 	defer cancel()
 	refreshToken, err := a.cipher.Decrypt(credential.EncryptedRefreshToken)
 	if err != nil {
@@ -1085,7 +1090,11 @@ func (a *Adapter) PrepareImportedCredential(ctx context.Context, seed provider.C
 	if strings.TrimSpace(seed.AccessToken) != "" || strings.TrimSpace(seed.RefreshToken) == "" {
 		return seed, nil
 	}
-	refreshCtx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	if err := ctx.Err(); err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	// Like RefreshCredential, a started exchange must not be abandoned by a cancelled import.
+	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildControlTimeout)
 	defer cancel()
 	tokens, err := a.oauth.refreshWithClientID(refreshCtx, strings.TrimSpace(seed.RefreshToken), seed.OIDCClientID)
 	if err != nil {
@@ -1109,6 +1118,11 @@ func (a *Adapter) PrepareImportedCredential(ctx context.Context, seed provider.C
 
 func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
 	return marshalCredentials(values)
+}
+
+// DefaultOAuthClientID is the client id assumed by imports that do not name one.
+func (a *Adapter) DefaultOAuthClientID() string {
+	return defaultOAuthClientID
 }
 
 func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential, accessToken, model, promptCacheKey string, trace bool) error {

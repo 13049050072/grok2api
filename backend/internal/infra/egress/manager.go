@@ -998,7 +998,7 @@ func (m *Manager) loadOperationsConfig(ctx context.Context, now time.Time) (doma
 	if !cached.expiresAt.IsZero() && now.Before(cached.expiresAt) {
 		return cached.value, true, nil
 	}
-	loaded, err, _ := m.operationsConfigLoad.Do("operations", func() (any, error) {
+	loaded, err := sharedLoad(ctx, &m.operationsConfigLoad, "operations", sharedSnapshotLoadTimeout, func(ctx context.Context) (domain.OperationsConfig, error) {
 		checkTime := time.Now().UTC()
 		m.operationsMu.RLock()
 		cached := m.operationsConfig
@@ -1023,7 +1023,7 @@ func (m *Manager) loadOperationsConfig(ctx context.Context, now time.Time) (doma
 	if err != nil {
 		return domain.OperationsConfig{}, true, err
 	}
-	return loaded.(domain.OperationsConfig), true, nil
+	return loaded, true, nil
 }
 
 func (m *Manager) fixedFallbackNode(ctx context.Context, scope domain.Scope, nodeID uint64) (domain.Node, error) {
@@ -1246,7 +1246,7 @@ func (m *Manager) listNodes(ctx context.Context, scope domain.Scope, now time.Ti
 			return values, nil
 		}
 		m.nodeMu.RUnlock()
-		loaded, err, _ := m.nodeLoads.Do(string(scope), func() (any, error) {
+		loaded, err := sharedLoad(ctx, &m.nodeLoads, string(scope), sharedSnapshotLoadTimeout, func(ctx context.Context) ([]domain.Node, error) {
 			checkTime := time.Now().UTC()
 			m.nodeMu.RLock()
 			if snapshot, ok := m.nodes[scope]; ok && checkTime.Before(snapshot.expiresAt) {
@@ -1277,7 +1277,7 @@ func (m *Manager) listNodes(ctx context.Context, scope domain.Scope, now time.Ti
 			}
 			return nil, err
 		}
-		return loaded.([]domain.Node), nil
+		return loaded, nil
 	}
 }
 
@@ -1831,7 +1831,7 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 	}
 	m.clearanceMu.Unlock()
 
-	result, err, _ := m.clearanceLoads.Do(key, func() (any, error) {
+	solution, err := m.sharedClearanceRefresh(ctx, key, func(ctx context.Context) (clearanceSolution, error) {
 		return m.refreshNode(ctx, node, proxyURL, key, persist, forceRefresh, !fallbackAllowed, refreshAfter)
 	})
 	if err != nil {
@@ -1840,8 +1840,23 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		}
 		return "", "", err
 	}
-	solution := result.(clearanceSolution)
 	return solution.Cookies, solution.UserAgent, nil
+}
+
+// sharedClearanceRefresh bounds a shared refresh by the distributed lock TTL,
+// which already covers a peer wait or a solve plus persistence.
+func (m *Manager) sharedClearanceRefresh(ctx context.Context, key string, refresh func(context.Context) (clearanceSolution, error)) (clearanceSolution, error) {
+	m.clearanceMu.Lock()
+	timeout := clearanceSolveTimeout(m.clearanceConfig) + clearanceLockGrace
+	m.clearanceMu.Unlock()
+	return sharedLoad(ctx, &m.clearanceLoads, key, timeout, refresh)
+}
+
+func clearanceSolveTimeout(cfg ClearanceConfig) time.Duration {
+	if cfg.Timeout <= 0 {
+		return time.Minute
+	}
+	return cfg.Timeout
 }
 
 func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, key string, persist, force, waitForPeer bool, refreshAfter time.Time) (clearanceSolution, error) {
@@ -1854,10 +1869,7 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 	if cfg.Mode != "flaresolverr" && cfg.Mode != "on_demand" {
 		return clearanceSolution{}, errors.New("FlareSolverr Clearance 未启用")
 	}
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = time.Minute
-	}
+	timeout := clearanceSolveTimeout(cfg)
 	fingerprint := clearanceFingerprint(cfg, proxyURL)
 	bindingFingerprint := clearanceBindingFingerprint(cfg, proxyURL)
 	interval := clearanceRefreshInterval(cfg)
@@ -2069,7 +2081,7 @@ func (m *Manager) recordClearanceError(ctx context.Context, node domain.Node, pe
 
 func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 	if nodeID == 0 {
-		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
+		_, err := m.sharedClearanceRefresh(ctx, "direct", func(ctx context.Context) (clearanceSolution, error) {
 			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, true, true, time.Time{})
 		})
 		return err
@@ -2093,7 +2105,7 @@ func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 		return err
 	}
 	key := clearanceCacheKey(node.ID, proxyURL, false)
-	_, err, _ = m.clearanceLoads.Do(key, func() (any, error) {
+	_, err = m.sharedClearanceRefresh(ctx, key, func(ctx context.Context) (clearanceSolution, error) {
 		return m.refreshNode(ctx, node, proxyURL, key, true, true, true, time.Time{})
 	})
 	return err
@@ -2257,7 +2269,7 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 		if refreshForce && known && state.invalid {
 			refreshAfter = state.refreshedAt
 		}
-		_, refreshErr, _ := m.clearanceLoads.Do(key, func() (any, error) {
+		_, refreshErr := m.sharedClearanceRefresh(ctx, key, func(ctx context.Context) (clearanceSolution, error) {
 			return m.refreshNode(ctx, node, proxyURL, key, true, refreshForce, false, refreshAfter)
 		})
 		if refreshErr != nil {
@@ -2266,7 +2278,7 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 	}
 	shouldUseDirect := direct.used || force && webNodeCount == 0
 	if shouldUseDirect && (force || direct.invalid || direct.userAgent == "" || direct.version != version || now.Sub(direct.refreshedAt) >= interval) {
-		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
+		_, err := m.sharedClearanceRefresh(ctx, "direct", func(ctx context.Context) (clearanceSolution, error) {
 			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, force, false, time.Time{})
 		})
 		if err != nil {

@@ -38,6 +38,125 @@ func TestRateAndConcurrencyLimits(t *testing.T) {
 	}
 }
 
+func TestRateLimiterShardsUsePerInstanceSeed(t *testing.T) {
+	colliding := make([]string, 0, 200)
+	for index := 0; len(colliding) < cap(colliding); index++ {
+		if key := fmt.Sprintf("client-%d", index); shardIndex(key) == 0 {
+			colliding = append(colliding, key)
+		}
+	}
+	first, second := NewRateLimiter(), NewRateLimiter()
+	shards := make(map[int]struct{})
+	differs := false
+	for _, key := range colliding {
+		index := rateShardIndex(first, key)
+		shards[index] = struct{}{}
+		differs = differs || index != rateShardIndex(second, key)
+	}
+	if len(shards) < 16 || !differs {
+		t.Fatalf("keys colliding under the unkeyed hash stayed clustered: shards=%d differs=%v", len(shards), differs)
+	}
+}
+
+func TestRateLimiterOverflowKeepsLimitedWindows(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	limiter := NewRateLimiter()
+	victim := "admin-login:ip-user:victim"
+	shard := limiter.shard(victim)
+	for range 2 {
+		if allowed, _ := limiter.Allow(ctx, victim, 2, now); !allowed {
+			t.Fatal("requests within the limit were rejected")
+		}
+	}
+	for _, key := range rateKeysInShard(limiter, shard, "flood", 2*maxEntriesPerShard()) {
+		if allowed, _ := limiter.Allow(ctx, key, 2, now.Add(time.Second)); !allowed {
+			t.Fatalf("fresh key %q was rejected", key)
+		}
+	}
+	if allowed, _ := limiter.Allow(ctx, victim, 2, now.Add(2*time.Second)); allowed {
+		t.Fatal("overflowing the shard reset an exhausted rate window")
+	}
+	if len(shard.windows) > maxEntriesPerShard() {
+		t.Fatalf("shard windows = %d, want <= %d", len(shard.windows), maxEntriesPerShard())
+	}
+}
+
+func TestRateLimiterOverflowEvictsLimitedWindowsOnlyAsLastResort(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	limiter := NewRateLimiter()
+	shard := limiter.shard("anchor")
+	keys := rateKeysInShard(limiter, shard, "limited", maxEntriesPerShard()+1)
+	limitedKeys, last := keys[:maxEntriesPerShard()], keys[maxEntriesPerShard()]
+	for _, key := range limitedKeys {
+		if allowed, _ := limiter.Allow(ctx, key, 1, now); !allowed {
+			t.Fatalf("first request for %q was rejected", key)
+		}
+	}
+	extra := rateKeysInShard(limiter, shard, "fresh", 1)[0]
+	if allowed, _ := limiter.Allow(ctx, extra, 5, now.Add(time.Second)); !allowed {
+		t.Fatal("fresh key was rejected")
+	}
+	if _, exists := shard.windows[extra]; exists {
+		t.Fatal("unlimited window survived while limited windows were evicted")
+	}
+	for _, key := range limitedKeys {
+		if allowed, _ := limiter.Allow(ctx, key, 1, now.Add(2*time.Second)); allowed {
+			t.Fatalf("limited window %q was evicted before an unlimited one", key)
+		}
+	}
+
+	if allowed, _ := limiter.Allow(ctx, last, 1, now.Add(3*time.Second)); !allowed {
+		t.Fatal("first request for the last key was rejected")
+	}
+	if len(shard.windows) != maxEntriesPerShard() {
+		t.Fatalf("shard windows = %d, want %d", len(shard.windows), maxEntriesPerShard())
+	}
+	if _, exists := shard.windows[last]; !exists {
+		t.Fatal("newest limited window was evicted instead of the oldest")
+	}
+}
+
+func TestRateLimiterOverflowRemovesExpiredWindowsFirst(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	limiter := NewRateLimiter()
+	shard := limiter.shard("anchor")
+	keys := rateKeysInShard(limiter, shard, "stale", maxEntriesPerShard()+1)
+	for _, key := range keys[:maxEntriesPerShard()] {
+		if allowed, _ := limiter.Allow(ctx, key, 1, now); !allowed {
+			t.Fatalf("first request for %q was rejected", key)
+		}
+	}
+	if allowed, _ := limiter.Allow(ctx, keys[maxEntriesPerShard()], 1, now.Add(time.Minute)); !allowed {
+		t.Fatal("request after the window expired was rejected")
+	}
+	if len(shard.windows) != 1 {
+		t.Fatalf("shard windows = %d, want only the live window", len(shard.windows))
+	}
+}
+
+func rateShardIndex(limiter *RateLimiter, key string) int {
+	shard := limiter.shard(key)
+	for index := range limiter.shards {
+		if &limiter.shards[index] == shard {
+			return index
+		}
+	}
+	return -1
+}
+
+func rateKeysInShard(limiter *RateLimiter, shard *rateShard, prefix string, count int) []string {
+	keys := make([]string, 0, count)
+	for index := 0; len(keys) < count; index++ {
+		if key := fmt.Sprintf("%s-%d", prefix, index); limiter.shard(key) == shard {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
 func BenchmarkConcurrencyLimiterCurrentMany(b *testing.B) {
 	ctx := context.Background()
 	limiter := NewConcurrencyLimiter()

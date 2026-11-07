@@ -78,6 +78,9 @@ type ImportInput struct {
 type ImportResult struct {
 	Imported int
 	Skipped  int
+	// NonPublic counts remote subscription entries dropped for pointing at a
+	// literal non-public IP. They are also included in Skipped.
+	NonPublic int
 }
 
 type ProbeBatchResult struct {

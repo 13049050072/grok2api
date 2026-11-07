@@ -467,7 +467,7 @@ func toolIdentity(value any) string {
 
 func consoleRetryAfter(body []byte) time.Duration {
 	text := string(body)
-	index := strings.Index(strings.ToLower(text), "resets in:")
+	index := provider.IndexFoldASCII(text, "resets in:")
 	if index < 0 {
 		return 0
 	}

@@ -400,11 +400,141 @@ func TestWriterIsolatesInvalidAuditRecordFromValidBatch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("drop observer was not notified")
 	}
-	if snapshot := service.LedgerSnapshot(); snapshot.Ready || !snapshot.Irrecoverable || snapshot.Dropped != 1 {
+	if snapshot := service.LedgerSnapshot(); snapshot.Ready || !snapshot.LossActive || snapshot.Dropped != 1 {
 		t.Fatalf("ledger snapshot after rejected record = %#v", snapshot)
 	}
+	if err := service.CheckLedgerReady(); err != nil {
+		t.Fatalf("observe mode blocked traffic after a drop: %v", err)
+	}
+}
+
+func TestLedgerLossBlocksEnforceUntilWriterRecovers(t *testing.T) {
+	dropAt := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	var nowNanos atomic.Int64
+	nowNanos.Store(dropAt.UnixNano())
+	service := NewService(&toggleAuditRepository{}, slog.Default(), 1, 1, time.Hour)
+	service.now = func() time.Time { return time.Unix(0, nowNanos.Load()).UTC() }
+	enforce := LedgerConfig{Mode: LedgerModeEnforce, FailureThreshold: 1, UnhealthyGrace: time.Second, QueueHighWatermarkPercent: 100}
+	service.UpdateLedgerConfig(enforce)
+	if !service.Record(auditdomain.Record{EventID: "queued"}) {
+		t.Fatal("record was not queued")
+	}
+	if service.Record(auditdomain.Record{EventID: "dropped"}) {
+		t.Fatal("full queue accepted a record")
+	}
 	if err := service.CheckLedgerReady(); !errors.Is(err, ErrLedgerUnavailable) {
-		t.Fatalf("irrecoverable drop did not block observe mode: %v", err)
+		t.Fatalf("enforce readiness after drop = %v", err)
+	}
+	observe := enforce
+	observe.Mode = LedgerModeObserve
+	service.UpdateLedgerConfig(observe)
+	if err := service.CheckLedgerReady(); err != nil {
+		t.Fatalf("observe mode blocked traffic after a drop: %v", err)
+	}
+	service.UpdateLedgerConfig(enforce)
+
+	nowNanos.Store(dropAt.Add(2 * ledgerLossRecoveryMin).UnixNano())
+	if snapshot := service.LedgerSnapshot(); snapshot.Ready || !snapshot.LossActive {
+		t.Fatalf("loss cleared without a persisted batch: %#v", snapshot)
+	}
+
+	nowNanos.Store(dropAt.UnixNano())
+	service.Start()
+	t.Cleanup(func() { closeAuditService(t, service) })
+	if err := service.CreateDurable(context.Background(), auditdomain.Record{EventID: "after-drop"}); err != nil {
+		t.Fatal(err)
+	}
+	nowNanos.Store(dropAt.Add(ledgerLossRecoveryMin - time.Second).UnixNano())
+	if err := service.CheckLedgerReady(); !errors.Is(err, ErrLedgerUnavailable) {
+		t.Fatalf("loss cleared before the recovery window: %v", err)
+	}
+	nowNanos.Store(dropAt.Add(ledgerLossRecoveryMin).UnixNano())
+	if snapshot := service.LedgerSnapshot(); !snapshot.Ready || snapshot.LossActive || snapshot.Dropped != 1 {
+		t.Fatalf("recovered snapshot = %#v", snapshot)
+	}
+
+	secondDropAt := dropAt.Add(2 * ledgerLossRecoveryMin)
+	nowNanos.Store(secondDropAt.UnixNano())
+	service.recordEnqueueDrop(auditWriteRequest{record: auditdomain.Record{EventID: "second-drop"}}, "test")
+	nowNanos.Store(secondDropAt.Add(2 * ledgerLossRecoveryMin).UnixNano())
+	if err := service.CheckLedgerReady(); !errors.Is(err, ErrLedgerUnavailable) {
+		t.Fatalf("new drop did not require a fresh persisted batch: %v", err)
+	}
+	if err := service.CreateDurable(context.Background(), auditdomain.Record{EventID: "after-second-drop"}); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := service.LedgerSnapshot(); !snapshot.Ready || snapshot.Dropped != 2 {
+		t.Fatalf("snapshot after second recovery = %#v", snapshot)
+	}
+}
+
+func TestRejectedRecordLossRecoversWithoutLaterTraffic(t *testing.T) {
+	dropAt := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	now := dropAt
+	service := NewService(&toggleAuditRepository{}, slog.Default(), 1, 1, time.Hour)
+	service.now = func() time.Time { return now }
+	service.UpdateLedgerConfig(LedgerConfig{Mode: LedgerModeEnforce, FailureThreshold: 1, UnhealthyGrace: time.Second, QueueHighWatermarkPercent: 90})
+	service.recordRejectedAudit(auditWriteRequest{record: auditdomain.Record{EventID: "invalid"}}, repository.ErrInvalidRecord)
+	if err := service.CheckLedgerReady(); !errors.Is(err, ErrLedgerUnavailable) {
+		t.Fatalf("enforce readiness after rejected record = %v", err)
+	}
+	now = dropAt.Add(ledgerLossRecoveryMin)
+	if snapshot := service.LedgerSnapshot(); !snapshot.Ready || snapshot.LossActive || snapshot.Dropped != 1 {
+		t.Fatalf("idle instance stayed paused after a rejected record: %#v", snapshot)
+	}
+
+	service.recordLedgerFailure()
+	service.recordRejectedAudit(auditWriteRequest{record: auditdomain.Record{EventID: "invalid-while-failing"}}, repository.ErrInvalidRecord)
+	now = now.Add(2 * ledgerLossRecoveryMin)
+	if snapshot := service.LedgerSnapshot(); !snapshot.LossActive {
+		t.Fatalf("rejection during writer failures cleared without a persisted batch: %#v", snapshot)
+	}
+	service.recordLedgerSuccess()
+	if snapshot := service.LedgerSnapshot(); !snapshot.Ready || snapshot.LossActive || snapshot.Dropped != 2 {
+		t.Fatalf("snapshot after writer recovery = %#v", snapshot)
+	}
+}
+
+func TestCloseAbandonsFailingBatchInsteadOfRetryingForever(t *testing.T) {
+	service := NewService(&toggleAuditRepository{err: errors.New("database unavailable")}, slog.Default(), 8, 4, time.Second)
+	service.UpdateWriterConfig(4, time.Second, time.Millisecond)
+	dropped := make(chan []string, 1)
+	service.SetDropObserver(func(eventIDs []string) { dropped <- eventIDs })
+	service.Start()
+	result := make(chan error, 1)
+	go func() {
+		result <- service.CreateDurable(context.Background(), auditdomain.Record{EventID: "stuck"})
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for service.LedgerSnapshot().ConsecutiveFailures == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("writer never attempted the batch")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := service.Close(closeCtx); err != nil {
+		t.Fatalf("close with a failing database = %v", err)
+	}
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("abandoned write reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller was not acknowledged")
+	}
+	select {
+	case eventIDs := <-dropped:
+		if len(eventIDs) != 1 || eventIDs[0] != "stuck" {
+			t.Fatalf("dropped events = %v", eventIDs)
+		}
+	default:
+		t.Fatal("drop observer was not notified")
+	}
+	if snapshot := service.LedgerSnapshot(); snapshot.Dropped != 1 || !snapshot.LossActive {
+		t.Fatalf("snapshot after abandoned batch = %#v", snapshot)
 	}
 }
 

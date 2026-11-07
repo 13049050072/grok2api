@@ -13,6 +13,9 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/pkg/mediafile"
 )
 
+// storeMarkerName 随媒体卷一起存在；卷被卸载或替换后标记消失，对象缺失便不能再视为孤儿元数据。
+const storeMarkerName = ".grok2api-media-store"
+
 // LocalStore 将媒体对象限制在单一根目录内，并使用临时文件与原子硬链接完成提交。
 type LocalStore struct {
 	root            string
@@ -28,7 +31,37 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	if err := os.MkdirAll(absolute, 0o700); err != nil {
 		return nil, fmt.Errorf("创建媒体存储目录: %w", err)
 	}
+	if err := ensureStoreMarker(absolute); err != nil {
+		// 标记缺失只会让 CheckHealthy 失败，容量清理回到保留元数据的保守行为，不阻断启动。
+		slog.Warn("media_store_marker_unavailable", "root", absolute, "error", err)
+	}
 	return &LocalStore{root: absolute, removeTemporary: os.Remove}, nil
+}
+
+func ensureStoreMarker(root string) error {
+	file, err := os.OpenFile(filepath.Join(root, storeMarkerName), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("创建媒体存储标记: %w", err)
+	}
+	return file.Close()
+}
+
+// CheckHealthy 确认媒体根目录仍是初始化时的卷。
+func (s *LocalStore) CheckHealthy(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Stat(filepath.Join(s.root, storeMarkerName))
+	if err != nil {
+		return fmt.Errorf("媒体存储标记不可用: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("媒体存储标记无效")
+	}
+	return nil
 }
 
 func (s *LocalStore) SaveImage(ctx context.Context, id, mimeType string, data []byte) (string, error) {

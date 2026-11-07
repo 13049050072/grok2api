@@ -131,6 +131,7 @@ type Service struct {
 	operationsCache             OperationsConfigInvalidator
 	qualityProber               QualityProber
 	assignmentMu                sync.Mutex
+	assignmentLock              repository.DistributedLock
 	lastAssignmentRun           time.Time
 	assignmentRunning           bool
 	autoAssignMaxNodeShare      float64
@@ -159,6 +160,14 @@ type QualityLeaseInput struct {
 func (s *Service) SetQualityProber(value QualityProber) {
 	s.mu.Lock()
 	s.qualityProber = value
+	s.mu.Unlock()
+}
+
+// SetAssignmentLock lets only one replica at a time run the automatic
+// assignment part of maintenance.
+func (s *Service) SetAssignmentLock(value repository.DistributedLock) {
+	s.mu.Lock()
+	s.assignmentLock = value
 	s.mu.Unlock()
 }
 
@@ -231,6 +240,9 @@ func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input Quality
 type AccountBindingRepository interface {
 	CountProviderAccountsByIDs(context.Context, accountdomain.Provider, []uint64) (int64, error)
 	UpdateEgressBindings(context.Context, accountdomain.Provider, []uint64, *uint64, accountdomain.EgressAssignmentMode, time.Time) (int64, error)
+	// MoveAutoEgressBindings must skip rows whose binding no longer matches
+	// fromNodeID (zero means unbound) or that are no longer automatic.
+	MoveAutoEgressBindings(ctx context.Context, provider accountdomain.Provider, ids []uint64, fromNodeID, toNodeID uint64, assignedAt time.Time) (int64, error)
 	ListEgressAssignments(context.Context, accountdomain.Provider) ([]accountdomain.Credential, error)
 	ListEgressBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error)
 	ListEgressSourceBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error)

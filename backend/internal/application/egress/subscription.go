@@ -14,13 +14,12 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
-	_ "github.com/bdandy/go-socks4"
 	"github.com/chenyme/grok2api/backend/internal/pkg/netguard"
 	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
-	xproxy "golang.org/x/net/proxy"
 )
 
 const (
@@ -33,8 +32,6 @@ const (
 
 // subscriptionIPLookup overrides destination resolution in tests.
 var subscriptionIPLookup func(context.Context, string) ([]netip.Addr, error)
-
-type subscriptionServerNameKey struct{}
 
 type subscriptionEntry struct {
 	ProxyURL string
@@ -71,13 +68,12 @@ func fetchProxySubscription(ctx context.Context, value string, viaProxy string) 
 	if err != nil {
 		return nil, err
 	}
-	defer transport.CloseIdleConnections()
 	proxied := strings.TrimSpace(viaProxy) != ""
 	var roundTripper http.RoundTripper = transport
 	if proxied {
 		// Pin every request, including redirects, to an address resolved here.
 		// The proxy then receives that IP instead of resolving the name again.
-		roundTripper = &pinnedSubscriptionTransport{base: transport}
+		roundTripper = &pinnedSubscriptionTransport{base: transport, forwardProxy: transport.Proxy != nil}
 	}
 	client := &http.Client{
 		Transport: roundTripper,
@@ -97,6 +93,7 @@ func fetchProxySubscription(ctx context.Context, value string, viaProxy string) 
 			return nil
 		},
 	}
+	defer client.CloseIdleConnections()
 	requestCtx, cancel := context.WithTimeout(ctx, subscriptionFetchTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, normalized, nil)
@@ -160,15 +157,11 @@ func subscriptionTransport(viaProxy string) (*http.Transport, error) {
 		// Dial the proxy endpoint itself; private admin proxies are allowed.
 		transport.DialContext = direct.DialContext
 	case "socks4", "socks4a", "socks5", "socks5h":
-		// SOCKS4 dialers do not implement ContextDialer. Bound the complete
-		// proxy handshake at the underlying connection so cancellation cannot
-		// leave an unbounded goroutine and socket behind.
-		forward := &subscriptionProxyForwardDialer{dialer: direct, timeout: proxyHandshakeTimeout}
-		dialer, err := xproxy.FromURL(parsed, forward)
+		dialer, err := tunnelproxy.NewSOCKSDialer(parsed, direct, proxyHandshakeTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("创建订阅拉取 SOCKS 代理: %w", err)
 		}
-		transport.DialContext = subscriptionProxyDialContext(dialer)
+		transport.DialContext = dialer.DialContext
 	case "trojan", "vless", "ss", "vmess":
 		dialer, err := tunnelproxy.NewDialer(viaProxy)
 		if err != nil {
@@ -183,29 +176,110 @@ func subscriptionTransport(viaProxy string) (*http.Transport, error) {
 
 type pinnedSubscriptionTransport struct {
 	base *http.Transport
+	// forwardProxy marks HTTP(S) proxies, which receive plain-HTTP requests in
+	// absolute form instead of through a tunnel.
+	forwardProxy bool
+
+	mu sync.Mutex
+	// tlsByServerName must be closed with the base transport; one entry per
+	// TLS server name lets redirect hops share connections.
+	tlsByServerName map[string]*http.Transport
 }
 
 func (p *pinnedSubscriptionTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if p == nil || p.base == nil || request == nil {
 		return nil, errors.New("订阅地址格式无效")
 	}
-	if err := pinSubscriptionRequest(request); err != nil {
+	pinned, serverName, err := pinSubscriptionRequest(request, p.forwardProxy)
+	if err != nil {
 		return nil, err
 	}
-	transport := p.base.Clone()
-	if request.URL != nil && request.URL.Scheme == "https" {
-		if serverName, _ := request.Context().Value(subscriptionServerNameKey{}).(string); serverName != "" {
-			transport.TLSClientConfig = &tls.Config{ServerName: serverName, NextProtos: []string{"h2", "http/1.1"}}
-		}
+	transport := p.base
+	if pinned.URL.Scheme == "https" {
+		transport = p.tlsTransport(serverName)
 	}
-	return transport.RoundTrip(request)
+	response, err := transport.RoundTrip(pinned)
+	if response != nil {
+		response.Request = request
+	}
+	return response, err
 }
 
-// pinSubscriptionRequest rewrites the destination to a public IP while keeping
-// the original hostname for the Host header and TLS server name.
-func pinSubscriptionRequest(request *http.Request) error {
+func (p *pinnedSubscriptionTransport) tlsTransport(serverName string) *http.Transport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if transport, ok := p.tlsByServerName[serverName]; ok {
+		return transport
+	}
+	transport := p.base.Clone()
+	config := &tls.Config{}
+	if p.base.TLSClientConfig != nil {
+		config = p.base.TLSClientConfig.Clone()
+	}
+	config.ServerName = serverName
+	config.NextProtos = []string{"h2", "http/1.1"}
+	transport.TLSClientConfig = config
+	if p.forwardProxy {
+		transport.DialTLSContext = p.dialProxyTLS(config)
+	}
+	if p.tlsByServerName == nil {
+		p.tlsByServerName = make(map[string]*http.Transport)
+	}
+	p.tlsByServerName[serverName] = transport
+	return transport
+}
+
+// dialProxyTLS verifies an HTTPS proxy under its own name. net/http applies
+// TLSClientConfig.ServerName to the proxy handshake as well, which would check
+// the proxy certificate against the subscription host.
+func (p *pinnedSubscriptionTransport) dialProxyTLS(config *tls.Config) func(context.Context, string, string) (net.Conn, error) {
+	dial := p.base.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	timeout := p.base.TLSHandshakeTimeout
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		connection, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		proxyConfig := config.Clone()
+		proxyConfig.ServerName = host
+		// CONNECT is written as HTTP/1.1 on this connection.
+		proxyConfig.NextProtos = []string{"http/1.1"}
+		tlsConnection := tls.Client(connection, proxyConfig)
+		if err := tlsConnection.HandshakeContext(ctx); err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+		return tlsConnection, nil
+	}
+}
+
+func (p *pinnedSubscriptionTransport) CloseIdleConnections() {
+	p.base.CloseIdleConnections()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, transport := range p.tlsByServerName {
+		transport.CloseIdleConnections()
+	}
+}
+
+// pinSubscriptionRequest returns a copy of request aimed at a public IP, plus
+// the TLS server name. The caller's request stays untouched because the client
+// resolves redirects against it.
+func pinSubscriptionRequest(request *http.Request, forwardProxy bool) (*http.Request, string, error) {
 	if request == nil || request.URL == nil || request.URL.Hostname() == "" {
-		return errors.New("订阅地址格式无效")
+		return nil, "", errors.New("订阅地址格式无效")
 	}
 	host := request.URL.Hostname()
 	port := request.URL.Port()
@@ -218,99 +292,26 @@ func pinSubscriptionRequest(request *http.Request) error {
 	}
 	addresses, err := resolvePublicAddresses(request.Context(), net.DefaultResolver, host)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	pinned := net.JoinHostPort(addresses[0].String(), port)
-	hostHeader := host
-	if (request.URL.Scheme == "https" && port != "443") || (request.URL.Scheme != "https" && port != "80") {
-		hostHeader = net.JoinHostPort(host, port)
+	pinned := request.Clone(request.Context())
+	pinned.URL.Host = net.JoinHostPort(addresses[0].String(), port)
+	if pinned.Host == "" {
+		pinned.Host = request.URL.Host
 	}
-	// Plain HTTP proxies copy Request.Host into the absolute request-target.
-	// The pinned IP has to live there, or the proxy resolves the original name.
-	if request.URL.Scheme != "https" {
+	// A forward proxy builds the absolute request-target from Request.Host, so
+	// the pinned IP has to live there or the proxy resolves the name again.
+	// Tunnels and SOCKS already dial the pinned IP and keep the original Host.
+	if forwardProxy && request.URL.Scheme != "https" {
+		pinned.Host = pinned.URL.Host
 		if port == "80" {
-			hostHeader = addresses[0].String()
+			pinned.Host = addresses[0].String()
 			if addresses[0].Is6() {
-				hostHeader = "[" + hostHeader + "]"
+				pinned.Host = "[" + pinned.Host + "]"
 			}
-		} else {
-			hostHeader = pinned
 		}
 	}
-	*request = *request.WithContext(context.WithValue(request.Context(), subscriptionServerNameKey{}, host))
-	request.URL.Host = pinned
-	request.Host = hostHeader
-	return nil
-}
-
-type subscriptionProxyForwardDialer struct {
-	dialer  *net.Dialer
-	timeout time.Duration
-}
-
-func (d *subscriptionProxyForwardDialer) Dial(network, address string) (net.Conn, error) {
-	connection, err := d.dialer.Dial(network, address)
-	return d.withDeadline(connection, err)
-}
-
-func (d *subscriptionProxyForwardDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	connection, err := d.dialer.DialContext(ctx, network, address)
-	return d.withDeadline(connection, err)
-}
-
-func (d *subscriptionProxyForwardDialer) withDeadline(connection net.Conn, err error) (net.Conn, error) {
-	if err != nil || connection == nil {
-		return connection, err
-	}
-	if err := connection.SetDeadline(time.Now().Add(d.timeout)); err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
-	return connection, nil
-}
-
-func subscriptionProxyDialContext(dialer xproxy.Dialer) func(context.Context, string, string) (net.Conn, error) {
-	clearDeadline := func(connection net.Conn, err error) (net.Conn, error) {
-		if err != nil || connection == nil {
-			return connection, err
-		}
-		if clearErr := connection.SetDeadline(time.Time{}); clearErr != nil {
-			_ = connection.Close()
-			return nil, clearErr
-		}
-		return connection, nil
-	}
-	if contextual, ok := dialer.(xproxy.ContextDialer); ok {
-		return func(ctx context.Context, network, address string) (net.Conn, error) {
-			return clearDeadline(contextual.DialContext(ctx, network, address))
-		}
-	}
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		type result struct {
-			connection net.Conn
-			err        error
-		}
-		completed := make(chan result, 1)
-		go func() {
-			connection, dialErr := dialer.Dial(network, address)
-			connection, dialErr = clearDeadline(connection, dialErr)
-			completed <- result{connection: connection, err: dialErr}
-		}()
-		select {
-		case value := <-completed:
-			return value.connection, value.err
-		case <-ctx.Done():
-			// The underlying handshake deadline guarantees this cleanup waiter is
-			// bounded even for SOCKS4 proxies that never send a response.
-			go func() {
-				value := <-completed
-				if value.connection != nil {
-					_ = value.connection.Close()
-				}
-			}()
-			return nil, ctx.Err()
-		}
-	}
+	return pinned, host, nil
 }
 
 // validatePublicSubscriptionTarget closes the SSRF gap introduced by remote

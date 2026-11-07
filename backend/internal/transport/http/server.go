@@ -65,6 +65,7 @@ type Dependencies struct {
 	QualityGuardConfigPath string
 	QualityGuardToken      string
 	QualityGuardProbe      egressapp.QualityProbeInput
+	QualityGuardNodeIDs    []uint64
 	Updates                *updatecheckapp.Service
 }
 
@@ -121,14 +122,19 @@ func New(deps Dependencies) *gin.Engine {
 	}
 	router.Use(gin.Recovery(), middleware.RequestID(), middleware.ClientIP(), middleware.SecurityHeaders(), middleware.MaxBodyBytes(deps.MaxBodyBytes), middleware.Timeout(deps.RequestTimeout), middleware.AccessLog(deps.Logger))
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+	readiness := newReadinessProbe(deps.Readiness)
 	router.GET("/readyz", func(c *gin.Context) {
-		if deps.Readiness != nil {
-			snapshot := deps.Readiness(c.Request.Context())
+		if readiness != nil {
+			snapshot, err := readiness.snapshot(c.Request.Context())
+			if err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"ready": false, "state": "not_ready"})
+				return
+			}
 			status := http.StatusServiceUnavailable
 			if snapshot.Ready {
 				status = http.StatusOK
 			}
-			c.JSON(status, snapshot)
+			c.JSON(status, publicReadiness(snapshot))
 			return
 		}
 		if deps.Ready != nil && deps.Ready(c.Request.Context()) {
@@ -144,7 +150,7 @@ func New(deps Dependencies) *gin.Engine {
 	mediaHandler.RegisterPublic(router)
 
 	adminRoot := router.Group("/api/admin/v1")
-	authHandler := adminauthhttp.NewHandler(deps.AdminAuth, deps.SecureCookies)
+	authHandler := adminauthhttp.NewHandler(deps.AdminAuth, deps.SecureCookies).WithTrustedProxies(deps.TrustedProxies)
 	authHandler.RegisterPublic(adminRoot)
 	adminProtected := adminRoot.Group("")
 	adminProtected.Use(middleware.AdminAuth(deps.AdminAuth))
@@ -157,7 +163,7 @@ func New(deps Dependencies) *gin.Engine {
 	dashboardhttp.NewHandler(deps.Dashboard).Register(adminProtected)
 	mediaHandler.RegisterAdmin(adminProtected)
 	settingshttp.NewHandler(deps.Settings).Register(adminProtected)
-	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe)
+	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe).WithQualityGuardNodeIDs(deps.QualityGuardNodeIDs)
 	egressHandler.Register(adminProtected)
 	systemhttp.NewHandler(func() string {
 		if deps.Settings != nil {

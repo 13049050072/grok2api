@@ -103,7 +103,7 @@ func TestCreateCredentialIfAbsentConcurrentRequestsDoNotDuplicate(t *testing.T) 
 	}
 }
 
-func TestCreateCredentialIfAbsentRejectsDuplicatesAndUnknownAccounts(t *testing.T) {
+func TestCreateCredentialIfAbsentRejectsDuplicatesButAllowsUnidentifiedAccounts(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDatabase(t)
 	repo := NewAccountRepository(db)
@@ -135,9 +135,15 @@ func TestCreateCredentialIfAbsentRejectsDuplicatesAndUnknownAccounts(t *testing.
 	if _, _, err := repo.UpsertByIdentity(ctx, anonymous); err != nil {
 		t.Fatal(err)
 	}
+	// Unidentified rows cannot prove they are the same upstream account; identity
+	// sync guards the later email/user_id fill instead of blocking creation here.
 	second.SourceKey = "source-2"
+	created, err := repo.CreateCredentialIfAbsent(ctx, second.Email, second.UserID, "", second)
+	if err != nil || created == 0 {
+		t.Fatalf("anonymous account blocked creation: id=%d err=%v", created, err)
+	}
 	if _, err := repo.CreateCredentialIfAbsent(ctx, second.Email, second.UserID, "", second); !errors.Is(err, repository.ErrConflict) {
-		t.Fatalf("anonymous account: %v", err)
+		t.Fatalf("created account duplicate: %v", err)
 	}
 }
 

@@ -561,6 +561,111 @@ func TestUpdateManyRejectsMissingEnabled(t *testing.T) {
 	}
 }
 
+type guardNodeRepository struct{ nodes map[uint64]egressdomain.Node }
+
+func (r *guardNodeRepository) ListEgressNodes(_ context.Context, scope egressdomain.Scope, _ repository.SortQuery) ([]egressdomain.Node, error) {
+	values := make([]egressdomain.Node, 0, len(r.nodes))
+	for _, node := range r.nodes {
+		if scope == "" || node.Scope == scope {
+			values = append(values, node)
+		}
+	}
+	return values, nil
+}
+func (r *guardNodeRepository) ListEgressNodePage(context.Context, repository.EgressNodeListQuery) ([]egressdomain.Node, int64, error) {
+	return nil, 0, nil
+}
+func (r *guardNodeRepository) GetEgressNode(_ context.Context, id uint64) (egressdomain.Node, error) {
+	node, ok := r.nodes[id]
+	if !ok {
+		return egressdomain.Node{}, repository.ErrNotFound
+	}
+	return node, nil
+}
+func (r *guardNodeRepository) CreateEgressNode(_ context.Context, value egressdomain.Node) (egressdomain.Node, error) {
+	return value, nil
+}
+func (r *guardNodeRepository) UpdateEgressNode(_ context.Context, value egressdomain.Node) (egressdomain.Node, error) {
+	r.nodes[value.ID] = value
+	return value, nil
+}
+func (r *guardNodeRepository) DeleteEgressNode(context.Context, uint64) error { return nil }
+
+func newGuardBatchRouter(t *testing.T, nodeIDs []uint64) (*gin.Engine, *guardNodeRepository) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := &guardNodeRepository{nodes: map[uint64]egressdomain.Node{
+		1: {ID: 1, Name: "managed", Scope: egressdomain.ScopeBuild, Enabled: true},
+		2: {ID: 2, Name: "unmanaged", Scope: egressdomain.ScopeBuild, Enabled: true},
+		3: {ID: 3, Name: "web", Scope: egressdomain.ScopeWeb, Enabled: true},
+	}}
+	router := gin.New()
+	NewHandler(egressapp.NewService(nodes, cipher, "")).WithQualityGuardNodeIDs(nodeIDs).RegisterQualityGuard(router.Group(""))
+	return router, nodes
+}
+
+func patchGuardBatch(router *gin.Engine, body string) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("PATCH", "/egress-nodes/batch", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func TestQualityGuardBatchUpdateOnlyTogglesManagedBuildNodes(t *testing.T) {
+	router, nodes := newGuardBatchRouter(t, []uint64{1, 3})
+
+	// quality_guard.py 发送 {"ids":[id],"enabled":bool}，并以 updated == 1 判断是否生效。
+	recorder := patchGuardBatch(router, `{"ids":["1"],"enabled":false}`)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"updated":1`) || nodes.nodes[1].Enabled {
+		t.Fatalf("managed node status=%d body=%s enabled=%v", recorder.Code, recorder.Body.String(), nodes.nodes[1].Enabled)
+	}
+	for _, id := range []string{"2", "3", "99"} {
+		recorder := patchGuardBatch(router, `{"ids":["`+id+`"],"enabled":false}`)
+		if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"updated":0`) || !strings.Contains(recorder.Body.String(), `"rejected":["`+id+`"]`) {
+			t.Fatalf("node %s status=%d body=%s", id, recorder.Code, recorder.Body.String())
+		}
+	}
+	recorder = patchGuardBatch(router, `{"ids":["1","2"],"enabled":true}`)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"updated":1`) || !strings.Contains(recorder.Body.String(), `"rejected":["2"]`) || !nodes.nodes[1].Enabled {
+		t.Fatalf("mixed batch status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !nodes.nodes[2].Enabled || !nodes.nodes[3].Enabled {
+		t.Fatalf("out-of-scope nodes were modified: %#v", nodes.nodes)
+	}
+
+	for _, body := range []string{
+		`{"ids":["1"]}`,
+		`{"ids":["1"],"enabled":false,"name":"renamed"}`,
+		`{"ids":["1"],"enabled":false,"proxyUrl":"http://proxy.example:8080"}`,
+		`{"ids":["1"],"enabled":false}{"ids":["2"],"enabled":false}`,
+		`{"ids":[],"enabled":false}`,
+		`{"ids":["abc"],"enabled":false}`,
+	} {
+		if recorder := patchGuardBatch(router, body); recorder.Code != 400 {
+			t.Fatalf("body=%s status=%d response=%s", body, recorder.Code, recorder.Body.String())
+		}
+	}
+	if !nodes.nodes[1].Enabled {
+		t.Fatal("rejected request modified a node")
+	}
+}
+
+func TestQualityGuardBatchUpdateWithoutNodeIDsAllowsOnlyBuildNodes(t *testing.T) {
+	router, nodes := newGuardBatchRouter(t, nil)
+	recorder := patchGuardBatch(router, `{"ids":["2","3"],"enabled":false}`)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"updated":1`) || !strings.Contains(recorder.Body.String(), `"rejected":["3"]`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if nodes.nodes[2].Enabled || !nodes.nodes[3].Enabled {
+		t.Fatalf("nodes after update = %#v", nodes.nodes)
+	}
+}
+
 func TestLegacyEgressSourceListRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, test := range []struct {

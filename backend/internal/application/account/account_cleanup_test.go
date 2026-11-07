@@ -60,8 +60,13 @@ func TestCleanupAccountsDeletesOnlySelectedCurrentStatuses(t *testing.T) {
 	normalID := create("normal", accountdomain.ProviderBuild, nil)
 	disabledID := create("disabled", accountdomain.ProviderBuild, func(value *accountdomain.Credential) { value.Enabled = false })
 	invalidID := create("invalid", accountdomain.ProviderBuild, func(value *accountdomain.Credential) { value.AuthStatus = accountdomain.AuthStatusReauthRequired })
-	coolingID := create("cooling", accountdomain.ProviderBuild, func(value *accountdomain.Credential) { until := now.Add(time.Hour); value.CooldownUntil = &until })
-	expiredCooldownID := create("expired-cooldown", accountdomain.ProviderBuild, func(value *accountdomain.Credential) { until := now.Add(-time.Hour); value.CooldownUntil = &until })
+	coolingID := create("cooling", accountdomain.ProviderBuild, nil)
+	expiredCooldownID := create("expired-cooldown", accountdomain.ProviderBuild, nil)
+	for id, until := range map[uint64]time.Time{coolingID: now.Add(time.Hour), expiredCooldownID: now.Add(-time.Hour)} {
+		if err := repo.UpdateHealth(ctx, id, accountdomain.ProviderBuild, 0, &until, "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
 	otherProviderID := create("web-disabled", accountdomain.ProviderWeb, func(value *accountdomain.Credential) { value.Enabled = false })
 
 	result, err := service.CleanupAccounts(ctx, accountdomain.ProviderBuild, []CleanupStatus{CleanupStatusDisabled, CleanupStatusReauthRequired, CleanupStatusCooldown, CleanupStatusDisabled}, nil)

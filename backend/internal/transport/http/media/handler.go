@@ -14,6 +14,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// mediaCacheControl keeps media out of shared caches: the URLs are
+// unauthenticated capabilities, and deleting an asset cannot purge copies a
+// CDN or proxy already stored.
+const mediaCacheControl = "private, max-age=31536000, immutable"
+
 type Handler struct {
 	service     *mediaapp.Service
 	ingestSlots chan struct{}
@@ -72,7 +77,7 @@ func (h *Handler) getImage(c *gin.Context) {
 	}
 	c.Header("Content-Type", asset.MIMEType)
 	c.Header("Content-Length", strconv.FormatInt(asset.SizeBytes, 10))
-	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("Cache-Control", mediaCacheControl)
 	c.Header("ETag", etag)
 	c.Header("X-Content-Type-Options", "nosniff")
 	if c.Request.Method == http.MethodHead {
@@ -101,7 +106,7 @@ func (h *Handler) getVideo(c *gin.Context) {
 	}
 	c.Header("Content-Type", asset.MIMEType)
 	c.Header("Content-Disposition", mediafile.VideoContentDisposition(asset.ID, asset.MIMEType))
-	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("Cache-Control", mediaCacheControl)
 	c.Header("ETag", `"`+asset.SHA256+`"`)
 	c.Header("X-Content-Type-Options", "nosniff")
 	http.ServeContent(c.Writer, c.Request, asset.ID, asset.CreatedAt, seeker)

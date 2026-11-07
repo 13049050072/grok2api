@@ -298,7 +298,7 @@ func (a *Adapter) forwardConsoleVoiceBytes(ctx context.Context, credential accou
 	}
 	response, err := a.doDPoPRequestWithContentType(requestCtx, credential, token, lease, method, consoleV1Endpoint(cfg.BaseURL, pathValue), body, contentType, accept)
 	if err != nil {
-		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
+		a.reportRequestFailure(ctx, lease.NodeID, err)
 		lease.Release()
 		cancel()
 		return nil, err
@@ -328,7 +328,7 @@ func (a *Adapter) forwardConsoleVoiceMultipart(ctx context.Context, credential a
 	}
 	response, err := a.doDPoPRequestWithContentType(requestCtx, credential, token, lease, method, consoleV1Endpoint(cfg.BaseURL, pathValue), body, contentType, accept)
 	if err != nil {
-		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
+		a.reportRequestFailure(ctx, lease.NodeID, err)
 		lease.Release()
 		cancel()
 		return nil, err

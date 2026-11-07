@@ -1,24 +1,33 @@
 package memory
 
 import (
+	"container/list"
 	"context"
-	"sort"
 	"sync"
 	"time"
 )
 
+// defaultReasoningReplayMaxBytes bounds cached ciphertext: one entry may hold
+// several encrypted reasoning items of up to 8 MiB each, so an entry count
+// alone does not bound memory.
+const defaultReasoningReplayMaxBytes int64 = 256 << 20
+
 type reasoningReplayEntry struct {
+	key       string
 	items     [][]byte
+	bytes     int64
 	expiresAt time.Time
 	storedAt  time.Time
 }
 
-// ReasoningReplayStore 提供单实例有界推理回放缓存。
+// ReasoningReplayStore 提供单实例有界推理回放缓存，按条目数与总字节数做 LRU 淘汰。
 type ReasoningReplayStore struct {
 	mu         sync.Mutex
 	maxSize    int
-	evictBatch int
-	values     map[string]reasoningReplayEntry
+	maxBytes   int64
+	totalBytes int64
+	order      *list.List // 队头为最久未使用
+	values     map[string]*list.Element
 	ttlSlide   bool
 }
 
@@ -27,14 +36,13 @@ func NewReasoningReplayStore(maxSize int) *ReasoningReplayStore {
 	if maxSize < 1 {
 		maxSize = 10240
 	}
-	evictBatch := maxSize / 80
-	if evictBatch < 1 {
-		evictBatch = 1
+	return &ReasoningReplayStore{
+		maxSize:  maxSize,
+		maxBytes: defaultReasoningReplayMaxBytes,
+		order:    list.New(),
+		values:   make(map[string]*list.Element),
+		ttlSlide: true,
 	}
-	if evictBatch > 128 {
-		evictBatch = 128
-	}
-	return &ReasoningReplayStore{maxSize: maxSize, evictBatch: evictBatch, values: make(map[string]reasoningReplayEntry, maxSize), ttlSlide: true}
 }
 
 func reasoningReplayMapKey(model, sessionKey string) string {
@@ -52,6 +60,14 @@ func cloneReplayItems(items [][]byte) [][]byte {
 	return cloned
 }
 
+func replayEntryBytes(key string, items [][]byte) int64 {
+	size := int64(len(key))
+	for _, item := range items {
+		size += int64(len(item))
+	}
+	return size
+}
+
 func (s *ReasoningReplayStore) Get(_ context.Context, model, sessionKey string, now time.Time, ttl time.Duration) ([][]byte, bool, error) {
 	if model == "" || sessionKey == "" {
 		return nil, false, nil
@@ -59,12 +75,13 @@ func (s *ReasoningReplayStore) Get(_ context.Context, model, sessionKey string, 
 	key := reasoningReplayMapKey(model, sessionKey)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry, ok := s.values[key]
+	element, ok := s.values[key]
 	if !ok {
 		return nil, false, nil
 	}
+	entry := element.Value.(*reasoningReplayEntry)
 	if !now.Before(entry.expiresAt) {
-		delete(s.values, key)
+		s.removeLocked(element)
 		return nil, false, nil
 	}
 	if s.ttlSlide {
@@ -76,7 +93,7 @@ func (s *ReasoningReplayStore) Get(_ context.Context, model, sessionKey string, 
 		}
 		entry.expiresAt = now.Add(ttl)
 		entry.storedAt = now
-		s.values[key] = entry
+		s.order.MoveToBack(element)
 	}
 	return cloneReplayItems(entry.items), true, nil
 }
@@ -86,13 +103,23 @@ func (s *ReasoningReplayStore) Set(_ context.Context, model, sessionKey string, 
 		return nil
 	}
 	key := reasoningReplayMapKey(model, sessionKey)
+	cloned := cloneReplayItems(items)
+	size := replayEntryBytes(key, cloned)
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.values[key]; !exists {
-		s.evictLocked(now)
+	// The previous state for this session is superseded even when the new one
+	// is too large to cache; replaying the stale one would be wrong.
+	if element, exists := s.values[key]; exists {
+		s.removeLocked(element)
 	}
-	s.values[key] = reasoningReplayEntry{items: cloneReplayItems(items), expiresAt: expiresAt, storedAt: now}
+	if size > s.maxBytes {
+		return nil
+	}
+	s.evictLocked(now, size)
+	entry := &reasoningReplayEntry{key: key, items: cloned, bytes: size, expiresAt: expiresAt, storedAt: now}
+	s.values[key] = s.order.PushBack(entry)
+	s.totalBytes += size
 	return nil
 }
 
@@ -102,34 +129,29 @@ func (s *ReasoningReplayStore) Delete(_ context.Context, model, sessionKey strin
 	}
 	key := reasoningReplayMapKey(model, sessionKey)
 	s.mu.Lock()
-	delete(s.values, key)
+	if element, ok := s.values[key]; ok {
+		s.removeLocked(element)
+	}
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *ReasoningReplayStore) evictLocked(now time.Time) {
-	for key, entry := range s.values {
-		if !now.Before(entry.expiresAt) {
-			delete(s.values, key)
+// evictLocked drops expired entries from the LRU front, then the least recently
+// used ones until an incoming entry of the given size fits both limits.
+func (s *ReasoningReplayStore) evictLocked(now time.Time, incoming int64) {
+	for element := s.order.Front(); element != nil; element = s.order.Front() {
+		entry := element.Value.(*reasoningReplayEntry)
+		expired := !now.Before(entry.expiresAt)
+		full := len(s.values) >= s.maxSize || s.totalBytes+incoming > s.maxBytes
+		if !expired && !full {
+			return
 		}
+		s.removeLocked(element)
 	}
-	if len(s.values) < s.maxSize {
-		return
-	}
-	type candidate struct {
-		key      string
-		storedAt time.Time
-	}
-	candidates := make([]candidate, 0, len(s.values))
-	for key, entry := range s.values {
-		candidates = append(candidates, candidate{key: key, storedAt: entry.storedAt})
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].storedAt.Before(candidates[j].storedAt) })
-	count := s.evictBatch
-	if count > len(candidates) {
-		count = len(candidates)
-	}
-	for index := 0; index < count; index++ {
-		delete(s.values, candidates[index].key)
-	}
+}
+
+func (s *ReasoningReplayStore) removeLocked(element *list.Element) {
+	entry := s.order.Remove(element).(*reasoningReplayEntry)
+	delete(s.values, entry.key)
+	s.totalBytes -= entry.bytes
 }

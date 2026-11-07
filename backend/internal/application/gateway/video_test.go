@@ -741,10 +741,11 @@ func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 }
 
 type videoCreateFailoverAdapter struct {
-	mu       sync.Mutex
-	failures map[uint64]int
-	status   int
-	attempts []uint64
+	mu        sync.Mutex
+	failures  map[uint64]int
+	status    int
+	attempts  []uint64
+	onFailure func(accountID uint64)
 }
 
 func (a *videoCreateFailoverAdapter) Provider() account.Provider { return account.ProviderWeb }
@@ -764,6 +765,9 @@ func (a *videoCreateFailoverAdapter) GenerateVideo(_ context.Context, request pr
 	}
 	a.mu.Unlock()
 	if remaining > 0 {
+		if a.onFailure != nil {
+			a.onFailure(request.Credential.ID)
+		}
 		if a.status == 0 {
 			return provider.VideoResult{}, errors.New("unclassified create failure")
 		}
@@ -898,6 +902,117 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	}
 	if stored.Status != media.StatusFailed || stored.AccountID != first.ID {
 		t.Fatalf("unclassified failed job = %#v", stored)
+	}
+}
+
+func TestVideoRetryPinFailureFallsBackToOpenSelection(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-retry-pin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	mediaRepo := relational.NewMediaJobRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "video-pin-test", Prefix: "video-pin-test", SecretHash: strings.Repeat("c", 64),
+		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createAccount := func(name string, priority int) account.Credential {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+			Name: name, SourceKey: name, EncryptedAccessToken: name + "-token", ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: priority, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		return credential
+	}
+	original := createAccount("original", 300)
+	first := createAccount("first", 200)
+	second := createAccount("second", 100)
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-imagine-video"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []uint64{original.ID, first.ID, second.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, accountID, []string{"grok-imagine-video"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	route, err := modelRepo.GetByProviderUpstream(ctx, account.ProviderWeb, "grok-imagine-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	limiter := memory.NewConcurrencyLimiter()
+	// A busy original account makes attempt 0 open a selection session.
+	releaseOriginal, acquired, err := limiter.Acquire(ctx, accountConcurrencyKey(original.ID), 1)
+	if err != nil || !acquired {
+		t.Fatalf("occupy original account: acquired=%v err=%v", acquired, err)
+	}
+	defer releaseOriginal()
+	var releaseFirst func()
+	defer func() {
+		if releaseFirst != nil {
+			releaseFirst()
+		}
+	}()
+	adapter := &videoCreateFailoverAdapter{failures: map[uint64]int{first.ID: 1}, status: http.StatusForbidden}
+	adapter.onFailure = func(accountID uint64) {
+		if accountID != first.ID || releaseFirst != nil {
+			return
+		}
+		// The failing attempt still holds one slot; taking the other one makes
+		// the forbidden-egress re-pin of this account unavailable.
+		release, ok, acquireErr := limiter.Acquire(ctx, accountConcurrencyKey(first.ID), 2)
+		if acquireErr == nil && ok {
+			releaseFirst = release
+		}
+	}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, limiter, sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, nil, 3)
+	service.ConfigureMedia(mediaRepo, 1)
+	service.UpdateVideoMaxAttempts(5)
+
+	now := time.Now().UTC()
+	job := media.Job{
+		ID: "video_retry_pin_fallback", RequestID: "request-video-retry-pin", ClientKeyID: key.ID, ClientKeyName: key.Name,
+		AccountID: original.ID, AccountName: original.Name, Provider: string(account.ProviderWeb),
+		Model: route.PublicID, ModelRouteID: route.ID, UpstreamModel: route.UpstreamModel,
+		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 5, Quality: "720p",
+		Status: media.StatusInProgress, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := mediaRepo.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	service.runVideoJob(ctx, job, route)
+
+	if releaseFirst == nil {
+		t.Fatal("test setup did not saturate the re-pinned account")
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != first.ID || attempts[1] != second.ID {
+		t.Fatalf("video attempts = %#v, want first then second", attempts)
+	}
+	stored, err := mediaRepo.GetMediaJob(ctx, job.ID, job.ClientKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != media.StatusCompleted || stored.AccountID != second.ID {
+		t.Fatalf("job = %#v, want completed on second account", stored)
 	}
 }
 

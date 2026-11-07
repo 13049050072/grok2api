@@ -44,7 +44,20 @@ const (
 	// An empty stream that idles while held is treated as an account-quality
 	// failure: the request can still rotate before any bytes reach the client.
 	qualityIdleAccountCooldown = 15 * time.Minute
+	// HoldTimeout is a soft deadline: undecided streams keep being held after
+	// it. qualityHoldHardLimitMax bounds that extension for every hold and
+	// stays below nginx's default 60s proxy_read_timeout, because no response
+	// headers are sent while a stream is held.
+	qualityHoldHardLimitMax = 50 * time.Second
 )
+
+// qualityHoldHardLimit leaves room for the cipher-only visible flush window
+// after the soft timeout, without ever holding a stream past
+// qualityHoldHardLimitMax.
+func qualityHoldHardLimit(holdTimeout time.Duration) time.Duration {
+	limit := max(2*holdTimeout, holdTimeout+time.Duration(defaultFakeEncFlushMS)*time.Millisecond)
+	return min(limit, qualityHoldHardLimitMax)
+}
 
 var (
 	errQualityDegraded    = errors.New("上游响应缺少推理")

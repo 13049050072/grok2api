@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
@@ -41,6 +42,7 @@ func ConvertResponseStreamWithOptions(source io.ReadCloser, operation string, op
 	reader, writer := io.Pipe()
 	stream := newStreamPipeReadCloser(reader, source)
 	go func() {
+		defer provider.RecoverStreamPanic(writer, nil, "conversation_"+operation)
 		defer stream.closeSource()
 		converter := newStreamConverter(writer, operation, options)
 		err := consumeSSE(source, converter.handle)
@@ -134,8 +136,11 @@ func (r *streamPipeReadCloser) closeSource() error {
 }
 
 type streamTool struct {
-	Index     int
+	Index int
+	// ID is the downstream identifier (toolu_* in Messages mode); CallID is
+	// the upstream call_id, which terminal envelopes are matched against.
 	ID        string
+	CallID    string
 	Name      string
 	Arguments string
 	SentArgs  bool
@@ -923,7 +928,7 @@ func (c *streamConverter) matchUnclaimedTool(item responseItem, claimed map[stri
 			continue
 		}
 		tool, ok := c.tools[key]
-		if !ok || tool.ID != "" {
+		if !ok || tool.CallID != "" {
 			continue
 		}
 		pending := !tool.SentArgs && !tool.Closed
@@ -962,7 +967,7 @@ func (c *streamConverter) existingToolKey(item responseItem) string {
 			return "call:" + callID
 		}
 		for key, tool := range c.tools {
-			if tool.ID == callID {
+			if tool.CallID == callID {
 				return key
 			}
 		}
@@ -1234,6 +1239,7 @@ func guardResponseStream(source io.ReadCloser) io.ReadCloser {
 	reader, writer := io.Pipe()
 	stream := newStreamPipeReadCloser(reader, source)
 	go func() {
+		defer provider.RecoverStreamPanic(writer, nil, "conversation_responses")
 		defer stream.closeSource()
 		tracker := streamRepeatTracker{}
 		err := consumeSSE(io.TeeReader(source, writer), func(event string, data []byte) error {

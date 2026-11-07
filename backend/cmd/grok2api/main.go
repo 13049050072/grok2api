@@ -12,6 +12,8 @@ package main
 import (
 	"fmt"
 	"os"
+	// 内嵌 IANA 时区库，非 Docker 或 Windows 主机缺少 tzdata 时仪表盘时区参数仍可解析。
+	_ "time/tzdata"
 
 	"github.com/chenyme/grok2api/backend/internal/cli"
 )

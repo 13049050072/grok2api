@@ -4,10 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
-	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -18,6 +15,8 @@ import (
 const (
 	autoAssignmentMigrationCooldown = 5 * time.Minute
 	maxAutomaticReassignments       = 200
+	assignmentLockKey               = "egress:auto-assignment"
+	assignmentLockTTL               = 5 * time.Minute
 )
 
 type RebalanceResult struct {
@@ -172,17 +171,28 @@ func (s *Service) rebalanceProvider(ctx context.Context, provider accountdomain.
 		}
 	}
 
-	updates := make(map[uint64][]uint64)
+	type bindingMove struct{ from, to uint64 }
+	updates := make(map[bindingMove][]uint64)
 	for _, credential := range accounts {
 		target := assignment[credential.ID]
 		if target == 0 || target == original[credential.ID] {
 			continue
 		}
-		updates[target] = append(updates[target], credential.ID)
+		move := bindingMove{from: original[credential.ID], to: target}
+		updates[move] = append(updates[move], credential.ID)
 	}
-	for nodeID, ids := range updates {
-		if _, err := s.accounts.UpdateEgressBindings(ctx, provider, ids, &nodeID, accountdomain.EgressAssignmentAuto, now); err != nil {
+	for move, ids := range updates {
+		applied, err := s.accounts.MoveAutoEgressBindings(ctx, provider, ids, move.from, move.to, now)
+		if err != nil {
 			return result, err
+		}
+		// Rows changed since the snapshot (for example a manual binding) are
+		// skipped by the repository and must not be reported as moved.
+		skipped := len(ids) - int(applied)
+		if move.from == 0 {
+			result.Assigned -= skipped
+		} else {
+			result.Rebalanced -= skipped
 		}
 	}
 	return result, nil
@@ -255,27 +265,8 @@ func (s *Service) autoAssignBounds() (nodeShare, migrationShare float64) {
 		return 0, 0
 	}
 	s.mu.RLock()
-	configuredNode, configuredMigration := s.autoAssignMaxNodeShare, s.autoAssignMaxMigrationShare
-	s.mu.RUnlock()
-	return resolveAutoAssignShare("GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE", configuredNode),
-		resolveAutoAssignShare("GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE", configuredMigration)
-}
-
-func resolveAutoAssignShare(envName string, configured float64) float64 {
-	if raw, ok := os.LookupEnv(envName); ok {
-		if parsed, valid := parseAutoAssignShare(raw); valid {
-			return parsed
-		}
-	}
-	return normalizeAutoAssignShare(configured)
-}
-
-func parseAutoAssignShare(raw string) (float64, bool) {
-	value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil || !validAutoAssignShare(value) {
-		return 0, false
-	}
-	return value, true
+	defer s.mu.RUnlock()
+	return s.autoAssignMaxNodeShare, s.autoAssignMaxMigrationShare
 }
 
 func normalizeAutoAssignShare(value float64) float64 {
@@ -448,7 +439,7 @@ func (s *Service) RunMaintenance(ctx context.Context) error {
 		}
 		s.mu.Unlock()
 		if due {
-			_, balanceErr := s.RebalanceAccounts(ctx, config.AutoAssignEnabled, config.AutoBalanceEnabled, time.Duration(config.ProbeIntervalSeconds)*time.Second)
+			balanceErr := s.rebalanceExclusively(ctx, config)
 			s.mu.Lock()
 			s.assignmentRunning = false
 			if balanceErr == nil {
@@ -461,4 +452,26 @@ func (s *Service) RunMaintenance(ctx context.Context) error {
 		}
 	}
 	return resultErr
+}
+
+// rebalanceExclusively keeps replicas from planning moves off the same account
+// snapshot. When another replica holds the lock this cycle counts as done.
+func (s *Service) rebalanceExclusively(ctx context.Context, config domain.OperationsConfig) error {
+	s.mu.RLock()
+	lock := s.assignmentLock
+	s.mu.RUnlock()
+	if lock != nil {
+		release, acquired, err := lock.Acquire(ctx, assignmentLockKey, assignmentLockTTL)
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			return nil
+		}
+		if release != nil {
+			defer release()
+		}
+	}
+	_, err := s.RebalanceAccounts(ctx, config.AutoAssignEnabled, config.AutoBalanceEnabled, time.Duration(config.ProbeIntervalSeconds)*time.Second)
+	return err
 }

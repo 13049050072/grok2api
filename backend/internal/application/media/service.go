@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -330,22 +331,26 @@ func (s *Service) AdminDeleteImages(ctx context.Context, ids []string) (int, err
 	}
 
 	deleted := 0
+	var deleteErr error
 	for _, asset := range assets {
-		if err := s.objects.Delete(ctx, asset.StorageKey); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return deleted, err
-		}
+		// 先删元数据：对象删除失败只留下不可达文件，反之会留下指向缺失对象的元数据。
 		if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil {
 			if errors.Is(err, repository.ErrNotFound) {
 				continue
 			}
-			return deleted, err
+			deleteErr = err
+			break
 		}
 		deleted++
+		if err := s.objects.Delete(ctx, asset.StorageKey); err != nil && !errors.Is(err, os.ErrNotExist) {
+			deleteErr = err
+			break
+		}
 	}
 	if total, err := s.assets.TotalMediaAssetBytes(ctx); err == nil {
 		s.totalBytes.Store(total)
 	}
-	return deleted, nil
+	return deleted, deleteErr
 }
 
 // AdminVideoStats 返回视频任务统计信息。
@@ -593,10 +598,14 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 				continue
 			}
 			if err := s.objects.Delete(ctx, asset.StorageKey); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return deleted, fmt.Errorf("媒体对象缺失，已保留共享元数据: %s: %w", asset.StorageKey, err)
+				if !errors.Is(err, os.ErrNotExist) {
+					return deleted, err
 				}
-				return deleted, err
+				// 卷被卸载时所有对象都会表现为缺失；只有存储能证明卷仍在，才把这条元数据当作孤儿删除。
+				if healthErr := s.checkObjectStorageHealthy(ctx); healthErr != nil {
+					return deleted, fmt.Errorf("媒体对象缺失且存储健康检查失败，已保留共享元数据: %s: %w", asset.StorageKey, errors.Join(err, healthErr))
+				}
+				slog.Warn("media_orphan_metadata_removed", "asset_id", asset.ID, "storage_key", asset.StorageKey)
 			}
 			if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil && !errors.Is(err, repository.ErrNotFound) {
 				return deleted, err
@@ -618,6 +627,19 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 	}
 	s.totalBytes.Store(total)
 	return deleted, nil
+}
+
+// objectStorageHealthChecker 由能确认媒体卷仍然挂载的对象存储实现。
+type objectStorageHealthChecker interface {
+	CheckHealthy(ctx context.Context) error
+}
+
+func (s *Service) checkObjectStorageHealthy(ctx context.Context) error {
+	checker, ok := s.objects.(objectStorageHealthChecker)
+	if !ok {
+		return errors.New("媒体存储不支持健康检查")
+	}
+	return checker.CheckHealthy(ctx)
 }
 
 func (s *Service) runtimeConfig() Config {

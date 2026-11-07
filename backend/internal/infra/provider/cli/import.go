@@ -20,6 +20,7 @@ const (
 	credentialImportProvider     = "grok_build"
 	maxCredentialImportAccounts  = 10000
 	maxImportedRefreshTokenBytes = 16 << 10
+	maxImportedTextFieldBytes    = 255
 )
 
 type credentialImportDocument struct {
@@ -42,6 +43,9 @@ type importedCredentialEntry struct {
 	UserID       string `json:"user_id"`
 	PrincipalID  string `json:"principal_id"`
 	TeamID       string `json:"team_id"`
+	// sourceIdentity keeps plain-text lines keyed by refresh token: lines sharing an
+	// email may belong to different teams and must not be merged before the exchange.
+	sourceIdentity string
 }
 
 func marshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
@@ -99,41 +103,35 @@ func parseImportedCredentialEntries(data []byte) ([]importedCredentialEntry, err
 	}
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed != "" && !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
-		return parsePlainTextRefreshTokens(trimmed)
+		// The untrimmed text is parsed because a leading TAB marks an exported account without email.
+		return parsePlainTextRefreshTokens(string(data))
 	}
 	return nil, sequenceErr
 }
 
-// parsePlainTextRefreshTokens accepts one refresh token per line. The optional
-// rt= and refresh_token= prefixes make common exports directly importable.
+// parsePlainTextRefreshTokens accepts one refresh token per line, or the TXT
+// export layout "email<TAB>refresh_token[<TAB>client_id]" where email may be
+// empty. The optional rt= and refresh_token= prefixes make common exports
+// directly importable.
 func parsePlainTextRefreshTokens(value string) ([]importedCredentialEntry, error) {
 	scanner := bufio.NewScanner(strings.NewReader(value))
 	scanner.Buffer(make([]byte, 64*1024), maxImportedRefreshTokenBytes+1)
 	entries := make([]importedCredentialEntry, 0)
+	lineNumber := 0
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		lineNumber++
+		line := strings.TrimRightFunc(scanner.Text(), unicode.IsSpace)
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		if key, token, ok := strings.Cut(line, "="); ok {
-			switch strings.ToLower(strings.TrimSpace(key)) {
-			case "rt", "refresh_token":
-				line = strings.TrimSpace(token)
-			}
-		}
-		if line == "" {
-			return nil, fmt.Errorf("refresh token 不能为空")
-		}
-		if len(line) > maxImportedRefreshTokenBytes {
-			return nil, fmt.Errorf("refresh token 长度不能超过 %d 字节", maxImportedRefreshTokenBytes)
-		}
-		if strings.IndexFunc(line, unicode.IsSpace) >= 0 {
-			return nil, fmt.Errorf("refresh token 不能包含空白字符")
+		entry, err := parsePlainTextCredentialLine(line)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 行: %w", lineNumber, err)
 		}
 		if len(entries) >= maxCredentialImportAccounts {
 			return nil, fmt.Errorf("%w: 单次最多导入 %d 个账号", provider.ErrCredentialLimit, maxCredentialImportAccounts)
 		}
-		entries = append(entries, importedCredentialEntry{Provider: credentialImportProvider, RefreshToken: line})
+		entries = append(entries, entry)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("读取 refresh token 文本: %w", err)
@@ -142,6 +140,46 @@ func parsePlainTextRefreshTokens(value string) ([]importedCredentialEntry, error
 		return nil, fmt.Errorf("文本中没有 refresh token")
 	}
 	return entries, nil
+}
+
+func parsePlainTextCredentialLine(line string) (importedCredentialEntry, error) {
+	fields := strings.Split(line, "\t")
+	if len(fields) > 3 {
+		return importedCredentialEntry{}, fmt.Errorf("每行只能是 refresh token，或「邮箱<TAB>refresh token<TAB>client id（可选）」")
+	}
+	var email, clientID string
+	token := fields[0]
+	if len(fields) > 1 {
+		email, token = strings.TrimSpace(fields[0]), fields[1]
+	}
+	if len(fields) > 2 {
+		clientID = strings.TrimSpace(fields[2])
+	}
+	token = strings.TrimSpace(token)
+	if key, value, ok := strings.Cut(token, "="); ok {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "rt", "refresh_token":
+			token = strings.TrimSpace(value)
+		}
+	}
+	if token == "" {
+		return importedCredentialEntry{}, fmt.Errorf("refresh token 不能为空")
+	}
+	if len(token) > maxImportedRefreshTokenBytes {
+		return importedCredentialEntry{}, fmt.Errorf("refresh token 长度不能超过 %d 字节", maxImportedRefreshTokenBytes)
+	}
+	if strings.IndexFunc(token, unicode.IsSpace) >= 0 {
+		return importedCredentialEntry{}, fmt.Errorf("refresh token 不能包含空白字符")
+	}
+	for _, field := range []struct{ name, value string }{{"邮箱", email}, {"client id", clientID}} {
+		if len(field.value) > maxImportedTextFieldBytes {
+			return importedCredentialEntry{}, fmt.Errorf("%s长度不能超过 %d 字节", field.name, maxImportedTextFieldBytes)
+		}
+		if strings.IndexFunc(field.value, unicode.IsSpace) >= 0 {
+			return importedCredentialEntry{}, fmt.Errorf("%s不能包含空白字符", field.name)
+		}
+	}
+	return importedCredentialEntry{Provider: credentialImportProvider, Email: email, ClientID: clientID, RefreshToken: token, sourceIdentity: token}, nil
 }
 
 func parseImportedCredentialJSONSequence(data []byte) ([]importedCredentialEntry, error) {
@@ -271,7 +309,7 @@ func normalizeImportedCredential(entry importedCredentialEntry) (provider.Creden
 		return provider.CredentialSeed{}, err
 	}
 	clientID := firstNonEmpty(entry.ClientID, defaultOAuthClientID)
-	identity := firstNonEmpty(userID, strings.ToLower(email), teamID, refreshToken, accessToken)
+	identity := firstNonEmpty(entry.sourceIdentity, userID, strings.ToLower(email), teamID, refreshToken, accessToken)
 	sourceKey := "import:" + security.HashToken(strings.Join([]string{providerName, clientID, identity}, "|"))
 
 	return provider.CredentialSeed{

@@ -46,9 +46,11 @@ type LedgerConfig struct {
 }
 
 type LedgerSnapshot struct {
-	Mode                LedgerMode
-	Ready               bool
-	Irrecoverable       bool
+	Mode  LedgerMode
+	Ready bool
+	// LossActive reports a dropped record whose recovery window has not
+	// elapsed yet. Dropped stays cumulative for the process lifetime.
+	LossActive          bool
 	QueueDepth          int
 	QueueCapacity       int
 	ConsecutiveFailures int
@@ -73,6 +75,7 @@ const (
 	auditWriteAttempts       = 3
 	auditWriteRetryBase      = 250 * time.Millisecond
 	auditWriteRetryMax       = 5 * time.Second
+	auditShutdownRetryRounds = 2
 	auditDefaultCommitDelay  = 5 * time.Millisecond
 	auditSummaryTTL          = 10 * time.Second
 	requestMethodLimit       = 16
@@ -83,6 +86,12 @@ const (
 	requestHeaderCountLimit  = 128
 	requestHeadersLimit      = 32 << 10
 )
+
+// ledgerLossRecoveryMin is the floor of the loss recovery window
+// max(UnhealthyGrace, ledgerLossRecoveryMin): after a drop, enforce mode
+// resumes only once a batch was persisted and no further drop happened for
+// that long.
+const ledgerLossRecoveryMin = time.Minute
 
 type auditWriteRequest struct {
 	record auditdomain.Record
@@ -117,6 +126,8 @@ type Service struct {
 	ledgerLastSuccess    time.Time
 	ledgerLastFailure    time.Time
 	ledgerLastDrop       time.Time
+	ledgerLossActive     bool
+	ledgerWroteSinceDrop bool
 	ledgerQueueHighSince time.Time
 	ledgerLastWarning    time.Time
 	observerMu           sync.RWMutex
@@ -190,16 +201,15 @@ func (s *Service) LedgerSnapshot() LedgerSnapshot {
 
 	s.ledgerMu.Lock()
 	s.updateQueuePressureLocked(now, queueDepth, queueCapacity)
-	dropped := s.dropped.Load()
-	ready := dropped == 0 && s.ledgerReadyLocked(now)
+	s.refreshLedgerLossLocked(now)
 	snapshot := LedgerSnapshot{
 		Mode:                s.ledgerConfig.Mode,
-		Ready:               ready,
-		Irrecoverable:       dropped > 0,
+		Ready:               !s.ledgerLossActive && s.ledgerReadyLocked(now),
+		LossActive:          s.ledgerLossActive,
 		QueueDepth:          queueDepth,
 		QueueCapacity:       queueCapacity,
 		ConsecutiveFailures: s.ledgerFailures,
-		Dropped:             dropped,
+		Dropped:             s.dropped.Load(),
 		LastSuccessAt:       s.ledgerLastSuccess,
 		LastFailureAt:       s.ledgerLastFailure,
 		UnhealthySince:      s.ledgerUnhealthySince,
@@ -211,14 +221,11 @@ func (s *Service) LedgerSnapshot() LedgerSnapshot {
 	return snapshot
 }
 
-// CheckLedgerReady always blocks after confirmed data loss. Observe mode only
-// permits traffic while a recoverable writer or queue degradation is active.
+// CheckLedgerReady blocks only in enforce mode, while the writer is degraded or
+// a drop is still inside its recovery window. Observe mode only reports.
 func (s *Service) CheckLedgerReady() error {
 	snapshot := s.LedgerSnapshot()
-	if snapshot.Ready && !snapshot.Irrecoverable {
-		return nil
-	}
-	if !snapshot.Irrecoverable && snapshot.Mode != LedgerModeEnforce {
+	if snapshot.Ready || snapshot.Mode != LedgerModeEnforce {
 		return nil
 	}
 	return ErrLedgerUnavailable
@@ -442,7 +449,7 @@ func (s *Service) notifyQueueSpace() {
 
 func (s *Service) recordEnqueueDrop(request auditWriteRequest, reason string) {
 	dropped := s.dropped.Add(1)
-	s.recordLedgerDrop()
+	s.recordLedgerDrop(false)
 	perfmetrics.Default.Inc("audit_records_total", perfmetrics.Labels{Subsystem: "audit", Operation: string(request.record.Operation), Stage: "enqueue", Outcome: "dropped"})
 	if dropped == 1 || dropped%1000 == 0 {
 		s.logger.Warn("audit_queue_full", "reason", reason, "dropped", dropped)
@@ -843,6 +850,7 @@ func (s *Service) persistBatch(requests []auditWriteRequest) {
 	pending := append([]auditWriteRequest(nil), requests...)
 	retryDelay := auditWriteRetryBase
 	retryRound := 0
+	stoppedRounds := 0
 	for len(pending) > 0 {
 		lastErr := s.persistAuditRequests(pending)
 		var invalid *repository.InvalidBatchRecordError
@@ -863,6 +871,13 @@ func (s *Service) persistBatch(requests []auditWriteRequest) {
 			completeAuditWrites(pending, nil)
 			return
 		}
+		if s.stopped.Load() {
+			stoppedRounds++
+			if stoppedRounds >= auditShutdownRetryRounds {
+				s.abandonAuditWrites(pending, lastErr)
+				return
+			}
+		}
 		perfmetrics.Default.Add("audit_batch_size", perfmetrics.Labels{Subsystem: "audit", Stage: "batch", Outcome: "retry"}, int64(len(pending)))
 		retryRound++
 		var panicErr *batch.PanicError
@@ -874,9 +889,28 @@ func (s *Service) persistBatch(requests []auditWriteRequest) {
 			s.logger.Debug("audit_batch_write_retrying", "count", len(pending), "attempts", auditWriteAttempts, "retry_in", retryDelay, "error", lastErr)
 		}
 		timer := time.NewTimer(retryDelay)
-		<-timer.C
+		select {
+		case <-s.stop:
+			timer.Stop()
+		case <-timer.C:
+		}
 		retryDelay = min(retryDelay*2, auditWriteRetryMax)
 	}
+}
+
+// abandonAuditWrites ends retries after auditShutdownRetryRounds failed rounds
+// during shutdown: retrying forever would hang Close, so the batch is
+// acknowledged as failed and counted as dropped like any other record that
+// never reached the ledger.
+func (s *Service) abandonAuditWrites(requests []auditWriteRequest, err error) {
+	completeAuditWrites(requests, err)
+	for _, request := range requests {
+		s.dropped.Add(1)
+		s.recordLedgerDrop(false)
+		perfmetrics.Default.Inc("audit_records_total", perfmetrics.Labels{Subsystem: "audit", Operation: string(request.record.Operation), Stage: "batch", Outcome: "abandoned"})
+		s.notifyDropped(request.record.EventID)
+	}
+	s.logger.Error("audit_batch_abandoned_on_shutdown", "count", len(requests), "dropped", s.dropped.Load(), "error", err)
 }
 
 func (s *Service) persistAuditRequests(requests []auditWriteRequest) error {
@@ -915,7 +949,7 @@ func auditRecords(requests []auditWriteRequest) []auditdomain.Record {
 
 func (s *Service) recordRejectedAudit(request auditWriteRequest, err error) {
 	dropped := s.dropped.Add(1)
-	s.recordLedgerDrop()
+	s.recordLedgerDrop(true)
 	perfmetrics.Default.Inc("audit_records_total", perfmetrics.Labels{Subsystem: "audit", Operation: string(request.record.Operation), Stage: "batch", Outcome: "rejected"})
 	s.logger.Error("audit_record_rejected", "event_id", request.record.EventID, "dropped", dropped, "error", err)
 	s.notifyDropped(request.record.EventID)
@@ -938,7 +972,9 @@ func (s *Service) recordLedgerSuccess() {
 	s.ledgerMu.Lock()
 	s.ledgerFailures = 0
 	s.ledgerLastSuccess = now
-	if s.dropped.Load() == 0 && s.ledgerQueueHighSince.IsZero() {
+	s.ledgerWroteSinceDrop = true
+	s.refreshLedgerLossLocked(now)
+	if !s.ledgerLossActive && s.ledgerQueueHighSince.IsZero() {
 		s.ledgerUnhealthySince = time.Time{}
 	}
 	s.ledgerMu.Unlock()
@@ -956,10 +992,16 @@ func (s *Service) recordLedgerFailure() {
 	s.ledgerMu.Unlock()
 }
 
-func (s *Service) recordLedgerDrop() {
+// recordLedgerDrop starts a loss recovery window. A record rejected by
+// validation is not writer trouble, so a writer that is not failing already
+// counts as healthy: enforce mode rejects new traffic before it writes audits,
+// and an idle instance would otherwise never produce the later batch.
+func (s *Service) recordLedgerDrop(rejected bool) {
 	now := s.now().UTC()
 	s.ledgerMu.Lock()
 	s.ledgerLastDrop = now
+	s.ledgerLossActive = true
+	s.ledgerWroteSinceDrop = rejected && s.ledgerFailures == 0
 	if s.ledgerUnhealthySince.IsZero() {
 		s.ledgerUnhealthySince = now
 	}
@@ -971,7 +1013,7 @@ func (s *Service) updateQueuePressureLocked(now time.Time, depth, capacity int) 
 	if capacity <= 0 || depth*100 < capacity*s.ledgerConfig.QueueHighWatermarkPercent {
 		wasHigh := !s.ledgerQueueHighSince.IsZero()
 		s.ledgerQueueHighSince = time.Time{}
-		if wasHigh && s.ledgerFailures == 0 && s.dropped.Load() == 0 {
+		if wasHigh && s.ledgerFailures == 0 && !s.ledgerLossActive {
 			s.ledgerUnhealthySince = time.Time{}
 		}
 		return
@@ -981,6 +1023,18 @@ func (s *Service) updateQueuePressureLocked(now time.Time, depth, capacity int) 
 	}
 	if s.ledgerUnhealthySince.IsZero() {
 		s.ledgerUnhealthySince = s.ledgerQueueHighSince
+	}
+}
+
+// refreshLedgerLossLocked clears a drop once a later batch was persisted and
+// the recovery window passed without another drop.
+func (s *Service) refreshLedgerLossLocked(now time.Time) {
+	if !s.ledgerLossActive || !s.ledgerWroteSinceDrop || now.Sub(s.ledgerLastDrop) < max(s.ledgerConfig.UnhealthyGrace, ledgerLossRecoveryMin) {
+		return
+	}
+	s.ledgerLossActive = false
+	if s.ledgerFailures == 0 && s.ledgerQueueHighSince.IsZero() {
+		s.ledgerUnhealthySince = time.Time{}
 	}
 }
 

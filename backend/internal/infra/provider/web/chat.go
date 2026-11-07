@@ -39,6 +39,8 @@ const (
 	maxTrackedAnnotations     = 2048
 )
 
+const webChatUsageLimitMessage = "Grok Web 账号用量已达上限，请稍后重试"
+
 var (
 	errWebAntiBot    = errors.New("Grok Web anti-bot rejection")
 	errWebUsageLimit = errors.New("Grok Web usage limit reached")
@@ -327,6 +329,10 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				a.feedbackAntiBot(ctx, lease, statsigTarget)
 				return antiBotProviderResponse(), nil
 			}
+			if errors.Is(preflightErr, errWebUsageLimit) {
+				return usageLimitProviderResponse(webChatUsageLimitMessage), nil
+			}
+			a.reportUpstreamFailure(ctx, lease.NodeID, preflightErr)
 			return nil, preflightErr
 		}
 
@@ -342,7 +348,10 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				a.feedbackAntiBot(ctx, lease, statsigTarget)
 				return antiBotProviderResponse(), nil
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, consumeErr)
+			if errors.Is(consumeErr, errWebUsageLimit) {
+				return usageLimitProviderResponse(webChatUsageLimitMessage), nil
+			}
+			a.reportUpstreamFailure(ctx, lease.NodeID, consumeErr)
 			return nil, consumeErr
 		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
@@ -380,9 +389,16 @@ func (a *Adapter) feedbackAntiBot(ctx context.Context, lease *infraegress.Lease,
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusForbidden, nil)
 }
 
+// preflightUpstream holds the response back until the first frame that shows
+// whether the turn was accepted, so account-level rejections can still be
+// answered with a status code instead of a broken 200 stream.
 func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 	reader := bufio.NewReaderSize(source, 64<<10)
 	var prefetched bytes.Buffer
+	stream := func() io.ReadCloser {
+		return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}
+	}
+	lifecycleSeen := false
 	for prefetched.Len() <= 1<<20 {
 		line, err := reader.ReadString('\n')
 		if line != "" {
@@ -398,13 +414,28 @@ func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 						return nil, webResponseError(errorValue)
 					}
 					if event, ok := root["event"].(map[string]any); ok {
-						if event["type"] == "error" {
+						switch typeName, _ := event["type"].(string); {
+						case typeName == "session.created" || typeName == "conversation.attached":
+							// The turn is only sent after these, so a quota or anti-bot
+							// rejection of it arrives on a later frame.
+							lifecycleSeen = true
+						case typeName == "error" && !lifecycleSeen:
 							return nil, gatewayEventError(event)
+						default:
+							if rejection := accountRejection(gatewayFrameError(event)); rejection != nil {
+								return nil, rejection
+							}
+							return stream(), nil
 						}
-						return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
-					}
-					if result, ok := root["result"].(map[string]any); ok && (result["conversation"] != nil || result["response"] != nil) {
-						return &readerCloser{Reader: io.MultiReader(bytes.NewReader(prefetched.Bytes()), reader), closer: source}, nil
+					} else if result, ok := root["result"].(map[string]any); ok && (result["conversation"] != nil || result["response"] != nil) {
+						if response, _ := result["response"].(map[string]any); response != nil {
+							if errorValue, ok := response["error"].(map[string]any); ok {
+								if rejection := accountRejection(webResponseError(errorValue)); rejection != nil {
+									return nil, rejection
+								}
+							}
+						}
+						return stream(), nil
 					}
 				}
 			}
@@ -416,7 +447,7 @@ func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("Grok Web 首个流事件超过安全检查上限")
+	return nil, provider.NewUpstreamBusinessError(fmt.Errorf("Grok Web 首个流事件超过安全检查上限"))
 }
 
 func (a *Adapter) openChat(ctx context.Context, credential account.Credential, previousResponseID string, spec ModelSpec, input normalizedChatInput, options gatewayOpenOptions) (*http.Response, *infraegress.Lease, *inferencedomain.WebResponseState, string, error) {
@@ -445,6 +476,7 @@ func (a *Adapter) handleResponseResource(ctx context.Context, request provider.R
 func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser, lease *infraegress.Lease, credential account.Credential, responseID, model, operation, prompt string, previous *inferencedomain.WebResponseState, tools toolConfiguration, parallelTools bool, options conversation.ResponseOptions) io.ReadCloser {
 	reader, writer := io.Pipe()
 	go func() {
+		defer provider.RecoverStreamPanic(writer, a.log(), "web_chat")
 		defer source.Close()
 		defer lease.Release()
 		parsed := &parsedChat{
@@ -575,7 +607,7 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 			return flushSideChannel()
 		})
 		if err != nil {
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+			a.reportUpstreamFailure(ctx, lease.NodeID, err)
 			_ = writer.CloseWithError(err)
 			return
 		}
@@ -972,7 +1004,7 @@ func consumeJSONObjects(source io.Reader, maxObjectBytes int, consume func([]byt
 		}
 		frame = append(frame, value)
 		if len(frame) > maxObjectBytes {
-			return fmt.Errorf("Grok Web 单个响应帧超过 %d MiB", maxObjectBytes>>20)
+			return provider.NewUpstreamBusinessError(fmt.Errorf("Grok Web 单个响应帧超过 %d MiB", maxObjectBytes>>20))
 		}
 		if inString {
 			if escaped {
@@ -1123,7 +1155,7 @@ func modelResponseStreamError(modelResponse map[string]any) error {
 		switch value := raw.(type) {
 		case string:
 			if message := strings.TrimSpace(value); message != "" {
-				return errors.New(message)
+				return webResponseError(map[string]any{"message": message})
 			}
 		case map[string]any:
 			if nested, _ := value["error"].(map[string]any); nested != nil {
@@ -1137,6 +1169,9 @@ func modelResponseStreamError(modelResponse map[string]any) error {
 	return nil
 }
 
+// webResponseError classifies an error reported inside a well-formed upstream
+// frame. Anti-bot rejections stay unwrapped because they are egress-session
+// signals; everything else is an upstream business error.
 func webResponseError(value map[string]any) error {
 	message, _ := value["message"].(string)
 	if message == "" {
@@ -1148,9 +1183,9 @@ func webResponseError(value map[string]any) error {
 	}
 	normalized := strings.ToLower(message)
 	if strings.Contains(normalized, "usage limit") || strings.Contains(normalized, "usage quota") {
-		return fmt.Errorf("%w: %s", errWebUsageLimit, message)
+		return provider.NewUpstreamBusinessError(fmt.Errorf("%w: %s", errWebUsageLimit, message))
 	}
-	return errors.New(message)
+	return provider.NewUpstreamBusinessError(errors.New(message))
 }
 
 func antiBotProviderResponse() *provider.Response {
@@ -1158,6 +1193,35 @@ func antiBotProviderResponse() *provider.Response {
 		"message": "Grok Web 出口会话被上游反机器人规则拒绝，请检查代理、User-Agent 与 Cloudflare Cookie 是否来自同一浏览器会话",
 		"type":    "upstream_error", "code": "anti_bot_rejected",
 	}})
+}
+
+// accountRejection keeps only errors that ForwardResponse answers with a
+// status code (anti-bot 403, usage limit 429); other upstream errors stay in
+// the stream as before.
+func accountRejection(err error) error {
+	if errors.Is(err, errWebAntiBot) || errors.Is(err, errWebUsageLimit) {
+		return err
+	}
+	return nil
+}
+
+func usageLimitProviderResponse(message string) *provider.Response {
+	return jsonProviderResponse(http.StatusTooManyRequests, map[string]any{"error": map[string]any{
+		"message": message, "type": "rate_limit_error", "code": "usage_limit_reached",
+	}})
+}
+
+// reportUpstreamFailure feeds a failed upstream exchange back to the egress
+// node: anti-bot rejections as 403, genuine transport failures as failures,
+// and nothing for client cancellations or upstream business errors.
+func (a *Adapter) reportUpstreamFailure(ctx context.Context, nodeID uint64, err error) {
+	if errors.Is(err, errWebAntiBot) {
+		a.egress.Feedback(context.WithoutCancel(ctx), nodeID, http.StatusForbidden, nil)
+		return
+	}
+	if provider.ShouldReportEgressFailure(ctx, err) {
+		a.egress.Feedback(context.WithoutCancel(ctx), nodeID, 0, err)
+	}
 }
 
 func collectModelResponseImages(parsed *parsedChat, modelResponse map[string]any) string {

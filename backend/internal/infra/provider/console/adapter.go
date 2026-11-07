@@ -101,6 +101,14 @@ func (a *Adapter) config() Config {
 	return a.cfg
 }
 
+// reportRequestFailure records a failed Console exchange against the egress
+// node, except when the caller went away or the failure is not the node's.
+func (a *Adapter) reportRequestFailure(ctx context.Context, nodeID uint64, err error) {
+	if provider.ShouldReportEgressFailure(ctx, err) {
+		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, nodeID, 0, err)
+	}
+}
+
 func (a *Adapter) ModelAliases() []provider.ModelAlias { return Aliases() }
 
 func (a *Adapter) QuotaMode(upstreamModel string) string {
@@ -187,7 +195,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	}
 	response, err := a.doDPoPRequest(requestCtx, request.Credential, token, lease, http.MethodPost, consoleEndpoint(cfg.BaseURL), body, "*/*")
 	if err != nil {
-		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
+		a.reportRequestFailure(ctx, lease.NodeID, err)
 		lease.Release()
 		cancel()
 		return nil, err

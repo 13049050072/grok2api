@@ -81,3 +81,26 @@ func TestLocalStoreRetriesTemporaryCleanupWithoutDeletingCommittedImage(t *testi
 		t.Fatalf("temporary files were not cleaned: %#v", temporaryFiles)
 	}
 }
+
+func TestLocalStoreHealthFollowsVolumeMarker(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "media")
+	store, err := NewLocalStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckHealthy(context.Background()); err != nil {
+		t.Fatalf("fresh store health = %v", err)
+	}
+	if _, err := NewLocalStore(root); err != nil {
+		t.Fatalf("reopen with existing marker: %v", err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckHealthy(context.Background()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("health after volume swap = %v", err)
+	}
+}

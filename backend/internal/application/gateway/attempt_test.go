@@ -308,6 +308,45 @@ func TestFailureAttemptRecorderCapturesRecoveredTransportCall(t *testing.T) {
 	}
 }
 
+type failingDiagnosticBody struct {
+	reader io.Reader
+	err    error
+	closed bool
+}
+
+func (b *failingDiagnosticBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	if err == io.EOF {
+		return n, b.err
+	}
+	return n, err
+}
+
+func (b *failingDiagnosticBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestFailureAttemptRecorderClosesBodyOnDiagnosticReadError(t *testing.T) {
+	readErr := errors.New("connection reset by peer")
+	source := &failingDiagnosticBody{reader: strings.NewReader("partial upstream failure"), err: readErr}
+	recorder := newFailureAttemptRecorder(http.MethodPost, "/responses")
+	response := &provider.Response{StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway", Body: source}
+	if err := recorder.captureResponse(account.Credential{ID: 9, Name: "primary"}, time.Now(), response, nil); !errors.Is(err, readErr) {
+		t.Fatalf("capture error = %v, want read error", err)
+	}
+	if !source.closed {
+		t.Fatal("upstream body was left open after the diagnostic read failed")
+	}
+	if rest, err := io.ReadAll(response.Body); err != nil || len(rest) != 0 {
+		t.Fatalf("response body after read error = %q, err = %v", rest, err)
+	}
+	stored := recorder.snapshot()
+	if len(stored) != 1 || stored[0].Stage != "response_body" || string(stored[0].ResponseBody) != "partial upstream failure" {
+		t.Fatalf("attempt = %#v", stored)
+	}
+}
+
 func TestFailureAttemptRecorderCapturesPinnedSelectionFailure(t *testing.T) {
 	recorder := newFailureAttemptRecorder(http.MethodPost, "/responses")
 	err := pinnedUnavailableError(42, "bound-account")

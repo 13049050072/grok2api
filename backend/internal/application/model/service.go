@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,11 +17,13 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/repository"
-	"golang.org/x/sync/singleflight"
 )
 
 const defaultModelSyncWorkers = 25
 const syncFailurePersistTimeout = 5 * time.Second
+
+// fullSyncTimeout 是共享全量同步的上限；同步不随调用方断开而取消。
+const fullSyncTimeout = time.Hour
 
 var maxModelBatchSize = repository.MaxPageSize * len(modeldomain.Capabilities())
 
@@ -75,7 +78,8 @@ type Service struct {
 	providers *provider.Registry
 	bulkPool  *batch.Pool
 	logger    *slog.Logger
-	syncAll   singleflight.Group
+	syncMu    sync.Mutex
+	syncRun   *fullSyncRun
 }
 
 func NewService(models repository.ModelRepository, accounts repository.AccountRepository, accountService *accountapp.Service, providers *provider.Registry) *Service {
@@ -415,18 +419,84 @@ func (s *Service) Sync(ctx context.Context) (int, error) {
 }
 
 // SyncObserved 执行全量模型同步，并按已完成账号数报告进度。
+// 并发调用共享同一次同步；同步不继承调用方的取消信号，调用方断开只结束自己的等待。
 func (s *Service) SyncObserved(ctx context.Context, observer SyncProgressObserver) (int, error) {
-	result := s.syncAll.DoChan("all", func() (any, error) {
-		return s.syncAllAccounts(ctx, observer)
-	})
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	run, unsubscribe := s.joinFullSync(ctx, observer)
+	defer unsubscribe()
 	select {
 	case <-ctx.Done():
 		return 0, ctx.Err()
-	case value := <-result:
-		if value.Err != nil {
-			return 0, value.Err
-		}
-		return value.Val.(int), nil
+	case <-run.done:
+		return run.synced, run.err
+	}
+}
+
+func (s *Service) joinFullSync(ctx context.Context, observer SyncProgressObserver) (*fullSyncRun, func()) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	run := s.syncRun
+	if run == nil {
+		run = &fullSyncRun{done: make(chan struct{}), observers: make(map[uint64]SyncProgressObserver)}
+		s.syncRun = run
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fullSyncTimeout)
+		go func() {
+			defer cancel()
+			synced, err := s.syncAllAccounts(runCtx, run.report)
+			s.syncMu.Lock()
+			s.syncRun = nil
+			s.syncMu.Unlock()
+			run.synced, run.err = synced, err
+			close(run.done)
+		}()
+	}
+	return run, run.subscribe(observer)
+}
+
+// fullSyncRun 是一次共享的全量同步，进度广播给所有仍在等待的调用方。
+type fullSyncRun struct {
+	done      chan struct{}
+	synced    int
+	err       error
+	mu        sync.Mutex
+	observers map[uint64]SyncProgressObserver
+	nextID    uint64
+	completed int
+	total     int
+}
+
+// subscribe 立即补发最近一次进度，中途加入的调用方不必等到下一个账号完成。
+func (r *fullSyncRun) subscribe(observer SyncProgressObserver) func() {
+	if observer == nil {
+		return func() {}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextID++
+	id := r.nextID
+	r.observers[id] = observer
+	if r.total > 0 {
+		observer(r.completed, r.total)
+	}
+	return func() {
+		r.mu.Lock()
+		delete(r.observers, id)
+		r.mu.Unlock()
+	}
+}
+
+// report 在锁内通知观察者以保证完成数不回退；观察者必须快速返回。
+func (r *fullSyncRun) report(completed, total int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if total == r.total && completed < r.completed {
+		return
+	}
+	r.completed, r.total = completed, total
+	for _, observer := range r.observers {
+		observer(completed, total)
 	}
 }
 
@@ -466,14 +536,14 @@ func (s *Service) syncAllAccounts(ctx context.Context, observer SyncProgressObse
 	})
 	pool := s.bulkPool.Snapshot()
 	s.logger.Info("model_bulk_sync_completed", "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", pool.Limit, "pool_active", pool.Active, "pool_queued", pool.Queued, "pool_peak", pool.Peak, "error", runErr)
-	if runErr != nil {
-		return 0, runErr
-	}
 
 	uniqueModels := make(map[account.Provider]map[string]struct{}, len(providerValues))
 	succeeded := 0
 	var lastErr error
 	for index, result := range results {
+		if !result.Completed {
+			continue
+		}
 		if result.Err != nil {
 			var panicErr *batch.PanicError
 			if errors.As(result.Err, &panicErr) {
@@ -495,12 +565,27 @@ func (s *Service) syncAllAccounts(ctx context.Context, observer SyncProgressObse
 			}
 		}
 	}
+	if runErr != nil {
+		// 已完成账号的能力快照已经写入；公开路由表只增不删，超时前发现的模型照常补齐。
+		if succeeded > 0 {
+			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), syncFailurePersistTimeout)
+			if _, err := s.upsertDiscoveredModels(writeCtx, providerValues, uniqueModels); err != nil {
+				s.logger.Warn("model_bulk_sync_partial_upsert_failed", "error", err)
+			}
+			cancel()
+		}
+		return 0, runErr
+	}
 	if succeeded == 0 {
 		if lastErr != nil {
 			return 0, lastErr
 		}
 		return 0, fmt.Errorf("没有账号成功同步模型")
 	}
+	return s.upsertDiscoveredModels(ctx, providerValues, uniqueModels)
+}
+
+func (s *Service) upsertDiscoveredModels(ctx context.Context, providerValues []account.Provider, uniqueModels map[account.Provider]map[string]struct{}) (int, error) {
 	syncedModels := 0
 	for _, providerValue := range providerValues {
 		providerModels := uniqueModels[providerValue]

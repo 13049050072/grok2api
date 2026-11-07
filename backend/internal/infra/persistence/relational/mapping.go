@@ -19,7 +19,11 @@ func toAdminDomain(value adminModel) admin.Admin {
 }
 
 func toSessionDomain(value adminSessionModel) admin.Session {
-	return admin.Session{ID: value.ID, AdminID: value.AdminID, RefreshTokenHash: value.RefreshTokenHash, ExpiresAt: value.ExpiresAt, LastUsedAt: value.LastUsedAt, CreatedAt: value.CreatedAt}
+	session := admin.Session{ID: value.ID, AdminID: value.AdminID, RefreshTokenHash: value.RefreshTokenHash, ExpiresAt: value.ExpiresAt, LastUsedAt: value.LastUsedAt, CreatedAt: value.CreatedAt}
+	if value.PreviousRefreshTokenHash != nil {
+		session.PreviousRefreshTokenHash = *value.PreviousRefreshTokenHash
+	}
+	return session
 }
 
 func toAccountDomain(value accountModel) account.Credential {

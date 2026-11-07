@@ -587,6 +587,9 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			if err != nil {
 				excluded[pinnedAccountID] = true
 				lease = nil
+				// An unavailable pin falls back to ordinary selection; a session
+				// opened by an earlier attempt must not inherit this error.
+				err = nil
 			}
 		}
 		if lease == nil {

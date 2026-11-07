@@ -141,7 +141,11 @@ type Usage struct {
 	Reported bool
 	// OutputObserved records that the transport actually forwarded generated
 	// content even when an interrupted upstream never emitted final usage.
-	OutputObserved         bool
+	OutputObserved bool
+	// ForwardedOutputBytes counts visible generated text (message, reasoning
+	// and tool-argument deltas) forwarded downstream. It is the only output
+	// evidence for billing a stream that ends before its final usage frame.
+	ForwardedOutputBytes   int64
 	InputTokens            int64
 	CachedInputTokens      int64
 	OutputTokens           int64
@@ -230,6 +234,7 @@ type Service struct {
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	responseContexts            responseContextCache
 }
 
 type teamModelRateLimit struct {
@@ -307,7 +312,7 @@ func (s *Service) shouldInvalidateBuildForbidden(failure *UpstreamFailure) bool 
 func (s *Service) markReauthRequired(ctx context.Context, requestID string, credential accountdomain.Credential, reason string) bool {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountStateWriteTimeout)
 	defer cancel()
-	if err := s.accounts.MarkReauthRequired(writeCtx, credential.ID, reason); err != nil {
+	if err := s.accounts.MarkReauthRequiredForCredential(writeCtx, credential, reason); err != nil {
 		s.logger.Error("account_reauth_required_write_failed", "request_id", requestID, "account_id", credential.ID, "provider", credential.Provider, "error", err)
 		return false
 	}
@@ -495,7 +500,10 @@ func (s *Service) UpdateRequestTimeout(value time.Duration) {
 	s.requestTimeout.Store(int64(value))
 }
 
-func (s *Service) textBillingReservationTTL() time.Duration {
+// syncBillingReservationTTL covers every request settled inside its HTTP
+// lifetime (text, image, TTS/STT). Only asynchronous video jobs keep
+// mediaBillingReservationTTL, because they finish after the request returns.
+func (s *Service) syncBillingReservationTTL() time.Duration {
 	ttl := time.Duration(s.requestTimeout.Load()) + finalizationTimeout + billingReservationCrashGrace
 	return max(minimumTextBillingReservationTTL, ttl)
 }
@@ -1029,8 +1037,12 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if err := s.checkLedgerReady(); err != nil {
 		return nil, err
 	}
-	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
-		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, s.textBillingReservationTTL()); err != nil {
+	previousContextTokens := int64(0)
+	if ownership != nil {
+		previousContextTokens = s.responseContexts.lookup(input.ClientKey.ID, input.PreviousResponseID, time.Now().UTC())
+	}
+	if reservation, priced := audit.EstimateOfficialTextReservationWithContext(pricingModel, input.Body, previousContextTokens); priced {
+		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, s.syncBillingReservationTTL()); err != nil {
 			return nil, err
 		}
 	}
@@ -1090,6 +1102,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				if usage.Reported {
 					record.UsageSource = usageSource
 				}
+				if estimatedUsage, estimated := estimateInterruptedStreamUsage(usage, response.StatusCode, errorCode, input.Body, previousContextTokens); estimated {
+					usage = estimatedUsage
+					record.UsageSource = audit.UsageSourceEstimated
+				}
 				record.AccountID = &accountID
 				record.AccountName = credential.Name
 				record.StatusCode = response.StatusCode
@@ -1142,6 +1158,8 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 					})
 					if err != nil {
 						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
+					} else {
+						s.responseContexts.remember(input.ClientKey.ID, responseID, usage.InputTokens+usage.OutputTokens, now.Add(responseOwnershipTTL))
 					}
 				}
 				if successful && lease.QuotaMode != "" {
@@ -1403,7 +1421,7 @@ attemptLoop:
 			}
 			if response.StatusCode == http.StatusUnauthorized {
 				body, _ := readRetryableBody(response.Body)
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, "Grok Build OAuth credential rejected after refresh")
+				_ = s.accounts.MarkReauthRequiredForCredential(ctx, credential, "Grok Build OAuth credential rejected after refresh")
 				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 				lease.Release()
 				lastErr = fmt.Errorf("刷新后上游仍返回 401")
@@ -1847,7 +1865,7 @@ func (s *Service) markSSOCredentialRejected(ctx context.Context, credential acco
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
 	defer cancel()
-	if err := s.accounts.MarkReauthRequired(writeCtx, credential.ID, reason); err != nil {
+	if err := s.accounts.MarkReauthRequiredForCredential(writeCtx, credential, reason); err != nil {
 		s.logger.Error("account_reauth_required_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
 	}
 	// Discard the process-local one-second candidate snapshot even if persistence fails,
@@ -1977,6 +1995,9 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	if !accountScope.AllowsProvider(ownership.Provider) {
 		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
 	}
+	if ownership.ModelRouteID != 0 && !s.clientKeys.CanUseModel(input.ClientKey, ownership.ModelRouteID) {
+		return nil, clientkeyapp.ErrModelNotAllowed
+	}
 	adapter, ok := s.providers.Responses(ownership.Provider)
 	if !ok {
 		return nil, ErrResponseAccountUnavailable
@@ -2057,7 +2078,7 @@ func (s *Service) markPermanentlyUnrefreshableCredentialRejected(ctx context.Con
 }
 
 func (s *Service) markCredentialRejectedAfterPermanentRefresh(ctx context.Context, credential accountdomain.Credential) {
-	_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
+	_ = s.accounts.MarkReauthRequiredForCredential(ctx, credential, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
 	s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 }
 

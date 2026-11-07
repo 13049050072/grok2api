@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,10 @@ const (
 	dpopRefreshSkew       = 20 * time.Second
 	maxDPoPTokenLifetime  = time.Hour
 )
+
+// defaultDPoPFetchTimeout bounds the shared token exchange when no Console
+// request timeout is configured.
+const defaultDPoPFetchTimeout = 30 * time.Second
 
 type dpopJWK struct {
 	Kty string `json:"kty"`
@@ -108,25 +113,48 @@ func (m *dpopSessionManager) get(
 	ssoToken string,
 	lease *infraegress.Lease,
 ) (dpopSession, string, error) {
-	key := dpopSessionCacheKey(adapter.config().BaseURL, credential, ssoToken, lease)
+	cfg := adapter.config()
+	key := dpopSessionCacheKey(cfg.BaseURL, credential, ssoToken, lease)
 	if session, ok := m.cached(key); ok {
 		return session, key, nil
 	}
-	value, err, _ := m.loads.Do(key, func() (any, error) {
+	// The exchange is shared by every caller coalesced on key, so it must not
+	// be canceled with whichever caller happened to start it; each caller
+	// stops waiting on its own context instead.
+	fetchTimeout := defaultDPoPFetchTimeout
+	if cfg.TimeoutSeconds > 0 {
+		fetchTimeout = time.Duration(cfg.TimeoutSeconds) * time.Second
+	}
+	loaded := m.loads.DoChan(key, func() (value any, err error) {
+		// DoChan re-raises a panic on a fresh goroutine, which no caller can recover.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				adapter.logger().Error("console_dpop_session_panic", "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				value, err = dpopSession{}, errors.New("Console DPoP session 获取异常中断")
+			}
+		}()
 		if session, ok := m.cached(key); ok {
 			return session, nil
 		}
-		session, fetchErr := adapter.fetchDPoPSession(ctx, ssoToken, lease)
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
+		defer cancel()
+		session, fetchErr := adapter.fetchDPoPSession(fetchCtx, ssoToken, lease)
 		if fetchErr != nil {
 			return dpopSession{}, fetchErr
 		}
 		m.store(key, session)
 		return session, nil
 	})
-	if err != nil {
-		return dpopSession{}, key, err
+	var result singleflight.Result
+	select {
+	case result = <-loaded:
+	case <-ctx.Done():
+		return dpopSession{}, key, ctx.Err()
 	}
-	session, ok := value.(dpopSession)
+	if result.Err != nil {
+		return dpopSession{}, key, result.Err
+	}
+	session, ok := result.Val.(dpopSession)
 	if !ok {
 		return dpopSession{}, key, errors.New("Console DPoP session 类型无效")
 	}

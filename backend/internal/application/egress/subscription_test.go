@@ -2,7 +2,12 @@ package egress
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -266,18 +271,353 @@ func TestPinSubscriptionRequestRewritesToResolvedIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pinSubscriptionRequest(request); err != nil {
+	pinned, serverName, err := pinSubscriptionRequest(request, true)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if request.URL.Hostname() != "1.2.3.4" || request.URL.Port() != "443" {
-		t.Fatalf("pinned url = %s", request.URL.Host)
+	if pinned.URL.Hostname() != "1.2.3.4" || pinned.URL.Port() != "443" {
+		t.Fatalf("pinned url = %s", pinned.URL.Host)
 	}
-	if request.Host != "pinned.example" {
-		t.Fatalf("host header = %q", request.Host)
+	if pinned.Host != "pinned.example" {
+		t.Fatalf("host header = %q", pinned.Host)
 	}
-	serverName, _ := request.Context().Value(subscriptionServerNameKey{}).(string)
 	if serverName != "pinned.example" {
 		t.Fatalf("server name = %q", serverName)
+	}
+	if request.URL.Host != "pinned.example" || request.Host != "pinned.example" {
+		t.Fatalf("caller request mutated: url host=%q host=%q", request.URL.Host, request.Host)
+	}
+}
+
+func TestPinSubscriptionRequestRewritesHostOnlyForForwardProxiedHTTP(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	tests := []struct {
+		target       string
+		forwardProxy bool
+		wantHost     string
+	}{
+		{target: "http://pinned.example/list", forwardProxy: true, wantHost: "1.2.3.4"},
+		{target: "http://pinned.example:8080/list", forwardProxy: true, wantHost: "1.2.3.4:8080"},
+		{target: "https://pinned.example/list", forwardProxy: true, wantHost: "pinned.example"},
+		{target: "http://pinned.example/list", forwardProxy: false, wantHost: "pinned.example"},
+		{target: "http://pinned.example:8080/list", forwardProxy: false, wantHost: "pinned.example:8080"},
+	}
+	for _, test := range tests {
+		request, err := http.NewRequest(http.MethodGet, test.target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Redirect hops arrive without Request.Host.
+		request.Host = ""
+		pinned, _, err := pinSubscriptionRequest(request, test.forwardProxy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pinned.Host != test.wantHost || pinned.URL.Hostname() != "1.2.3.4" {
+			t.Fatalf("%s forwardProxy=%v: host=%q url=%s, want host %q", test.target, test.forwardProxy, pinned.Host, pinned.URL.Host, test.wantHost)
+		}
+	}
+}
+
+// socksTargetListener completes a SOCKS5 CONNECT on every accepted connection
+// and then hands it to the HTTP server, which plays the target.
+type socksTargetListener struct {
+	net.Listener
+	mu      sync.Mutex
+	targets []string
+}
+
+func (l *socksTargetListener) Accept() (net.Conn, error) {
+	for {
+		connection, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		target, err := acceptSOCKS5Connect(connection)
+		if err != nil {
+			_ = connection.Close()
+			continue
+		}
+		l.mu.Lock()
+		l.targets = append(l.targets, target)
+		l.mu.Unlock()
+		return connection, nil
+	}
+}
+
+func (l *socksTargetListener) Targets() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.targets...)
+}
+
+func acceptSOCKS5Connect(connection net.Conn) (string, error) {
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	defer connection.SetDeadline(time.Time{})
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(connection, greeting); err != nil {
+		return "", err
+	}
+	if _, err := io.ReadFull(connection, make([]byte, greeting[1])); err != nil {
+		return "", err
+	}
+	if _, err := connection.Write([]byte{5, 0}); err != nil {
+		return "", err
+	}
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(connection, header); err != nil {
+		return "", err
+	}
+	if header[3] != 1 {
+		return "", errors.New("SOCKS target is not an IPv4 address")
+	}
+	address := make([]byte, 6)
+	if _, err := io.ReadFull(connection, address); err != nil {
+		return "", err
+	}
+	if _, err := connection.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		return "", err
+	}
+	return netip.AddrPortFrom(netip.AddrFrom4([4]byte(address[:4])), binary.BigEndian.Uint16(address[4:])).String(), nil
+}
+
+func TestSOCKSProxiedSubscriptionKeepsHostAcrossRelativeRedirect(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	var mu sync.Mutex
+	var hosts []string
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		hosts = append(hosts, request.Host)
+		mu.Unlock()
+		if request.URL.Path == "/subscription" {
+			http.Redirect(writer, request, "/final", http.StatusFound)
+			return
+		}
+		_, _ = writer.Write([]byte("http://proxy.example:8080\n"))
+	}))
+	listener := &socksTargetListener{Listener: server.Listener}
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	body, err := fetchProxySubscription(context.Background(), "http://pinned.example/subscription", "socks5://"+listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "proxy.example") {
+		t.Fatalf("body = %q", body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hosts) != 2 || hosts[0] != "pinned.example" || hosts[1] != "pinned.example" {
+		t.Fatalf("Host headers = %q", hosts)
+	}
+	targets := listener.Targets()
+	if len(targets) == 0 {
+		t.Fatal("SOCKS proxy saw no CONNECT")
+	}
+	for _, target := range targets {
+		if target != "1.2.3.4:80" {
+			t.Fatalf("SOCKS targets = %q", targets)
+		}
+	}
+}
+
+func TestPinnedSubscriptionTransportFollowsRelativeHTTPSRedirect(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	var mu sync.Mutex
+	var seen []string
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		seen = append(seen, request.Host+"|"+request.TLS.ServerName)
+		mu.Unlock()
+		if request.URL.Path == "/subscription" {
+			http.Redirect(writer, request, "/final", http.StatusFound)
+			return
+		}
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	var opened, closed atomic.Int32
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			opened.Add(1)
+		case http.StateClosed, http.StateHijacked:
+			closed.Add(1)
+		}
+	}
+	listener := &socksTargetListener{Listener: server.Listener}
+	server.Listener = listener
+	server.StartTLS()
+	defer server.Close()
+
+	base, err := subscriptionTransport("socks5://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	base.TLSClientConfig = &tls.Config{RootCAs: roots}
+	transport := &pinnedSubscriptionTransport{base: base}
+	client := &http.Client{Transport: transport}
+	response, err := client.Get("https://example.com/subscription")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+	if response.Request.URL.String() != "https://example.com/final" {
+		t.Fatalf("final request url = %s", response.Request.URL)
+	}
+	mu.Lock()
+	if len(seen) != 2 || seen[0] != "example.com|example.com" || seen[1] != "example.com|example.com" {
+		mu.Unlock()
+		t.Fatalf("Host|SNI per hop = %q", seen)
+	}
+	mu.Unlock()
+	for _, target := range listener.Targets() {
+		if target != "1.2.3.4:443" {
+			t.Fatalf("SOCKS targets = %q", listener.Targets())
+		}
+	}
+	transport.mu.Lock()
+	transports := len(transport.tlsByServerName)
+	transport.mu.Unlock()
+	if transports != 1 {
+		t.Fatalf("TLS transports = %d, want one shared by both hops", transports)
+	}
+	client.CloseIdleConnections()
+	deadline := time.Now().Add(2 * time.Second)
+	for closed.Load() < opened.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("idle connections left open: opened=%d closed=%d", opened.Load(), closed.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestForwardProxiedSubscriptionPinsRelativeRedirect(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	var mu sync.Mutex
+	var requestURIs []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requestURIs = append(requestURIs, request.RequestURI)
+		mu.Unlock()
+		if request.URL.Path == "/subscription" {
+			http.Redirect(writer, request, "/final", http.StatusFound)
+			return
+		}
+		_, _ = writer.Write([]byte("http://proxy.example:8080\n"))
+	}))
+	defer proxy.Close()
+
+	body, err := fetchProxySubscription(context.Background(), "http://pinned.example/subscription", proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "proxy.example") {
+		t.Fatalf("body = %q", body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestURIs) != 2 || requestURIs[0] != "http://1.2.3.4/subscription" || requestURIs[1] != "http://1.2.3.4/final" {
+		t.Fatalf("proxy request URIs = %q", requestURIs)
+	}
+}
+
+func TestHTTPSForwardProxyHandshakeKeepsProxyServerName(t *testing.T) {
+	previous := subscriptionIPLookup
+	subscriptionIPLookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	}
+	t.Cleanup(func() { subscriptionIPLookup = previous })
+
+	target := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write([]byte(request.Host + "|" + request.TLS.ServerName))
+	}))
+	defer target.Close()
+	var mu sync.Mutex
+	var proxyServerNames, connectTargets []string
+	proxy := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		proxyServerNames = append(proxyServerNames, request.TLS.ServerName)
+		connectTargets = append(connectTargets, request.Host)
+		mu.Unlock()
+		if request.Method != http.MethodConnect {
+			http.Error(writer, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", target.Listener.Addr().String())
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		connection, _, err := writer.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, err := io.WriteString(connection, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+		go func() {
+			_, _ = io.Copy(upstream, connection)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(connection, upstream)
+	}))
+	defer proxy.Close()
+
+	base, err := subscriptionTransport(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(proxy.Certificate())
+	roots.AddCert(target.Certificate())
+	base.TLSClientConfig = &tls.Config{RootCAs: roots}
+	client := &http.Client{Transport: &pinnedSubscriptionTransport{base: base, forwardProxy: true}}
+	defer client.CloseIdleConnections()
+	response, err := client.Get("https://example.com/subscription")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || string(body) != "example.com|example.com" {
+		t.Fatalf("target Host|SNI = %q, err=%v", body, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// The proxy is addressed by IP, so its handshake carries no SNI; the
+	// subscription host belongs only to the tunnelled handshake.
+	if len(proxyServerNames) != 1 || proxyServerNames[0] != "" || connectTargets[0] != "1.2.3.4:443" {
+		t.Fatalf("proxy SNI = %q, CONNECT targets = %q", proxyServerNames, connectTargets)
 	}
 }
 
@@ -406,29 +746,6 @@ func TestValidatePublicSubscriptionTargetRejectsPrivateAddresses(t *testing.T) {
 		if err := validatePublicSubscriptionTarget(context.Background(), value); err != nil {
 			t.Fatalf("public subscription target rejected: %s: %v", value, err)
 		}
-	}
-}
-
-func TestSubscriptionProxyForwardDialerBoundsHandshakeConnection(t *testing.T) {
-	client, server := net.Pipe()
-	defer server.Close()
-	dialer := &subscriptionProxyForwardDialer{timeout: 20 * time.Millisecond}
-	connection, err := dialer.withDeadline(client, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	started := time.Now()
-	buffer := make([]byte, 1)
-	_, err = connection.Read(buffer)
-	if err == nil {
-		t.Fatal("connection without peer data did not reach its handshake deadline")
-	}
-	if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
-		t.Fatalf("deadline error=%v", err)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("handshake deadline took %s", elapsed)
 	}
 }
 

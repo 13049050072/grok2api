@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
-	xproxy "golang.org/x/net/proxy"
 )
 
 // DoPinnedHTTPS sends a request whose URL host is an already validated IP
@@ -77,11 +76,11 @@ func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*
 		case "http", "https":
 			transport.Proxy = http.ProxyURL(parsed)
 		case "socks4", "socks4a", "socks5", "socks5h":
-			dialer, err := xproxy.FromURL(parsed, direct)
+			dialer, err := tunnelproxy.NewSOCKSDialer(parsed, direct, tunnelproxy.SOCKSHandshakeTimeout)
 			if err != nil {
 				return nil, fmt.Errorf("创建固定地址 SOCKS 代理: %w", err)
 			}
-			transport.DialContext = dialContext(dialer)
+			transport.DialContext = dialer.DialContext
 		case "trojan", "vless", "ss", "vmess":
 			dialer, err := tunnelproxy.NewDialer(proxyURL)
 			if err != nil {

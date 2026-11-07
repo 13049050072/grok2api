@@ -10,6 +10,7 @@ import (
 
 	adminapp "github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	admindomain "github.com/chenyme/grok2api/backend/internal/domain/admin"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/shared/response"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/adminsession"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
@@ -17,12 +18,19 @@ import (
 )
 
 type Handler struct {
-	service       *adminapp.Service
-	secureCookies bool
+	service        *adminapp.Service
+	secureCookies  bool
+	trustedProxies middleware.TrustedProxies
 }
 
 func NewHandler(service *adminapp.Service, secureCookies bool) *Handler {
 	return &Handler{service: service, secureCookies: secureCookies}
+}
+
+// WithTrustedProxies 允许 TLS 终止于可信反向代理时，依据其 X-Forwarded-Proto 为会话 Cookie 设置 Secure。
+func (h *Handler) WithTrustedProxies(values []string) *Handler {
+	h.trustedProxies = middleware.NewTrustedProxies(values)
+	return h
 }
 
 func (h *Handler) RegisterPublic(router *gin.RouterGroup) {
@@ -67,7 +75,7 @@ func (h *Handler) login(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	adminValue, tokens, err := h.service.Login(c.Request.Context(), request.Username, request.Password, remoteAddress(c.Request))
+	adminValue, tokens, err := h.service.Login(c.Request.Context(), request.Username, request.Password, clientIP(c.Request))
 	if err != nil {
 		if errors.Is(err, adminapp.ErrLoginRateLimited) {
 			response.Error(c, http.StatusTooManyRequests, "loginRateLimited", "登录尝试过于频繁，请稍后重试")
@@ -84,7 +92,12 @@ func (h *Handler) login(c *gin.Context) {
 	response.Success(c, http.StatusOK, gin.H{"admin": newAdminResponse(adminValue), "tokens": newTokenResponse(tokens)})
 }
 
-func remoteAddress(request *http.Request) string {
+// clientIP 优先使用 middleware.ClientIP 按可信代理解析出的地址；未经过该中间件时退回
+// TCP 直连对端，绝不直接采信转发头。
+func clientIP(request *http.Request) string {
+	if value := requestmeta.ClientIP(request.Context()); value != "" {
+		return value
+	}
 	value := strings.TrimSpace(request.RemoteAddr)
 	host, _, err := net.SplitHostPort(value)
 	if err == nil && host != "" {
@@ -122,17 +135,20 @@ func (h *Handler) refresh(c *gin.Context) {
 func (h *Handler) logout(c *gin.Context) {
 	var request refreshRequest
 	if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+		h.clearSessionCookies(c)
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
 	if request.RefreshToken == "" {
 		request.RefreshToken, _ = c.Cookie(adminsession.RefreshCookieName)
 	}
-	if err := h.service.Logout(c.Request.Context(), request.RefreshToken); err != nil {
+	// 即使服务端撤销失败也清除浏览器 Cookie，避免界面已退出但凭据仍留在浏览器中。
+	err := h.service.Logout(c.Request.Context(), request.RefreshToken)
+	h.clearSessionCookies(c)
+	if err != nil {
 		response.Error(c, http.StatusServiceUnavailable, "authRuntimeUnavailable", "管理员认证服务暂不可用")
 		return
 	}
-	h.clearSessionCookies(c)
 	response.Success(c, http.StatusOK, gin.H{"loggedOut": true})
 }
 
@@ -158,9 +174,21 @@ func (h *Handler) changePassword(c *gin.Context) {
 		response.Error(c, http.StatusUnauthorized, "adminUnauthorized", "管理员登录已失效")
 		return
 	}
-	if err := h.service.ChangePassword(c.Request.Context(), adminValue.ID, request.CurrentPassword, request.NewPassword); err != nil {
-		if errors.Is(err, adminapp.ErrInvalidCredentials) || errors.Is(err, adminapp.ErrInvalidPassword) {
-			response.Error(c, http.StatusBadRequest, "passwordChangeFailed", err.Error())
+	if err := h.service.ChangePassword(c.Request.Context(), adminValue.ID, request.CurrentPassword, request.NewPassword, clientIP(c.Request)); err != nil {
+		if errors.Is(err, adminapp.ErrInvalidCredentials) {
+			response.Error(c, http.StatusBadRequest, "currentPasswordIncorrect", "当前密码错误")
+			return
+		}
+		if errors.Is(err, adminapp.ErrInvalidPassword) {
+			response.Error(c, http.StatusBadRequest, "invalidNewPassword", err.Error())
+			return
+		}
+		if errors.Is(err, adminapp.ErrLoginRateLimited) {
+			response.Error(c, http.StatusTooManyRequests, "passwordChangeRateLimited", "密码校验尝试过于频繁，请稍后重试")
+			return
+		}
+		if errors.Is(err, adminapp.ErrRuntimeUnavailable) {
+			response.Error(c, http.StatusServiceUnavailable, "authRuntimeUnavailable", "管理员认证服务暂不可用")
 			return
 		}
 		response.Error(c, http.StatusInternalServerError, "passwordChangeFailed", "修改管理员密码失败")
@@ -178,17 +206,21 @@ func newTokenResponse(value adminapp.Tokens) tokenResponse {
 }
 
 func (h *Handler) setSessionCookies(c *gin.Context, value adminapp.Tokens) {
-	secure := h.secureCookies || c.Request.TLS != nil
+	secure := h.secureCookie(c.Request)
 	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie(adminsession.AccessCookieName, value.AccessToken, cookieMaxAge(value.AccessTokenExpiresAt), adminsession.AccessCookiePath, "", secure, true)
 	c.SetCookie(adminsession.RefreshCookieName, value.RefreshToken, cookieMaxAge(value.RefreshTokenExpiresAt), adminsession.RefreshCookiePath, "", secure, true)
 }
 
 func (h *Handler) clearSessionCookies(c *gin.Context) {
-	secure := h.secureCookies || c.Request.TLS != nil
+	secure := h.secureCookie(c.Request)
 	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie(adminsession.AccessCookieName, "", -1, adminsession.AccessCookiePath, "", secure, true)
 	c.SetCookie(adminsession.RefreshCookieName, "", -1, adminsession.RefreshCookiePath, "", secure, true)
+}
+
+func (h *Handler) secureCookie(request *http.Request) bool {
+	return h.secureCookies || request.TLS != nil || h.trustedProxies.ForwardedHTTPS(request)
 }
 
 func cookieMaxAge(expiresAt time.Time) int {

@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
@@ -46,6 +48,7 @@ var (
 
 var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
 var errQuotaRefreshBusy = errors.New("额度同步已由其他实例执行")
+var errCredentialRefreshPanic = errors.New("账号凭据刷新异常中断")
 
 type RateLimitReconcileState string
 
@@ -240,6 +243,13 @@ type ImportResult struct {
 	Skipped    int
 	Failed     int
 	AccountIDs []uint64
+	// Failures 列出被单独拒绝的账号；Index 是账号在本次批次中的 1-based 序号（文件内重复项已跳过）。
+	Failures []ImportFailure
+}
+
+type ImportFailure struct {
+	Index  int
+	Reason string
 }
 
 type BuildConversionStrategy string
@@ -517,6 +527,10 @@ type Service struct {
 	// autoDeleteConsoleUnlinked deletes Console accounts once they are marked
 	// with LastErrorConsoleUnlinked instead of keeping them as reauthRequired.
 	autoDeleteConsoleUnlinked atomic.Bool
+	// consoleUnlinkedRetryArmed keeps at most one delayed sweep for unlinked
+	// Console accounts whose deletion waited for active inference leases.
+	consoleUnlinkedRetryArmed atomic.Bool
+	consoleUnlinkedRetryDelay time.Duration
 	buildBotFlagCache         *resultcache.Cache[string, []uint64]
 	logger                    *slog.Logger
 	now                       func() time.Time
@@ -575,8 +589,9 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		autoCleanWake:     make(chan struct{}, 1),
 		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
 		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), detectPool: batch.NewPool(32),
-		logger: slog.Default(),
-		now:    func() time.Time { return time.Now().UTC() },
+		consoleUnlinkedRetryDelay: time.Minute,
+		logger:                    slog.Default(),
+		now:                       func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -1722,7 +1737,7 @@ func (s *Service) persistPreparedImportedSeeds(ctx context.Context, seeds []prov
 		cancelPersist()
 		if err != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = mapRepositoryError(err)
 			}
 			cancelPrepare()
 			return
@@ -1790,50 +1805,117 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 	return s.persistImportedSeedsFromProgress(ctx, seeds, observer, progress, 0, len(seeds), true)
 }
 
+// persistImportedSeedsFromProgress 出错时也返回已经写入的部分结果，调用方据此继续同步这些账号。
 func (s *Service) persistImportedSeedsFromProgress(ctx context.Context, seeds []provider.CredentialSeed, observer ImportedAccountObserver, progress BatchProgressObserver, completed, total int, reportInitial bool) (ImportResult, error) {
 	result := ImportResult{AccountIDs: make([]uint64, 0, len(seeds))}
 	if progress != nil && reportInitial {
 		if err := progress(completed, total); err != nil {
-			return ImportResult{}, err
+			return result, err
 		}
+	}
+	finish := func(err error) (ImportResult, error) {
+		if len(result.AccountIDs) > 0 {
+			s.WakeCredentialRefresh()
+		}
+		return result, err
+	}
+	accept := func(value repository.AccountUpsertResult) error {
+		result.AccountIDs = append(result.AccountIDs, value.ID)
+		if value.Created {
+			result.Created++
+		} else {
+			result.Updated++
+		}
+		s.reconcileProviderLinksBestEffort(ctx, value.ID)
+		if observer != nil {
+			if err := observer(value.ID); err != nil {
+				return err
+			}
+		}
+		completed++
+		if progress != nil {
+			return progress(completed, total)
+		}
+		return nil
+	}
+	reject := func(index int, err error) error {
+		reason := importItemFailureReason(err)
+		s.logger.Warn("account_import_item_failed", "index", index, "reason", reason)
+		result.Failed++
+		result.Failures = append(result.Failures, ImportFailure{Index: index, Reason: reason})
+		completed++
+		if progress != nil {
+			return progress(completed, total)
+		}
+		return nil
 	}
 	for start := 0; start < len(seeds); start += credentialImportChunkSize {
 		end := min(start+credentialImportChunkSize, len(seeds))
 		values := make([]accountdomain.Credential, 0, end-start)
-		for _, seed := range seeds[start:end] {
+		indexes := make([]int, 0, end-start)
+		for offset, seed := range seeds[start:end] {
 			value, err := s.credentialFromSeed(seed)
-			if err != nil {
-				return ImportResult{}, err
+			switch {
+			case errors.Is(err, ErrInvalidInput):
+				err = reject(start+offset+1, err)
+			case err == nil:
+				values = append(values, value)
+				indexes = append(indexes, start+offset+1)
 			}
-			values = append(values, value)
+			if err != nil {
+				return finish(err)
+			}
+		}
+		if len(values) == 0 {
+			continue
 		}
 		stored, err := s.upsertImportedCredentialsSafely(ctx, values)
+		if errors.Is(err, repository.ErrConflict) {
+			// 整块事务会因一个身份不明确的账号回滚；逐条重试，只拒绝冲突的账号。
+			for offset, value := range values {
+				items, itemErr := s.upsertImportedCredentialsSafely(ctx, []accountdomain.Credential{value})
+				switch {
+				case errors.Is(itemErr, repository.ErrConflict):
+					itemErr = reject(indexes[offset], itemErr)
+				case itemErr != nil:
+					itemErr = mapRepositoryError(itemErr)
+				default:
+					for _, item := range items {
+						if itemErr = accept(item); itemErr != nil {
+							break
+						}
+					}
+				}
+				if itemErr != nil {
+					return finish(itemErr)
+				}
+			}
+			continue
+		}
 		if err != nil {
-			return ImportResult{}, err
+			return finish(mapRepositoryError(err))
 		}
 		for _, value := range stored {
-			result.AccountIDs = append(result.AccountIDs, value.ID)
-			s.reconcileProviderLinksBestEffort(ctx, value.ID)
-			if observer != nil {
-				if err := observer(value.ID); err != nil {
-					return ImportResult{}, err
-				}
-			}
-			completed++
-			if progress != nil {
-				if err := progress(completed, total); err != nil {
-					return ImportResult{}, err
-				}
-			}
-			if value.Created {
-				result.Created++
-			} else {
-				result.Updated++
+			if err := accept(value); err != nil {
+				return finish(err)
 			}
 		}
 	}
-	s.WakeCredentialRefresh()
-	return result, nil
+	return finish(nil)
+}
+
+func importItemFailureReason(err error) string {
+	message := err.Error()
+	switch {
+	case errors.Is(err, repository.ErrConflict):
+		message = strings.TrimPrefix(strings.TrimPrefix(message, repository.ErrConflict.Error()), ": ")
+		if message == "" {
+			message = ErrConflict.Error()
+		}
+	case errors.Is(err, ErrInvalidInput):
+		message = strings.TrimPrefix(message, ErrInvalidInput.Error()+": ")
+	}
+	return message
 }
 
 // SyncWebAccountsToConsoleWithProgress 使用 Web 账号的同一份 SSO 创建或更新 Console 账号。
@@ -1915,6 +1997,11 @@ func (s *Service) SyncAllWebAccountsToConsoleWithStrategy(ctx context.Context, s
 		current, err := s.syncWebCredentialsToConsole(ctx, values, observer, offsetBatchProgress(progress, completed, total))
 		result.Created += current.Created
 		result.Updated += current.Updated
+		result.Failed += current.Failed
+		for _, failure := range current.Failures {
+			failure.Index += completed
+			result.Failures = append(result.Failures, failure)
+		}
 		result.AccountIDs = append(result.AccountIDs, current.AccountIDs...)
 		if err != nil {
 			return result, err
@@ -2492,7 +2579,7 @@ func (s *Service) renderProviderCredentials(providerValue accountdomain.Provider
 			return ExportFile{}, err
 		}
 		if format == ExportFormatText {
-			data, count := renderCredentialText(rows)
+			data, count := renderCredentialText(rows, s.defaultImportClientID(providerValue))
 			return ExportFile{Data: data, Count: count, Format: format}, nil
 		}
 		return ExportFile{Data: renderCredentialCSV(rows), Count: len(rows), Format: format}, nil
@@ -2561,14 +2648,29 @@ func (s *Service) decryptExportRows(providerValue accountdomain.Provider, values
 // credentialCSVHeader 是 CSV 导出固定表头；token_type 与 token 已按来源归一化。
 const credentialCSVHeader = "id,provider,name,email,user_id,tier,status,enabled,token_type,token,created_at"
 
+// defaultImportClientID 返回导入时缺省使用的 OAuth client id；未知时返回空，txt 导出会写出全部 client id。
+func (s *Service) defaultImportClientID(providerValue accountdomain.Provider) string {
+	if s.providers == nil {
+		return ""
+	}
+	adapter, ok := s.providers.CredentialCodec(providerValue)
+	if !ok {
+		return ""
+	}
+	if source, ok := adapter.(interface{ DefaultOAuthClientID() string }); ok {
+		return source.DefaultOAuthClientID()
+	}
+	return ""
+}
+
 // renderCredentialText 输出每行一个账号的纯文本：web/console 行是纯 SSO 令牌，
-// build 行是「邮箱<TAB>refresh token」（refresh 为空时用 access token）。
-// 空令牌行会被跳过，保证导出的 txt 能被对应导入接口读回。
-func renderCredentialText(rows []exportCredentialRow) ([]byte, int) {
+// build 行是「邮箱<TAB>refresh token」，client id 不是导入默认值时追加第三列。
+// 无法读回的行会被跳过（包括没有 refresh token 的 build 账号），保证导出的 txt 能被对应导入接口读回。
+func renderCredentialText(rows []exportCredentialRow, defaultClientID string) ([]byte, int) {
 	var builder strings.Builder
 	written := 0
 	for _, row := range rows {
-		line := credentialTextLine(row)
+		line := credentialTextLine(row, defaultClientID)
 		if line == "" {
 			continue
 		}
@@ -2579,15 +2681,24 @@ func renderCredentialText(rows []exportCredentialRow) ([]byte, int) {
 	return []byte(builder.String()), written
 }
 
-func credentialTextLine(row exportCredentialRow) string {
-	token := exportAccountToken(row)
-	if token == "" {
+func credentialTextLine(row exportCredentialRow, defaultClientID string) string {
+	if row.Credential.Provider != accountdomain.ProviderBuild {
+		return exportAccountToken(row)
+	}
+	// Build 文本导入只接受 refresh token，access token 写进去会在导入兑换时失败。
+	refreshToken := strings.TrimSpace(row.RefreshToken)
+	if refreshToken == "" {
 		return ""
 	}
-	if row.Credential.Provider == accountdomain.ProviderBuild {
-		return strings.TrimSpace(row.Credential.Email) + "\t" + token
+	email := strings.TrimSpace(row.Credential.Email)
+	if strings.IndexFunc(email, unicode.IsSpace) >= 0 {
+		email = ""
 	}
-	return token
+	line := email + "\t" + refreshToken
+	if clientID := strings.TrimSpace(row.Credential.OIDCClientID); clientID != "" && clientID != defaultClientID {
+		line += "\t" + clientID
+	}
+	return line
 }
 
 // exportAccountToken 返回 txt/csv 使用的令牌：web/console 是 access token（SSO），
@@ -2649,7 +2760,12 @@ func renderCredentialCSV(rows []exportCredentialRow) []byte {
 }
 
 // csvField 只在字段包含分隔符、引号或换行时加双引号，内部引号按 RFC4180 双写。
+// 以 = + - @ TAB CR 开头的字段先加单引号，防止电子表格把账号名等内容当作公式执行；
+// CSV 仅用于导出，没有对应的导入路径需要还原该前缀。
 func csvField(value string) string {
+	if value != "" && strings.IndexByte("=+-@\t\r", value[0]) >= 0 {
+		value = "'" + value
+	}
 	if !strings.ContainsAny(value, ",\"\r\n") {
 		return value
 	}
@@ -2821,13 +2937,42 @@ func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason stri
 	if _, err := s.accounts.Update(ctx, value); err != nil {
 		return mapRepositoryError(err)
 	}
+	s.afterReauthRequired(ctx, value)
+	return nil
+}
+
+// MarkReauthRequiredForCredential 只在账号仍持有被上游拒绝的凭据时标记失效。期间刷新或重新导入的
+// 新凭据优先：旧拒绝直接丢弃，也不会触发 Console 未关联账号的自动删除。
+func (s *Service) MarkReauthRequiredForCredential(ctx context.Context, credential accountdomain.Credential, reason string) error {
+	guarded, ok := s.accounts.(interface {
+		MarkReauthRequiredIfCredentialUnchanged(context.Context, uint64, string, string) error
+	})
+	if !ok {
+		return s.MarkReauthRequired(ctx, credential.ID, reason)
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	if err := guarded.MarkReauthRequiredIfCredentialUnchanged(ctx, credential.ID, credential.EncryptedAccessToken, reason); err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			s.logger.Info("account_reauth_skipped_credential_changed", "account_id", credential.ID, "provider", credential.Provider)
+			return nil
+		}
+		return mapRepositoryError(err)
+	}
+	credential.AuthStatus = accountdomain.AuthStatusReauthRequired
+	credential.LastError = reason
+	s.afterReauthRequired(ctx, credential)
+	return nil
+}
+
+func (s *Service) afterReauthRequired(ctx context.Context, value accountdomain.Credential) {
 	if s.sticky != nil {
-		_ = s.sticky.DeleteByAccount(ctx, id)
+		_ = s.sticky.DeleteByAccount(ctx, value.ID)
 	}
 	if isConsoleUnlinkedAccount(value) && s.autoDeleteConsoleUnlinked.Load() {
-		s.deleteConsoleUnlinkedAccount(ctx, id)
+		s.deleteConsoleUnlinkedAccount(ctx, value.ID)
 	}
-	return nil
 }
 
 // ssoRejectedReason keeps the generic SSO rejection text except for Console
@@ -2854,10 +2999,16 @@ func (s *Service) UpdateAutoDeleteConsoleUnlinked(enabled bool) {
 
 // deleteConsoleUnlinkedAccount removes only the Console row; linked Web/Build
 // accounts stay. A pending video job makes the delete fail closed and the
-// account simply remains reauthRequired.
+// account simply remains reauthRequired. Active inference leases defer the
+// delete to a later sweep instead.
 func (s *Service) deleteConsoleUnlinkedAccount(ctx context.Context, id uint64) {
 	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
 	defer cancel()
+	if idle, _, err := s.excludeAccountsWithActiveLeases(deleteCtx, []uint64{id}); err != nil || len(idle) == 0 {
+		s.logger.Info("console_unlinked_account_delete_deferred", "account_id", id, "error", err)
+		s.scheduleConsoleUnlinkedSweep()
+		return
+	}
 	if err := s.Delete(deleteCtx, id); err != nil && !errors.Is(err, ErrNotFound) {
 		s.logger.Warn("console_unlinked_account_delete_failed", "account_id", id, "error", err)
 		return
@@ -2866,7 +3017,9 @@ func (s *Service) deleteConsoleUnlinkedAccount(ctx context.Context, id uint64) {
 }
 
 func (s *Service) sweepConsoleUnlinkedAccounts(ctx context.Context) {
-	ids, err := s.accounts.ListReauthAccountIDsByLastError(ctx, accountdomain.ProviderConsole, accountdomain.LastErrorConsoleUnlinked)
+	listCtx, cancel := context.WithTimeout(ctx, credentialStateWriteTimeout)
+	ids, err := s.accounts.ListReauthAccountIDsByLastError(listCtx, accountdomain.ProviderConsole, accountdomain.LastErrorConsoleUnlinked)
+	cancel()
 	if err != nil {
 		s.logger.Warn("console_unlinked_account_sweep_failed", "error", err)
 		return
@@ -2879,6 +3032,16 @@ func (s *Service) sweepConsoleUnlinkedAccounts(ctx context.Context) {
 	}
 }
 
+func (s *Service) scheduleConsoleUnlinkedSweep() {
+	if !s.consoleUnlinkedRetryArmed.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(s.consoleUnlinkedRetryDelay, func() {
+		s.consoleUnlinkedRetryArmed.Store(false)
+		s.sweepConsoleUnlinkedAccounts(context.Background())
+	})
+}
+
 // markSSOCredentialRejected 在上游明确返回 401 后可靠持久化失效状态。
 // 状态写入不继承客户端取消，避免已经确认失效的账号因请求断开继续留在号池。
 func (s *Service) markSSOCredentialRejected(ctx context.Context, value accountdomain.Credential, reason string) error {
@@ -2887,7 +3050,7 @@ func (s *Service) markSSOCredentialRejected(ctx context.Context, value accountdo
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
 	defer cancel()
-	if err := s.MarkReauthRequired(writeCtx, value.ID, reason); err != nil {
+	if err := s.MarkReauthRequiredForCredential(writeCtx, value, reason); err != nil {
 		s.logger.Error("account_reauth_required_write_failed", "account_id", value.ID, "provider", value.Provider, "error", err)
 		return err
 	}
@@ -2930,7 +3093,21 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 	if options.retryPermanentOnce {
 		refreshKey += ":manual-retry"
 	}
-	result, err, _ := s.refreshes.Do(refreshKey, func() (any, error) {
+	if err := ctx.Err(); err != nil {
+		return accountdomain.Credential{}, err
+	}
+	// The shared refresh is detached from the first caller: once the provider rotates the
+	// refresh token, the replacement must be persisted even if every waiter has gone away.
+	results := s.refreshes.DoChan(refreshKey, func() (refreshResult any, refreshErr error) {
+		// DoChan re-raises a panic on a fresh goroutine, which no caller can recover.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.Error("credential_refresh_panic", "account_id", value.ID, "provider", value.Provider, "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				refreshResult, refreshErr = nil, errCredentialRefreshPanic
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRefreshTimeout)
+		defer cancel()
 		latest, err := s.accounts.Get(ctx, value.ID)
 		if err != nil {
 			return nil, err
@@ -3031,10 +3208,16 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		s.WakeCredentialRefresh()
 		return updated, nil
 	})
-	if err != nil {
-		return accountdomain.Credential{}, err
+	var result singleflight.Result
+	select {
+	case result = <-results:
+	case <-ctx.Done():
+		return accountdomain.Credential{}, ctx.Err()
 	}
-	credential, ok := result.(accountdomain.Credential)
+	if result.Err != nil {
+		return accountdomain.Credential{}, result.Err
+	}
+	credential, ok := result.Val.(accountdomain.Credential)
 	if !ok {
 		return accountdomain.Credential{}, fmt.Errorf("账号凭据刷新返回类型无效")
 	}

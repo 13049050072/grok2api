@@ -61,7 +61,7 @@ func (s *TokenService) ParseAccessToken(raw string) (AdminTokenIdentity, error) 
 			return nil, fmt.Errorf("不支持的 JWT 签名算法")
 		}
 		return s.secret, nil
-	}, jwt.WithIssuer(s.issuer))
+	}, jwt.WithIssuer(s.issuer), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid || claims.AdminID == 0 || claims.SessionID == 0 {
 		return AdminTokenIdentity{}, fmt.Errorf("管理员令牌无效")
 	}

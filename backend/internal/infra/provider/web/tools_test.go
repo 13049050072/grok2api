@@ -428,6 +428,174 @@ func TestToolStreamSievePreservesInvalidSyntaxAndTrailingText(t *testing.T) {
 	}
 }
 
+// driveToolSieve mirrors streamOpenAIResponse: SafeText is sent as-is and Raw
+// is sent when a completed block yields no calls.
+func driveToolSieve(sieve *toolStreamSieve, chunks ...string) (string, []parsedToolCall) {
+	var text strings.Builder
+	var calls []parsedToolCall
+	for _, chunk := range chunks {
+		result := sieve.Feed(chunk)
+		text.WriteString(result.SafeText)
+		if result.Complete && len(result.Calls) == 0 {
+			text.WriteString(result.Raw)
+		}
+		calls = append(calls, result.Calls...)
+	}
+	flushed := sieve.Flush()
+	text.WriteString(flushed.SafeText)
+	return text.String(), append(calls, flushed.Calls...)
+}
+
+func TestToolStreamSieveAccumulatesXMLAcrossChunks(t *testing.T) {
+	sieve := newToolStreamSieve(map[string]struct{}{"lookup": {}})
+	chunks := []string{
+		"before <tool_calls>\n  <tool_call call_id=\"call_1\">\n    <tool_name>lookup</tool_name>",
+		"\n    <parameters>{\"q\":\"",
+		"x\"}</parameters>\n  </tool_call>",
+		"\n</TOOL_CALLS",
+		" \n>after",
+	}
+	var safe strings.Builder
+	var final toolStreamResult
+	for index, chunk := range chunks {
+		final = sieve.Feed(chunk)
+		safe.WriteString(final.SafeText)
+		if index < len(chunks)-1 && (final.Complete || len(final.Calls) > 0) {
+			t.Fatalf("chunk %d completed before the closing tag: %#v", index, final)
+		}
+	}
+	if safe.String() != "before " {
+		t.Fatalf("text sent to client = %q", safe.String())
+	}
+	if !final.Complete || len(final.Calls) != 1 || final.Calls[0].Name != "lookup" || final.Calls[0].Arguments != `{"q":"x"}` || strings.Contains(final.Raw, "after") {
+		t.Fatalf("final = %#v", final)
+	}
+	if flushed := sieve.Flush(); flushed.SafeText != "" || len(flushed.Calls) != 0 {
+		t.Fatalf("flush after completed calls = %#v", flushed)
+	}
+}
+
+func TestToolStreamSieveReleasesUnknownToolAcrossChunks(t *testing.T) {
+	sieve := newToolStreamSieve(map[string]struct{}{"lookup": {}})
+	chunks := []string{
+		"intro <tool_calls><tool_call><tool_name>unknown</tool_name>",
+		"<parameters>{}</parameters></tool_call>",
+		"</tool_calls> trailing",
+		" more",
+	}
+	text, calls := driveToolSieve(sieve, chunks...)
+	if len(calls) != 0 || text != strings.Join(chunks, "") {
+		t.Fatalf("text = %q, calls = %#v", text, calls)
+	}
+}
+
+func TestToolStreamSieveFlushHandlesUnterminatedCapture(t *testing.T) {
+	available := map[string]struct{}{"lookup": {}}
+	chunks := []string{"hi <tool_calls><tool_call><tool_name>lookup</tool_name>", `<parameters>{"q":1}</parameters></tool_call>`}
+	text, calls := driveToolSieve(newToolStreamSieve(available), chunks...)
+	if len(calls) != 0 || text != strings.Join(chunks, "") {
+		t.Fatalf("unterminated root: text = %q, calls = %#v", text, calls)
+	}
+
+	sieve := newToolStreamSieve(available)
+	first := sieve.Feed(`<tool_calls><invoke name="lookup">{"q":2}`)
+	second := sieve.Feed(`</invoke>`)
+	flushed := sieve.Flush()
+	if first.SafeText != "" || second.SafeText != "" || !flushed.Complete || len(flushed.Calls) != 1 || flushed.Calls[0].Arguments != `{"q":2}` {
+		t.Fatalf("first = %#v, second = %#v, flushed = %#v", first, second, flushed)
+	}
+
+	sieve = newToolStreamSieve(available)
+	if result := sieve.Feed("hello <tool"); result.SafeText != "hello " {
+		t.Fatalf("partial open tag = %#v", result)
+	}
+	if flushed := sieve.Flush(); flushed.SafeText != "<tool" || len(flushed.Calls) != 0 {
+		t.Fatalf("flushed partial open tag = %#v", flushed)
+	}
+}
+
+func TestToolStreamSieveReleasesOversizedCapture(t *testing.T) {
+	sieve := newToolStreamSieve(map[string]struct{}{"lookup": {}})
+	head := "<tool_calls><tool_call><tool_name>lookup</tool_name><parameters>"
+	filler := strings.Repeat("x", maxToolCallCaptureBytes)
+	if result := sieve.Feed(head); result.SafeText != "" || result.Complete {
+		t.Fatalf("head = %#v", result)
+	}
+	if result := sieve.Feed(filler); result.SafeText != head+filler || result.Complete || len(result.Calls) != 0 {
+		t.Fatalf("oversized capture was not released: len = %d, complete = %v", len(result.SafeText), result.Complete)
+	}
+	tail := "</parameters></tool_call></tool_calls> done"
+	if result := sieve.Feed(tail); result.SafeText != tail || result.Complete || len(result.Calls) != 0 {
+		t.Fatalf("tail = %#v", result)
+	}
+	if flushed := sieve.Flush(); flushed.SafeText != "" || len(flushed.Calls) != 0 {
+		t.Fatalf("flushed = %#v", flushed)
+	}
+}
+
+func TestToolStreamSieveHandlesRunesThatChangeLengthWhenLowered(t *testing.T) {
+	available := map[string]struct{}{"lookup": {}}
+	for _, r := range []string{"Ⱥ", "\u212a"} {
+		arguments := `{"q":"` + strings.Repeat(r, 8) + `"}`
+		xml := "<tool_calls><tool_call><tool_name>lookup</tool_name><parameters>" + arguments + "</parameters></tool_call></tool_calls>"
+		prefix := strings.Repeat(r, 4) + " before "
+
+		result := newToolStreamSieve(available).Feed(prefix + xml)
+		if result.SafeText != prefix || !result.Complete || len(result.Calls) != 1 || result.Calls[0].Arguments != arguments {
+			t.Fatalf("%q single chunk = %#v", r, result)
+		}
+
+		split := strings.Index(xml, r) + len(r)
+		closing := strings.Index(xml, "</tool_calls>") + 4
+		text, calls := driveToolSieve(newToolStreamSieve(available), prefix+xml[:split], xml[split:closing], xml[closing:]+" after")
+		if text != prefix || len(calls) != 1 || calls[0].Arguments != arguments {
+			t.Fatalf("%q multi chunk: text = %q, calls = %#v", r, text, calls)
+		}
+
+		if got, pending := splitToolPrefix(strings.Repeat(r, 3) + "<tool_c"); got != strings.Repeat(r, 3) || pending != "<tool_c" {
+			t.Fatalf("%q splitToolPrefix = %q, %q", r, got, pending)
+		}
+	}
+}
+
+func TestToolCallsToXMLRoundTripsThroughParser(t *testing.T) {
+	available := map[string]struct{}{"lookup": {}, "fetch": {}}
+	xml := toolCallsToXML(json.RawMessage(`[
+		{"id":"call_<1>","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"Ⱥ\"}"}},
+		{"id":"call_2","type":"function","function":{"name":"fetch","arguments":{"url":"https://x.ai"}}}
+	]`))
+	if !strings.Contains(xml, `<tool_call call_id="call_&lt;1&gt;">`) {
+		t.Fatalf("xml = %s", xml)
+	}
+	parsed := parseToolCalls(xml, available)
+	if len(parsed.Calls) != 2 || parsed.Calls[0].Name != "lookup" || parsed.Calls[0].Arguments != `{"q":"Ⱥ"}` || parsed.Calls[1].Name != "fetch" || parsed.Calls[1].Arguments != `{"url":"https://x.ai"}` {
+		t.Fatalf("parsed = %#v", parsed)
+	}
+	if parsed.Start != 0 || parsed.End != len(xml) {
+		t.Fatalf("parsed span = %d..%d, want 0..%d", parsed.Start, parsed.End, len(xml))
+	}
+	result := newToolStreamSieve(available).Feed("text " + xml)
+	if result.SafeText != "text " || len(result.Calls) != 2 {
+		t.Fatalf("sieve = %#v", result)
+	}
+}
+
+func TestParseToolCallsAcceptsTagAttributes(t *testing.T) {
+	available := map[string]struct{}{"lookup": {}}
+	text := `<tool_calls version="1"><tool_call call_id="x"><tool_name>lookup</tool_name><parameters>{"q":"y"}</parameters></tool_call ></tool_calls >`
+	parsed := parseToolCalls(text, available)
+	if len(parsed.Calls) != 1 || parsed.Calls[0].Arguments != `{"q":"y"}` {
+		t.Fatalf("parsed = %#v", parsed)
+	}
+	text, calls := driveToolSieve(newToolStreamSieve(available), `pre <tool_calls version="1">`, text[len(`<tool_calls version="1">`):])
+	if text != "pre " || len(calls) != 1 {
+		t.Fatalf("sieve text = %q, calls = %#v", text, calls)
+	}
+	if toolCallPattern.MatchString("<tool_calls></tool_call>") {
+		t.Fatal("<tool_call> pattern matched a <tool_calls> tag")
+	}
+}
+
 func TestSearchSourcesAndServerToolsAreDeduplicated(t *testing.T) {
 	parsed := &parsedChat{}
 	response := map[string]any{

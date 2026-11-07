@@ -50,6 +50,9 @@ func (r *qualityLeaseAccountRepository) CountProviderAccountsByIDs(context.Conte
 func (r *qualityLeaseAccountRepository) UpdateEgressBindings(context.Context, accountdomain.Provider, []uint64, *uint64, accountdomain.EgressAssignmentMode, time.Time) (int64, error) {
 	return 1, nil
 }
+func (r *qualityLeaseAccountRepository) MoveAutoEgressBindings(_ context.Context, _ accountdomain.Provider, ids []uint64, _, _ uint64, _ time.Time) (int64, error) {
+	return int64(len(ids)), nil
+}
 func (r *qualityLeaseAccountRepository) ListEgressAssignments(context.Context, accountdomain.Provider) ([]accountdomain.Credential, error) {
 	return []accountdomain.Credential{r.credential}, nil
 }

@@ -8,7 +8,7 @@ import (
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 )
 
-func TestNormalizeAndParseAutoAssignShare(t *testing.T) {
+func TestNormalizeAutoAssignShare(t *testing.T) {
 	if got := normalizeAutoAssignShare(0); got != 0 {
 		t.Fatalf("zero must stay off: %v", got)
 	}
@@ -24,20 +24,6 @@ func TestNormalizeAndParseAutoAssignShare(t *testing.T) {
 	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		if got := normalizeAutoAssignShare(value); got != 0 {
 			t.Fatalf("special float %v must stay off: %v", value, got)
-		}
-	}
-	if _, ok := parseAutoAssignShare("0"); !ok {
-		t.Fatal("explicit 0 is a valid env override")
-	}
-	if _, ok := parseAutoAssignShare("0.03"); ok {
-		t.Fatal("0.03 must be rejected so YAML/default remains")
-	}
-	if value, ok := parseAutoAssignShare("0.10"); !ok || value != 0.10 {
-		t.Fatalf("0.10 = %v %v", value, ok)
-	}
-	for _, raw := range []string{"NaN", "Inf", "-Inf"} {
-		if _, ok := parseAutoAssignShare(raw); ok {
-			t.Fatalf("%q must be rejected so YAML/default remains", raw)
 		}
 	}
 }
@@ -81,14 +67,13 @@ func TestAutoAssignmentMigrationLimitPreservesHistoricalCeilingWhenOff(t *testin
 	}
 }
 
-func TestResolveAutoAssignSharePrefersValidEnv(t *testing.T) {
+func TestAutoAssignBoundsUseResolvedConfigOnly(t *testing.T) {
 	t.Setenv("GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE", "0.25")
-	if got := resolveAutoAssignShare("GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE", 0); got != 0.25 {
-		t.Fatalf("env should override disabled YAML: %v", got)
-	}
-	t.Setenv("GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE", "nope")
-	if got := resolveAutoAssignShare("GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE", 0.4); got != 0.4 {
-		t.Fatalf("invalid env should fall back to YAML: %v", got)
+	t.Setenv("GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE", "0.5")
+	service := &Service{}
+	service.ConfigureAutoAssignBounds(0.4, 0)
+	if node, migration := service.autoAssignBounds(); node != 0.4 || migration != 0 {
+		t.Fatalf("bounds = %v/%v, want configured 0.4/0 without re-reading env", node, migration)
 	}
 }
 

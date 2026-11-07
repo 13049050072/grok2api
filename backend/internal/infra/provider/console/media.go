@@ -205,7 +205,7 @@ func (a *Adapter) forwardConsoleMedia(ctx context.Context, credential account.Cr
 	}
 	response, err := a.doDPoPRequest(requestCtx, credential, token, lease, http.MethodPost, consoleV1Endpoint(cfg.BaseURL, path), body, "application/json")
 	if err != nil {
-		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
+		a.reportRequestFailure(ctx, lease.NodeID, err)
 		lease.Release()
 		cancel()
 		return nil, err
@@ -650,7 +650,7 @@ func (a *Adapter) doConsoleVideoJSON(ctx context.Context, credential account.Cre
 	defer cancel()
 	response, err := a.doDPoPRequest(requestCtx, credential, token, lease, method, endpoint, body, "application/json")
 	if err != nil {
-		a.egress.FeedbackForScope(context.WithoutCancel(ctx), egressdomain.ScopeConsole, lease.NodeID, 0, err)
+		a.reportRequestFailure(ctx, lease.NodeID, err)
 		return nil, err
 	}
 	defer response.Body.Close()

@@ -78,13 +78,21 @@ func newBrowserClient(proxyURL, userAgent string) (*browserClient, error) {
 		if err != nil {
 			return nil, fmt.Errorf("解析浏览器出口代理: %w", err)
 		}
-		if tunnelproxy.IsSupportedScheme(parsed.Scheme) {
+		switch {
+		case tunnelproxy.IsSupportedScheme(parsed.Scheme):
 			dialer, err := tunnelproxy.NewDialer(proxyURL)
 			if err != nil {
 				return nil, fmt.Errorf("创建浏览器隧道代理: %w", err)
 			}
 			options = append(options, tlsclient.WithDialContext(dialer.DialContext))
-		} else {
+		case tunnelproxy.IsSOCKSScheme(parsed.Scheme):
+			// tls-client's built-in SOCKS dialer ignores the request context.
+			dialer, err := tunnelproxy.NewSOCKSDialer(parsed, nil, tunnelproxy.SOCKSHandshakeTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("创建浏览器 SOCKS 代理: %w", err)
+			}
+			options = append(options, tlsclient.WithDialContext(dialer.DialContext))
+		default:
 			options = append(options, tlsclient.WithProxyUrl(proxyURL))
 		}
 	}

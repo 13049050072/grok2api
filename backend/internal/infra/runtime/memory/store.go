@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"hash/maphash"
 	"sync"
 	"time"
 
@@ -20,10 +21,13 @@ const (
 type rateWindow struct {
 	startedAt time.Time
 	count     int
+	limited   bool
 }
 
 // RateLimiter 提供单实例固定分钟窗口限流。
 type RateLimiter struct {
+	// seed 每个实例随机生成，调用方无法离线构造落入同一分片的键来挤占容量。
+	seed   maphash.Seed
 	shards [shardCount]rateShard
 }
 
@@ -33,7 +37,7 @@ type rateShard struct {
 }
 
 func NewRateLimiter() *RateLimiter {
-	limiter := &RateLimiter{}
+	limiter := &RateLimiter{seed: maphash.MakeSeed()}
 	for index := range limiter.shards {
 		limiter.shards[index].windows = make(map[string]rateWindow)
 	}
@@ -44,7 +48,7 @@ func (r *RateLimiter) Allow(_ context.Context, key string, limit int, now time.T
 	if limit <= 0 {
 		return true, nil
 	}
-	shard := &r.shards[shardIndex(key)]
+	shard := r.shard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	window := shard.windows[key]
@@ -52,10 +56,12 @@ func (r *RateLimiter) Allow(_ context.Context, key string, limit int, now time.T
 		window = rateWindow{startedAt: now, count: 0}
 	}
 	if window.count >= limit {
+		window.limited = true
 		shard.windows[key] = window
 		return false, nil
 	}
 	window.count++
+	window.limited = window.count >= limit
 	shard.windows[key] = window
 	if len(shard.windows) > maxEntriesPerShard() {
 		cleanupRateShard(shard, now)
@@ -63,6 +69,12 @@ func (r *RateLimiter) Allow(_ context.Context, key string, limit int, now time.T
 	return true, nil
 }
 
+func (r *RateLimiter) shard(key string) *rateShard {
+	return &r.shards[maphash.String(r.seed, key)%shardCount]
+}
+
+// cleanupRateShard 先删除过期窗口，再按开始时间淘汰未达上限的窗口；只有分片中
+// 只剩已达上限的窗口时才淘汰它们，避免溢出重置正在生效的限流。
 func cleanupRateShard(shard *rateShard, now time.Time) {
 	for key, window := range shard.windows {
 		if now.Sub(window.startedAt) >= time.Minute {
@@ -70,16 +82,27 @@ func cleanupRateShard(shard *rateShard, now time.Time) {
 		}
 	}
 	for len(shard.windows) > maxEntriesPerShard() {
-		var oldestKey string
-		var oldest time.Time
-		for key, window := range shard.windows {
-			if oldestKey == "" || window.startedAt.Before(oldest) {
-				oldestKey = key
-				oldest = window.startedAt
-			}
+		key, found := oldestRateWindow(shard.windows, false)
+		if !found {
+			key, _ = oldestRateWindow(shard.windows, true)
 		}
-		delete(shard.windows, oldestKey)
+		delete(shard.windows, key)
 	}
+}
+
+func oldestRateWindow(windows map[string]rateWindow, limited bool) (string, bool) {
+	var oldestKey string
+	var oldest time.Time
+	found := false
+	for key, window := range windows {
+		if window.limited != limited {
+			continue
+		}
+		if !found || window.startedAt.Before(oldest) {
+			oldestKey, oldest, found = key, window.startedAt, true
+		}
+	}
+	return oldestKey, found
 }
 
 // ConcurrencyLimiter 提供单实例并发租约。

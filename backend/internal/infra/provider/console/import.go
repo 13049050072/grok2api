@@ -134,6 +134,10 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 // The password is never read or stored: nothing on the Console path uses it.
 const consoleFieldSeparator = "----"
 
+// maxConsoleLineFields is the field count of the full layout; longer lines
+// can only come from a password containing the separator.
+const maxConsoleLineFields = 7
+
 func parseSeparatedConsoleLine(line string, lineNumber int) (*provider.CredentialSeed, error) {
 	fields := strings.Split(strings.TrimSpace(line), consoleFieldSeparator)
 	for index := range fields {
@@ -142,7 +146,14 @@ func parseSeparatedConsoleLine(line string, lineNumber int) (*provider.Credentia
 	if len(fields) < 3 {
 		return nil, fmt.Errorf("第 %d 行格式无效：应为 邮箱----密码----sso[----workosSession----workosXaiOrigin----workosId----x-apikey]", lineNumber)
 	}
-	token := sanitizeSSOToken(fields[2])
+	ssoIndex, ok := provider.RegistrationSSOIndex(fields)
+	if !ok {
+		if len(fields) > maxConsoleLineFields {
+			return nil, fmt.Errorf("第 %d 行无法确定 sso 字段：密码可能包含分隔符 %s，请改用 JSON 导入", lineNumber, consoleFieldSeparator)
+		}
+		ssoIndex = 2
+	}
+	token := sanitizeSSOToken(fields[ssoIndex])
 	if token == "" {
 		return nil, fmt.Errorf("第 %d 行缺少 sso", lineNumber)
 	}
@@ -162,7 +173,7 @@ func parseSeparatedConsoleLine(line string, lineNumber int) (*provider.Credentia
 	}
 	seed := credentialSeed(name, token)
 	seed.Email = email
-	applyConsoleCaches(&seed, field(6), field(3), field(4), field(5))
+	applyConsoleCaches(&seed, field(ssoIndex+4), field(ssoIndex+1), field(ssoIndex+2), field(ssoIndex+3))
 	return &seed, nil
 }
 

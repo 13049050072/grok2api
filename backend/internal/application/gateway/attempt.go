@@ -109,6 +109,12 @@ func (r *failureAttemptRecorder) captureResponse(credential accountdomain.Creden
 		var err error
 		var replay io.ReadCloser
 		body, replay, bodyTruncated, err = readResponseBody(response.Body)
+		if err != nil {
+			// Callers discard the response when this error is returned, so the
+			// upstream body must be closed here rather than handed back.
+			_ = replay.Close()
+			replay = io.NopCloser(bytes.NewReader(nil))
+		}
 		response.Body = replay
 		body, bodyTruncated = r.captureBody(body, bodyTruncated)
 		if err != nil {

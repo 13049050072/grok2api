@@ -53,6 +53,9 @@ func TestPublicImageSupportsGetHeadAndETag(t *testing.T) {
 	if get.Code != http.StatusOK || get.Header().Get("Content-Type") != "image/png" || get.Body.Len() != len(raw) || get.Header().Get("ETag") == "" {
 		t.Fatalf("GET status=%d headers=%#v size=%d", get.Code, get.Header(), get.Body.Len())
 	}
+	if got := get.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("capability image URL must stay out of shared caches, Cache-Control = %q", got)
+	}
 	head := httptest.NewRecorder()
 	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, path, nil))
 	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
@@ -100,6 +103,9 @@ func TestPublicVideoAssetSupportsGetHeadAndRange(t *testing.T) {
 	wantDisposition := `inline; filename="` + asset.ID + `.mp4"`
 	if get.Code != http.StatusOK || get.Body.Len() != len(payload) || get.Header().Get("Content-Type") != "video/mp4" || get.Header().Get("Content-Disposition") != wantDisposition || get.Header().Get("ETag") == "" {
 		t.Fatalf("GET status=%d size=%d headers=%#v", get.Code, get.Body.Len(), get.Header())
+	}
+	if got := get.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("capability video URL must stay out of shared caches, Cache-Control = %q", got)
 	}
 	head := httptest.NewRecorder()
 	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, path, nil))

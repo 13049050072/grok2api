@@ -1613,34 +1613,76 @@ func (r *AccountRepository) ReplaceCredentialIfUnique(ctx context.Context, id ui
 	return nil
 }
 
+// Update 只写管理端可编辑的设置与 auth_status/last_error。令牌、身份、额度、冷却、出口与 Web 资料
+// 都有各自的写入路径，调用方手里的旧快照不得覆盖并发刷新、身份同步或健康状态写入。
 func (r *AccountRepository) Update(ctx context.Context, value account.Credential) (account.Credential, error) {
-	var row accountModel
 	var storedProvider account.Provider
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing accountModel
-		if err := tx.Select("id", "identity_key", "created_at", "provider", "auth_status", "reauth_marked_at").First(&existing, value.ID).Error; err != nil {
+		if err := tx.Select("id", "provider", "auth_status", "reauth_marked_at", "egress_node_id").First(&existing, value.ID).Error; err != nil {
 			return err
 		}
 		storedProvider = account.Provider(existing.Provider)
 		value.Provider = storedProvider
-		row = fromAccountDomain(value)
+		row := fromAccountDomain(value)
 		row.ID = existing.ID
-		// 身份同步补充的 user_id/email 不得让普通编辑重写持久化身份键。
-		row.IdentityKey = existing.IdentityKey
-		row.CreatedAt = existing.CreatedAt
+		row.EgressNodeID = existing.EgressNodeID
 		applyReauthMarkedAtTransition(&row, existing)
-		if err := tx.Save(&row).Error; err != nil {
+		now := time.Now().UTC()
+		if err := tx.Model(&accountModel{}).Where("id = ?", row.ID).Updates(map[string]any{
+			"name": row.Name, "enabled": row.Enabled, "priority": row.Priority, "max_concurrent": row.MaxConcurrent,
+			"minimum_remaining": row.MinimumRemaining, "build_super_entitled": row.BuildSuperEntitled, "build_route_mode": row.BuildRouteMode,
+			"auth_status": row.AuthStatus, "last_error": row.LastError, "reauth_marked_at": row.ReauthMarkedAt, "updated_at": now,
+		}).Error; err != nil {
 			return err
 		}
-		if _, err := deleteInvalidEgressLeaseBlocksForAccount(tx, row); err != nil {
+		if err := tx.Model(&accountCredentialModel{}).
+			Where("account_id = ? AND encrypted_cloudflare_cookie <> ?", row.ID, value.EncryptedCloudflareCookie).
+			Updates(map[string]any{"encrypted_cloudflare_cookie": value.EncryptedCloudflareCookie, "updated_at": now}).Error; err != nil {
 			return err
 		}
-		return saveAccountRelations(tx, value, row.ID)
+		_, err := deleteInvalidEgressLeaseBlocksForAccount(tx, row)
+		return err
 	}); err != nil {
 		return account.Credential{}, mapError(err)
 	}
-	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: storedProvider, AccountID: row.ID})
-	return r.Get(ctx, row.ID)
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: storedProvider, AccountID: value.ID})
+	return r.Get(ctx, value.ID)
+}
+
+// MarkReauthRequiredIfCredentialUnchanged 仅在账号仍保存被上游拒绝的 access token 时标记 reauthRequired；
+// 期间已刷新或重新导入的凭据不受旧拒绝影响，此时返回 repository.ErrConflict。
+func (r *AccountRepository) MarkReauthRequiredIfCredentialUnchanged(ctx context.Context, id uint64, rejectedAccessToken, reason string) error {
+	var storedProvider account.Provider
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "provider", "enabled", "egress_node_id").First(&row, id).Error; err != nil {
+			return err
+		}
+		storedProvider = account.Provider(row.Provider)
+		now := time.Now().UTC()
+		result := tx.Model(&accountModel{}).
+			Where("id = ? AND EXISTS (SELECT 1 FROM account_credentials WHERE account_credentials.account_id = provider_accounts.id AND account_credentials.encrypted_primary = ?)", id, rejectedAccessToken).
+			Updates(map[string]any{
+				"auth_status": string(account.AuthStatusReauthRequired), "last_error": truncate(reason, 512),
+				"reauth_marked_at": gorm.Expr("CASE WHEN auth_status = ? AND reauth_marked_at IS NOT NULL THEN reauth_marked_at ELSE ? END", account.AuthStatusReauthRequired, now),
+				"updated_at":       now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return repository.ErrConflict
+		}
+		row.AuthStatus = string(account.AuthStatusReauthRequired)
+		_, err := deleteInvalidEgressLeaseBlocksForAccount(tx, row)
+		return err
+	})
+	if err != nil {
+		return mapError(err)
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: storedProvider, AccountID: id})
+	return nil
 }
 
 // applyReauthMarkedAtTransition 仅在状态切入 reauthRequired 时打锚点；保持 reauth 时保留原锚点；离开 reauth 时清空。
@@ -1878,6 +1920,51 @@ func (r *AccountRepository) UpdateEgressBindings(ctx context.Context, providerVa
 			query = query.Where("node_id <> ?", *nodeID)
 		}
 		deleted := query.Delete(&accountEgressLeaseBlockModel{})
+		if deleted.Error != nil {
+			return deleted.Error
+		}
+		clearedLeaseBlocks = deleted.RowsAffected
+		return nil
+	})
+	if err == nil && clearedLeaseBlocks > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountEgressLeaseChanged, Provider: providerValue})
+	}
+	return updated, mapError(err)
+}
+
+// MoveAutoEgressBindings applies automatic moves to toNodeID only for rows that
+// still hold the binding the plan observed: unbound when fromNodeID is zero,
+// otherwise auto-bound to fromNodeID. Manual bindings and moves committed by
+// another writer in the meantime are left untouched.
+func (r *AccountRepository) MoveAutoEgressBindings(ctx context.Context, providerValue account.Provider, ids []uint64, fromNodeID, toNodeID uint64, assignedAt time.Time) (int64, error) {
+	if len(ids) == 0 || toNodeID == 0 || fromNodeID == toNodeID {
+		return 0, nil
+	}
+	auto := string(account.EgressAssignmentAuto)
+	var updated int64
+	var clearedLeaseBlocks int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx.Model(&accountModel{}).Where("provider = ? AND id IN ?", providerValue, ids)
+		if fromNodeID == 0 {
+			query = query.Where("egress_node_id IS NULL")
+		} else {
+			query = query.Where("egress_node_id = ? AND egress_assignment_mode = ?", fromNodeID, auto)
+		}
+		result := query.Updates(map[string]any{
+			"egress_node_id":         toNodeID,
+			"egress_assignment_mode": auto,
+			"egress_assigned_at":     assignedAt.UTC(),
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		if providerValue != account.ProviderBuild || updated == 0 {
+			return nil
+		}
+		moved := tx.Model(&accountModel{}).Select("id").
+			Where("provider = ? AND id IN ? AND egress_node_id = ? AND egress_assignment_mode = ?", providerValue, ids, toNodeID, auto)
+		deleted := tx.Where("account_id IN (?) AND node_id <> ?", moved, toNodeID).Delete(&accountEgressLeaseBlockModel{})
 		if deleted.Error != nil {
 			return deleted.Error
 		}
@@ -3072,7 +3159,8 @@ func (r *AccountRepository) ListStaleWebQuotaAccountIDs(ctx context.Context, bef
 		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ?", account.ProviderWeb, true, account.AuthStatusActive).
 		Group("account.id").
 		Having("MAX(quota.synced_at) IS NULL OR MAX(quota.synced_at) < ?", before.UTC()).
-		Order("MIN(quota.synced_at) ASC, account.id ASC").
+		// SQLite sorts NULL first and PostgreSQL last; never-synced accounts must lead on both.
+		Order("CASE WHEN MIN(quota.synced_at) IS NULL THEN 0 ELSE 1 END ASC, MIN(quota.synced_at) ASC, account.id ASC").
 		Limit(limit).
 		Scan(&ids).Error
 	return ids, err

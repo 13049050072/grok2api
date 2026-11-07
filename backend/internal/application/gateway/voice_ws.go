@@ -288,6 +288,7 @@ func (s *Service) OpenVoiceWebSocket(ctx context.Context, input VoiceWebSocketIn
 			Operation: operation, Capability: capability,
 		}, nil
 	}
+	writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
 	if lastErr != nil {
 		return nil, lastErr
 	}

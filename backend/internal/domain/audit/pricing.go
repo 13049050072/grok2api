@@ -209,26 +209,53 @@ func EstimateOfficialCost(model string, inputTokens, cachedInputTokens, outputTo
 
 // EstimateOfficialTextReservation 根据请求内容和输出上限计算保守的文本费用预留。
 func EstimateOfficialTextReservation(model string, body []byte) (PricingResult, bool) {
+	return EstimateOfficialTextReservationWithContext(model, body, 0)
+}
+
+// EstimateOfficialTextReservationWithContext 在请求体之外计入服务端已保存的上下文 token
+// （例如 previous_response_id 指向的历史），避免续写请求只按增量输入预留。
+func EstimateOfficialTextReservationWithContext(model string, body []byte, contextInputTokens int64) (PricingResult, bool) {
 	if _, ok := resolveOfficialTokenPrice(model); !ok {
 		return PricingResult{}, false
 	}
-	inputTokens := estimateRequestInputTokens(body)
+	inputTokens := estimateRequestInputTokens(body) + max(0, contextInputTokens)
 	outputTokens := estimateRequestOutputLimit(body)
 	return EstimateOfficialCost(model, inputTokens, 0, outputTokens, inputTokens)
+}
+
+// EstimateRequestInputTokens 使用与费用预留相同的启发式估算请求体的输入 token。
+func EstimateRequestInputTokens(body []byte) int64 {
+	return estimateRequestInputTokens(body)
+}
+
+// EstimateTextTokens 使用与请求估算相同的“约 3 字节 1 token”启发式估算已生成文本的 token。
+func EstimateTextTokens(textBytes int64) int64 {
+	if textBytes <= 0 {
+		return 0
+	}
+	return textBytes/3 + min(1, textBytes%3)
+}
+
+// RequestOutputTokenLimit 返回请求显式声明的输出 token 上限；未声明时返回 false。
+func RequestOutputTokenLimit(body []byte) (int64, bool) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return 0, false
+	}
+	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
+		var value int64
+		if raw, ok := payload[key]; ok && json.Unmarshal(raw, &value) == nil && value > 0 {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 func estimateRequestOutputLimit(body []byte) int64 {
 	const defaultOutputTokens int64 = 16_384
 	const maximumOutputTokens int64 = 131_072
-	var payload map[string]json.RawMessage
-	if json.Unmarshal(body, &payload) != nil {
-		return defaultOutputTokens
-	}
-	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
-		var value int64
-		if raw, ok := payload[key]; ok && json.Unmarshal(raw, &value) == nil && value > 0 {
-			return min(value, maximumOutputTokens)
-		}
+	if value, ok := RequestOutputTokenLimit(body); ok {
+		return min(value, maximumOutputTokens)
 	}
 	return defaultOutputTokens
 }

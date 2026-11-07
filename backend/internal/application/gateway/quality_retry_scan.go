@@ -509,6 +509,8 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 	var held bytes.Buffer
 	holdTimer := time.NewTimer(cfg.HoldTimeout)
 	defer holdTimer.Stop()
+	hardLimit := time.NewTimer(qualityHoldHardLimit(cfg.HoldTimeout))
+	defer hardLimit.Stop()
 	for {
 		sig := state.signals()
 		if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
@@ -531,6 +533,10 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
 				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
 			}
+		case <-hardLimit.C:
+			state.holdExpired = true
+			sig.HoldExpired = true
+			return resolveQualityHoldLimit(&held, pump, &state, sig, cfg)
 		case result, ok := <-pump.results:
 			if !ok {
 				return finishQualityPeek(&held, pump, &state, cfg)
@@ -552,6 +558,21 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			}
 		}
 	}
+}
+
+// resolveQualityHoldLimit ends a hold that is still undecided at the hard
+// limit. A stream with any generation evidence is delivered unverified rather
+// than held further; one without any evidence keeps the empty-stream outcome,
+// so reaching the limit never fails open on silence.
+func resolveQualityHoldLimit(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, sig QualityStreamSignals, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+	verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens)
+	if verdict == QualityWait {
+		if !sig.HasThinking && !sig.ReasoningStarted && !state.semanticOutput && sig.VisibleTokens <= 0 && sig.OutputTokens <= 0 {
+			return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
+		}
+		verdict = QualityDeliver
+	}
+	return newPrefixReplay(held, pump), verdict, state.usage, state.responseID, nil
 }
 
 func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {

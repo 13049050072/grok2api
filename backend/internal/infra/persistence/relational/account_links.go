@@ -81,32 +81,131 @@ func linkWebToConsole(tx *gorm.DB, webAccountID, consoleAccountID uint64) error 
 	return tx.Create(&webConsoleAccountLinkModel{WebAccountID: webAccountID, ConsoleAccountID: consoleAccountID, CreatedAt: time.Now().UTC()}).Error
 }
 
+// accountIdentityDuplicate is another same-provider row that already carries the identity being written.
+type accountIdentityDuplicate struct {
+	ID        uint64
+	MatchedBy string
+	// SharesEmail means the duplicate preview, which groups by email, will list both rows.
+	SharesEmail bool
+}
+
+// UpdateIdentityMetadata fills synchronized identity fields. Unidentified rows may coexist with
+// identified ones, so the fill must not silently create a second row for one upstream account:
+// duplicates that the email-based duplicate preview can show are written and logged; others are
+// not written and the row records last_error so an administrator can resolve them.
 func (r *AccountRepository) UpdateIdentityMetadata(ctx context.Context, accountID uint64, email, userID, teamID string) error {
 	if accountID == 0 {
 		return repository.ErrNotFound
 	}
-	updates := make(map[string]any, 3)
-	if email = strings.TrimSpace(email); email != "" {
-		updates["email"] = email
-	}
-	if userID = strings.TrimSpace(userID); userID != "" {
-		updates["user_id"] = userID
-	}
-	if teamID = strings.TrimSpace(teamID); teamID != "" {
-		updates["team_id"] = teamID
-	}
-	if len(updates) == 0 {
+	email, userID, teamID = strings.TrimSpace(email), strings.TrimSpace(userID), strings.TrimSpace(teamID)
+	if email == "" && userID == "" && teamID == "" {
 		return nil
 	}
-	result := r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", accountID).Updates(updates)
-	if result.Error != nil {
-		return mapError(result.Error)
+	var (
+		providerValue account.Provider
+		duplicates    []accountIdentityDuplicate
+		lastError     string
+	)
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Shares the lock with CreateCredentialIfAbsent and imports so their duplicate checks see this write.
+		if err := lockAccountLinkMutation(tx); err != nil {
+			return err
+		}
+		var current accountModel
+		if err := tx.Select("id", "provider", "email", "user_id", "team_id").First(&current, accountID).Error; err != nil {
+			return err
+		}
+		providerValue = account.Provider(current.Provider)
+		updates := make(map[string]any, 3)
+		nextEmail, nextUserID, nextTeamID := strings.TrimSpace(current.Email), strings.TrimSpace(current.UserID), strings.TrimSpace(current.TeamID)
+		if email != "" {
+			updates["email"], nextEmail = email, email
+		}
+		if userID != "" {
+			updates["user_id"], nextUserID = userID, userID
+		}
+		if teamID != "" {
+			updates["team_id"], nextTeamID = teamID, teamID
+		}
+		var err error
+		duplicates, err = findAccountIdentityDuplicates(tx, current, nextEmail, nextUserID, nextTeamID)
+		if err != nil {
+			return err
+		}
+		for _, duplicate := range duplicates {
+			if !duplicate.SharesEmail {
+				lastError = accountIdentityDuplicateLastError(duplicates)
+				return tx.Model(&accountModel{}).Where("id = ?", accountID).Update("last_error", lastError).Error
+			}
+		}
+		updates["last_error"] = gorm.Expr("CASE WHEN last_error LIKE ? THEN '' ELSE last_error END", accountIdentityDuplicateErrorPrefix+"%")
+		return tx.Model(&accountModel{}).Where("id = ?", accountID).Updates(updates).Error
+	})
+	if err != nil {
+		return mapError(err)
 	}
-	if result.RowsAffected == 0 {
-		return repository.ErrNotFound
+	for _, duplicate := range duplicates {
+		slog.Warn("account_identity_duplicate",
+			"account_id", accountID,
+			"duplicate_account_id", duplicate.ID,
+			"provider", providerValue,
+			"matched_by", duplicate.MatchedBy,
+			"identity_written", lastError == "",
+		)
 	}
-	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: accountID})
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: providerValue, AccountID: accountID})
+	if lastError != "" {
+		return fmt.Errorf("%w: %s", repository.ErrConflict, lastError)
+	}
 	return nil
+}
+
+// findAccountIdentityDuplicates mirrors the safe-import identity (email, or user_id with team_id)
+// and only reports matches introduced by fields this write changes.
+func findAccountIdentityDuplicates(tx *gorm.DB, current accountModel, nextEmail, nextUserID, nextTeamID string) ([]accountIdentityDuplicate, error) {
+	emailChanged := nextEmail != "" && !strings.EqualFold(nextEmail, strings.TrimSpace(current.Email))
+	userChanged := nextUserID != "" && (nextUserID != strings.TrimSpace(current.UserID) || nextTeamID != strings.TrimSpace(current.TeamID))
+	if !emailChanged && !userChanged {
+		return nil, nil
+	}
+	query := tx.Model(&accountModel{}).Select("id", "email", "user_id", "team_id").
+		Where("provider = ? AND id <> ?", current.Provider, current.ID)
+	switch {
+	case emailChanged && userChanged:
+		query = query.Where("lower(trim(email)) = ? OR (trim(user_id) = ? AND COALESCE(trim(team_id), '') = ?)", strings.ToLower(nextEmail), nextUserID, nextTeamID)
+	case emailChanged:
+		query = query.Where("lower(trim(email)) = ?", strings.ToLower(nextEmail))
+	default:
+		query = query.Where("trim(user_id) = ? AND COALESCE(trim(team_id), '') = ?", nextUserID, nextTeamID)
+	}
+	var rows []accountModel
+	if err := query.Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	duplicates := make([]accountIdentityDuplicate, 0, len(rows))
+	for _, row := range rows {
+		sharesEmail := nextEmail != "" && strings.EqualFold(strings.TrimSpace(row.Email), nextEmail)
+		matchedBy := "user_id"
+		if sharesEmail {
+			matchedBy = "email"
+		}
+		duplicates = append(duplicates, accountIdentityDuplicate{ID: row.ID, MatchedBy: matchedBy, SharesEmail: sharesEmail})
+	}
+	return duplicates, nil
+}
+
+const accountIdentityDuplicateErrorPrefix = "身份同步发现同类型账号"
+
+func accountIdentityDuplicateLastError(duplicates []accountIdentityDuplicate) string {
+	const shown = 5
+	ids := make([]string, 0, min(len(duplicates), shown))
+	for _, duplicate := range duplicates[:min(len(duplicates), shown)] {
+		ids = append(ids, fmt.Sprintf("#%d", duplicate.ID))
+	}
+	if len(duplicates) > shown {
+		ids = append(ids, fmt.Sprintf("等 %d 个", len(duplicates)))
+	}
+	return fmt.Sprintf("%s %s 已使用相同用户 ID，未写入邮箱和用户 ID；请核对并删除重复账号", accountIdentityDuplicateErrorPrefix, strings.Join(ids, "、"))
 }
 
 // ReconcileProviderLinks 只建立无歧义的高可信关系；已有不同关系和多候选均保持不变。

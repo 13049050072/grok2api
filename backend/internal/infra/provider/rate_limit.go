@@ -137,7 +137,7 @@ func rateLimitModel(text string) string {
 }
 
 func rateLimitResetAfter(body string) time.Duration {
-	index := strings.Index(strings.ToLower(body), "resets in:")
+	index := IndexFoldASCII(body, "resets in:")
 	if index < 0 {
 		return 0
 	}

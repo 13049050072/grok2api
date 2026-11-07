@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
 const anthropicBillingHeaderPrefix = "x-anthropic-billing-header: "
@@ -740,7 +742,7 @@ func anthropicWebSearchQuery(messages []anthropicMessage) string {
 		if text == "" {
 			continue
 		}
-		if offset := strings.Index(strings.ToLower(text), prefix); offset >= 0 {
+		if offset := provider.IndexFoldASCII(text, prefix); offset >= 0 {
 			text = strings.TrimSpace(text[offset+len(prefix):])
 		}
 		return truncateRunes(strings.TrimSpace(text), 4096)

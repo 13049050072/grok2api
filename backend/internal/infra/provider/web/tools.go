@@ -8,18 +8,26 @@ import (
 	"html"
 	"regexp"
 	"strings"
+
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
 const (
 	maxFunctionTools       = 128
 	maxToolDescriptionSize = 16 << 10
+	// maxToolCallCaptureBytes bounds how much streamed text the sieve holds
+	// back while waiting for </tool_calls>; beyond it the text is released.
+	maxToolCallCaptureBytes = 1 << 20
+
+	toolCallsOpenTag  = "<tool_calls"
+	toolCallsCloseTag = "</tool_calls"
 )
 
 var (
 	toolNamePattern      = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	toolSyntaxPattern    = regexp.MustCompile(`(?i)<tool_calls|<tool_call|<function_call|<invoke\s|"tool_calls"\s*:`)
-	toolCallsRootPattern = regexp.MustCompile(`(?is)<tool_calls\s*>(.*?)</tool_calls\s*>`)
-	toolCallPattern      = regexp.MustCompile(`(?is)<tool_call\s*>(.*?)</tool_call\s*>`)
+	toolCallsRootPattern = regexp.MustCompile(`(?is)<tool_calls\b[^>]*>(.*?)</tool_calls\s*>`)
+	toolCallPattern      = regexp.MustCompile(`(?is)<tool_call\b[^>]*>(.*?)</tool_call\s*>`)
 	toolNameTagPattern   = regexp.MustCompile(`(?is)<tool_name\s*>(.*?)</tool_name\s*>`)
 	toolParamsTagPattern = regexp.MustCompile(`(?is)<parameters\s*>(.*?)</parameters\s*>`)
 	functionCallPattern  = regexp.MustCompile(`(?is)<function_call\s*>(.*?)</function_call\s*>`)
@@ -66,9 +74,14 @@ type toolStreamResult struct {
 
 type toolStreamSieve struct {
 	available map[string]struct{}
-	buffer    string
+	// pending holds a trailing partial "<tool_calls" while not capturing.
+	pending   string
+	capture   strings.Builder
 	capturing bool
 	done      bool
+	// scan and closeStart resume the </tool_calls\s*> search across chunks.
+	scan       int
+	closeStart int
 }
 
 // parseToolConfiguration 兼容 Chat Completions 与 Responses 的函数工具结构。
@@ -422,7 +435,7 @@ func removeToolSyntax(text string, parsed toolParseResult) string {
 }
 
 func newToolStreamSieve(available map[string]struct{}) *toolStreamSieve {
-	return &toolStreamSieve{available: available}
+	return &toolStreamSieve{available: available, closeStart: -1}
 }
 
 // Feed 在流中发现工具 XML 后开始缓存，完整解析前不向客户端泄露内部标记。
@@ -430,44 +443,51 @@ func (s *toolStreamSieve) Feed(chunk string) toolStreamResult {
 	if s.done || chunk == "" {
 		return toolStreamResult{SafeText: chunk}
 	}
-	combined := s.buffer + chunk
-	s.buffer = ""
+	safe := ""
 	if !s.capturing {
-		lower := strings.ToLower(combined)
-		index := strings.Index(lower, "<tool_calls")
+		combined := s.pending + chunk
+		s.pending = ""
+		index := provider.IndexFoldASCII(combined, toolCallsOpenTag)
 		if index < 0 {
-			safe, pending := splitToolPrefix(combined)
-			s.buffer = pending
+			safe, s.pending = splitToolPrefix(combined)
 			return toolStreamResult{SafeText: safe}
 		}
+		safe, chunk = combined[:index], combined[index:]
 		s.capturing = true
-		s.buffer = combined[index:]
-		combined = combined[:index]
 	}
-	lower := strings.ToLower(s.buffer)
-	endIndex := strings.Index(lower, "</tool_calls>")
-	if endIndex < 0 {
-		return toolStreamResult{SafeText: combined}
+	s.capture.WriteString(chunk)
+	captured := s.capture.String()
+	end := s.closingTagEnd(captured)
+	if end < 0 {
+		if len(captured) > maxToolCallCaptureBytes {
+			s.resetCapture()
+			return toolStreamResult{SafeText: safe + captured}
+		}
+		return toolStreamResult{SafeText: safe}
 	}
-	endIndex += len("</tool_calls>")
-	raw := s.buffer[:endIndex]
-	remainder := s.buffer[endIndex:]
+	raw, remainder := captured[:end], captured[end:]
+	s.resetCapture()
 	parsed := parseToolCalls(raw, s.available)
-	s.buffer = ""
-	s.capturing = false
 	s.done = len(parsed.Calls) > 0
 	if len(parsed.Calls) == 0 {
 		raw += remainder
 	}
-	return toolStreamResult{SafeText: combined, Calls: parsed.Calls, Complete: true, Raw: raw}
+	return toolStreamResult{SafeText: safe, Calls: parsed.Calls, Complete: true, Raw: raw}
 }
 
 func (s *toolStreamSieve) Flush() toolStreamResult {
-	if s.done || s.buffer == "" {
+	if s.done {
 		return toolStreamResult{}
 	}
-	raw := s.buffer
-	s.buffer = ""
+	raw := s.pending
+	if s.capturing {
+		raw = s.capture.String()
+	}
+	s.pending = ""
+	s.resetCapture()
+	if raw == "" {
+		return toolStreamResult{}
+	}
 	parsed := parseToolCalls(raw, s.available)
 	if len(parsed.Calls) > 0 {
 		s.done = true
@@ -476,11 +496,48 @@ func (s *toolStreamSieve) Flush() toolStreamResult {
 	return toolStreamResult{SafeText: raw, Complete: parsed.SawSyntax, Raw: raw}
 }
 
+func (s *toolStreamSieve) resetCapture() {
+	s.capture.Reset()
+	s.capturing = false
+	s.scan = 0
+	s.closeStart = -1
+}
+
+// closingTagEnd returns the offset just past the first </tool_calls\s*> in
+// captured (matching toolCallsRootPattern), or -1. captured only grows between
+// calls, so the search resumes where the previous call stopped.
+func (s *toolStreamSieve) closingTagEnd(captured string) int {
+	for {
+		if s.closeStart >= 0 {
+			for s.scan < len(captured) && isToolTagSpace(captured[s.scan]) {
+				s.scan++
+			}
+			if s.scan == len(captured) {
+				return -1
+			}
+			if captured[s.scan] == '>' {
+				return s.scan + 1
+			}
+			s.closeStart = -1
+		}
+		index := provider.IndexFoldASCII(captured[s.scan:], toolCallsCloseTag)
+		if index < 0 {
+			s.scan = max(s.scan, len(captured)-len(toolCallsCloseTag)+1)
+			return -1
+		}
+		s.closeStart = s.scan + index
+		s.scan = s.closeStart + len(toolCallsCloseTag)
+	}
+}
+
+// isToolTagSpace matches RE2's \s, which the tool XML patterns use.
+func isToolTagSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
 func splitToolPrefix(value string) (string, string) {
-	prefix := "<tool_calls"
-	lower := strings.ToLower(value)
-	for size := min(len(prefix)-1, len(lower)); size > 0; size-- {
-		if strings.HasSuffix(lower, prefix[:size]) {
+	for size := min(len(toolCallsOpenTag)-1, len(value)); size > 0; size-- {
+		if provider.HasPrefixFoldASCII(value[len(value)-size:], toolCallsOpenTag[:size]) {
 			return value[:len(value)-size], value[len(value)-size:]
 		}
 	}

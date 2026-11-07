@@ -643,9 +643,73 @@ func TestCleanupCapsExpiredTicketPruningPerInvocation(t *testing.T) {
 	}
 }
 
-func TestCleanupPreservesMetadataWhenLocalObjectIsMissing(t *testing.T) {
+func TestCleanupPreservesMetadataWhenMediaVolumeIsUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, root string, store *localmedia.LocalStore) repository.MediaObjectStorage
+	}{
+		{
+			name: "volume replaced by empty mount point",
+			prepare: func(t *testing.T, root string, store *localmedia.LocalStore) repository.MediaObjectStorage {
+				if err := os.RemoveAll(root); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(root, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return store
+			},
+		},
+		{
+			name: "store without health check",
+			prepare: func(_ *testing.T, _ string, store *localmedia.LocalStore) repository.MediaObjectStorage {
+				return objectStorageWithoutHealthCheck{store}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "media-missing.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			if err := database.InitializeSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+			root := filepath.Join(t.TempDir(), "objects")
+			store, err := localmedia.NewLocalStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assets := relational.NewMediaAssetRepository(database)
+			raw, _ := base64.StdEncoding.DecodeString(onePixelPNG)
+			id := "img_missing_0000000000000001"
+			key, err := store.SaveImage(ctx, id, "image/png", raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := assets.CreateMediaAsset(ctx, mediadomain.Asset{ID: id, Kind: "image", StorageKey: key, MIMEType: "image/png", SizeBytes: int64(len(raw)), SHA256: strings.Repeat("a", 64), CreatedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Delete(ctx, key); err != nil {
+				t.Fatal(err)
+			}
+			objects := tc.prepare(t, root, store)
+			service := NewService(assets, relational.NewMediaJobRepository(database), objects, nil, Config{PublicBaseURL: "https://api.example", MaxImageBytes: 32 << 20, MaxTotalBytes: int64(len(raw)), CleanupThresholdPercent: 50, CleanupInterval: 10 * time.Minute})
+			if _, err := service.Cleanup(ctx); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cleanup error = %v", err)
+			}
+			if _, err := assets.GetMediaAsset(ctx, id); err != nil {
+				t.Fatalf("shared metadata was deleted: %v", err)
+			}
+		})
+	}
+}
+
+func TestCleanupRemovesOrphanMetadataAndContinuesWhenStoreIsHealthy(t *testing.T) {
 	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "media-missing.db"))
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "media-orphan.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,30 +717,114 @@ func TestCleanupPreservesMetadataWhenLocalObjectIsMissing(t *testing.T) {
 	if err := database.InitializeSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
-	objects, err := localmedia.NewLocalStore(filepath.Join(t.TempDir(), "objects"))
+	store, err := localmedia.NewLocalStore(filepath.Join(t.TempDir(), "objects"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	repository := relational.NewMediaAssetRepository(database)
+	assets := relational.NewMediaAssetRepository(database)
 	raw, _ := base64.StdEncoding.DecodeString(onePixelPNG)
-	id := "img_missing_0000000000000001"
-	key, err := objects.SaveImage(ctx, id, "image/png", raw)
+	base := time.Now().UTC().Add(-time.Hour)
+	ids := []string{"img_orphan_0000000000000001", "img_oldest_0000000000000002", "img_newest_0000000000000003"}
+	keys := make([]string, len(ids))
+	for index, id := range ids {
+		key, err := store.SaveImage(ctx, id, "image/png", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys[index] = key
+		if err := assets.CreateMediaAsset(ctx, mediadomain.Asset{ID: id, Kind: "image", StorageKey: key, MIMEType: "image/png", SizeBytes: int64(len(raw)), SHA256: strings.Repeat("a", 64), CreatedAt: base.Add(time.Duration(index) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Delete(ctx, keys[0]); err != nil {
+		t.Fatal(err)
+	}
+	// 阈值只容得下一张图：孤儿元数据之后的最旧图片也必须继续被回收。
+	service := NewService(assets, relational.NewMediaJobRepository(database), store, nil, Config{PublicBaseURL: "https://api.example", MaxImageBytes: 32 << 20, MaxTotalBytes: 3 * int64(len(raw)), CleanupThresholdPercent: 50, CleanupInterval: 10 * time.Minute})
+	deleted, err := service.Cleanup(ctx)
+	if err != nil || deleted != 2 {
+		t.Fatalf("cleanup deleted=%d err=%v", deleted, err)
+	}
+	for _, id := range ids[:2] {
+		if _, err := assets.GetMediaAsset(ctx, id); !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("metadata %s err = %v", id, err)
+		}
+	}
+	if _, err := store.Open(ctx, keys[1]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oldest object open err = %v", err)
+	}
+	if _, err := assets.GetMediaAsset(ctx, ids[2]); err != nil {
+		t.Fatalf("newest metadata was deleted: %v", err)
+	}
+	body, err := store.Open(ctx, keys[2])
+	if err != nil {
+		t.Fatalf("newest object was deleted: %v", err)
+	}
+	_ = body.Close()
+}
+
+func TestAdminDeleteImagesDeletesMetadataBeforeObject(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "media-admin-delete.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repository.CreateMediaAsset(ctx, mediadomain.Asset{ID: id, Kind: "image", StorageKey: key, MIMEType: "image/png", SizeBytes: int64(len(raw)), SHA256: strings.Repeat("a", 64), CreatedAt: time.Now().UTC()}); err != nil {
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := objects.Delete(ctx, key); err != nil {
+	store, err := localmedia.NewLocalStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	service := NewService(repository, relational.NewMediaJobRepository(database), objects, nil, Config{PublicBaseURL: "https://api.example", MaxImageBytes: 32 << 20, MaxTotalBytes: int64(len(raw)), CleanupThresholdPercent: 50, CleanupInterval: 10 * time.Minute})
-	if _, err := service.Cleanup(ctx); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("cleanup error = %v", err)
+	assets := relational.NewMediaAssetRepository(database)
+	raw, _ := base64.StdEncoding.DecodeString(onePixelPNG)
+	createImage := func(id string) string {
+		key, err := store.SaveImage(ctx, id, "image/png", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := assets.CreateMediaAsset(ctx, mediadomain.Asset{ID: id, Kind: "image", StorageKey: key, MIMEType: "image/png", SizeBytes: int64(len(raw)), SHA256: strings.Repeat("a", 64), CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		return key
 	}
-	if _, err := repository.GetMediaAsset(ctx, id); err != nil {
-		t.Fatalf("shared metadata was deleted: %v", err)
+
+	keptKey := createImage("img_admin_keep_00000000000001")
+	failing := NewService(failingMediaAssetDelete{MediaAssetRepository: assets}, relational.NewMediaJobRepository(database), store, nil, Config{PublicBaseURL: "https://api.example", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 20, CleanupThresholdPercent: 80, CleanupInterval: 10 * time.Minute})
+	if _, err := failing.AdminDeleteImages(ctx, []string{"img_admin_keep_00000000000001"}); err == nil {
+		t.Fatal("metadata delete failure was ignored")
 	}
+	body, err := store.Open(ctx, keptKey)
+	if err != nil {
+		t.Fatalf("object was deleted although its metadata remains: %v", err)
+	}
+	_ = body.Close()
+
+	missingKey := createImage("img_admin_miss_00000000000002")
+	if err := store.Delete(ctx, missingKey); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(assets, relational.NewMediaJobRepository(database), store, nil, Config{PublicBaseURL: "https://api.example", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 20, CleanupThresholdPercent: 80, CleanupInterval: 10 * time.Minute})
+	deleted, err := service.AdminDeleteImages(ctx, []string{"img_admin_miss_00000000000002"})
+	if err != nil || deleted != 1 {
+		t.Fatalf("delete orphan metadata deleted=%d err=%v", deleted, err)
+	}
+	if _, err := assets.GetMediaAsset(ctx, "img_admin_miss_00000000000002"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("orphan metadata err = %v", err)
+	}
+}
+
+type objectStorageWithoutHealthCheck struct {
+	repository.MediaObjectStorage
+}
+
+type failingMediaAssetDelete struct {
+	repository.MediaAssetRepository
+}
+
+func (failingMediaAssetDelete) DeleteMediaAsset(context.Context, string) error {
+	return errors.New("metadata delete failed")
 }
 
 func TestPublicImageURLUsesHotReloadedBase(t *testing.T) {

@@ -113,6 +113,10 @@ func eventKey(event repository.InvalidationEvent) invalidationKey {
 		// Health events are intentionally account-scoped. Coalescing different
 		// accounts would silently drop cooldown updates on multi-replica setups.
 		key.accountID = event.AccountID
+	} else if event.Provider == "" {
+		// Receivers resolve the provider from AccountID, so accounts of
+		// different providers must not collapse into one event.
+		key.accountID = event.AccountID
 	}
 	return key
 }

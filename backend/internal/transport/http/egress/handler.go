@@ -28,6 +28,7 @@ type Handler struct {
 	guardStatePath  string
 	guardConfigPath string
 	guardProbe      egressapp.QualityProbeInput
+	guardNodeIDs    map[uint64]struct{}
 	guardStateMu    sync.Mutex
 	guardStateCache qualityGuardStateCache
 	profilesMu      sync.Mutex
@@ -49,6 +50,16 @@ func NewHandler(service *egressapp.Service, guardStatePath ...string) *Handler {
 // payload. The internal caller can select only the physical egress node.
 func (h *Handler) WithQualityGuardProbe(input egressapp.QualityProbeInput) *Handler {
 	h.guardProbe = input
+	return h
+}
+
+// WithQualityGuardNodeIDs limits sidecar enable/disable calls to
+// qualityGuard.nodeIDs. An empty list allows every grok_build node.
+func (h *Handler) WithQualityGuardNodeIDs(ids []uint64) *Handler {
+	h.guardNodeIDs = make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		h.guardNodeIDs[id] = struct{}{}
+	}
 	return h
 }
 
@@ -97,7 +108,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 // available only through administrator authentication.
 func (h *Handler) RegisterQualityGuard(router *gin.RouterGroup) {
 	router.GET("/egress-nodes", h.list)
-	router.PATCH("/egress-nodes/batch", h.updateMany)
+	router.PATCH("/egress-nodes/batch", h.updateQualityGuardNodes)
 	router.POST("/egress-nodes/:id/test", h.testNode)
 	router.POST("/egress-nodes/:id/quality-test", h.testQualityGuardNode)
 	router.GET("/egress-leases", h.listQualityGuardLeases)
@@ -805,6 +816,55 @@ func (h *Handler) updateMany(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"updated": updated})
+}
+
+// updateQualityGuardNodes lets the sidecar toggle only `enabled` on managed
+// grok_build nodes. Out-of-scope IDs are listed in `rejected` and left
+// untouched, but the response stays 200: the sidecar treats updated != 1 as
+// "not applied", whereas an HTTP error from its unguarded restore path would
+// abort every subsequent cycle after a nodeIDs change.
+func (h *Handler) updateQualityGuardNodes(c *gin.Context) {
+	var request batchNodeUpdateRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || request.Enabled == nil || !errors.Is(decoder.Decode(&struct{}{}), io.EOF) {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseBoundedEgressNodeIDs(request.IDs, 5000)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", "代理节点 ID 无效")
+		return
+	}
+	buildNodes, err := h.service.ListAll(c.Request.Context(), egressdomain.ScopeBuild, repository.SortQuery{})
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	buildNodeIDs := make(map[uint64]struct{}, len(buildNodes))
+	for _, node := range buildNodes {
+		buildNodeIDs[node.ID] = struct{}{}
+	}
+	allowed := make([]uint64, 0, len(ids))
+	rejected := make([]string, 0)
+	for _, id := range ids {
+		_, isBuild := buildNodeIDs[id]
+		_, managed := h.guardNodeIDs[id]
+		if isBuild && (len(h.guardNodeIDs) == 0 || managed) {
+			allowed = append(allowed, id)
+		} else {
+			rejected = append(rejected, strconv.FormatUint(id, 10))
+		}
+	}
+	updated := 0
+	if len(allowed) > 0 {
+		updated, err = h.service.UpdateManyEnabled(c.Request.Context(), allowed, *request.Enabled)
+		if err != nil {
+			h.writeError(c, err)
+			return
+		}
+	}
+	response.Success(c, http.StatusOK, gin.H{"updated": updated, "rejected": rejected})
 }
 
 func (h *Handler) deleteMany(c *gin.Context) {

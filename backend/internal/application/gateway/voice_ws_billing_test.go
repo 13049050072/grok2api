@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -24,17 +25,29 @@ func (*billingPoCVoiceConn) WriteMessage(int, []byte) error    { return nil }
 func (*billingPoCVoiceConn) SetReadLimit(int64)                {}
 func (*billingPoCVoiceConn) Close() error                      { return nil }
 
-type billingPoCVoiceAdapter struct{ conn *billingPoCVoiceConn }
+type billingPoCVoiceAdapter struct {
+	conn    *billingPoCVoiceConn
+	dialErr error
+}
 
 func (*billingPoCVoiceAdapter) Provider() account.Provider { return account.ProviderConsole }
 func (*billingPoCVoiceAdapter) Definition() provider.Definition {
 	return provider.Definition{Provider: account.ProviderConsole, Media: provider.MediaSurface{STT: true, Realtime: true}}
 }
 func (a *billingPoCVoiceAdapter) DialVoiceWebSocket(context.Context, provider.VoiceWebSocketRequest) (provider.VoiceWebSocketConn, func(), error) {
+	if a.dialErr != nil {
+		return nil, nil, a.dialErr
+	}
 	return a.conn, func() {}, nil
 }
 
 func buildBillingTestService(t *testing.T) (*Service, *relational.ClientKeyRepository, clientkey.Key) {
+	t.Helper()
+	service, keyRepo, _, key := buildVoiceWSTestService(t, &billingPoCVoiceAdapter{conn: &billingPoCVoiceConn{}})
+	return service, keyRepo, key
+}
+
+func buildVoiceWSTestService(t *testing.T, adapter *billingPoCVoiceAdapter) (*Service, *relational.ClientKeyRepository, *relational.AuditRepository, clientkey.Key) {
 	t.Helper()
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "voice-billing.db"))
@@ -68,13 +81,30 @@ func buildBillingTestService(t *testing.T) (*Service, *relational.ClientKeyRepos
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter := &billingPoCVoiceAdapter{conn: &billingPoCVoiceConn{}}
 	registry := provider.NewRegistry(adapter)
 	sticky := memory.NewStickyStore()
 	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
 	accounts := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
 	keys := clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil)
-	return NewService(modelRepo, auditRepo, accounts, keys, registry, selector, nil, 1), keyRepo, key
+	return NewService(modelRepo, auditRepo, accounts, keys, registry, selector, nil, 1), keyRepo, auditRepo, key
+}
+
+func TestVoiceWSExhaustedCredentialRetriesWriteFailureAudit(t *testing.T) {
+	adapter := &billingPoCVoiceAdapter{dialErr: videoHTTPStatusError{status: http.StatusUnauthorized}}
+	service, _, auditRepo, key := buildVoiceWSTestService(t, adapter)
+	if _, err := service.OpenVoiceWebSocket(context.Background(), VoiceWebSocketInput{RequestID: "rejected-sso", ClientKey: key, PublicModel: "billing-stt", Path: "/stt"}); err == nil {
+		t.Fatal("rejected SSO dial must fail the websocket open")
+	}
+	logs, total, err := auditRepo.List(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || logs[0].RequestID != "rejected-sso" || logs[0].StatusCode != http.StatusServiceUnavailable || logs[0].ErrorCode != "upstream_unavailable" || logs[0].Operation != audit.OperationSTT {
+		t.Fatalf("audit = %#v, total = %d", logs, total)
+	}
+	if logs[0].AccountID == nil || logs[0].AccountName != "billing-console" {
+		t.Fatalf("audit account = %v %q, want the rejected credential", logs[0].AccountID, logs[0].AccountName)
+	}
 }
 
 // A client disconnecting after a confirmed transcript.done duration must

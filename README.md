@@ -191,6 +191,8 @@ bootstrapAdmin:
   password: "replace-with-a-strong-password"
 ```
 
+grok2api refuses to start while any of these placeholders remain, or when `jwtSecret` is shorter than 32 characters or uses fewer than 8 distinct characters. The bootstrap password must be 8–72 bytes (the bcrypt limit).
+
 Start the service:
 
 ```bash
@@ -352,9 +354,13 @@ Authorization: Bearer g2a_xxx_xxx
 
 `/v1/images/edits` accepts `application/json` and `multipart/form-data`: each entry of `image`/`images` may be an HTTP(S) or data URL, an `input_` temporary `file_id`, or a plain string, and multipart file fields (`image`, `images`, `image[]`, `images[]`) take PNG, JPEG, WebP, or GIF up to 20 MiB per file.
 
+`/healthz`, `/readyz`, and `/v1/media/*` do not take a client key. The anonymous `/readyz` response carries only the overall and per-component state and is recomputed at most every 5 seconds. Media URLs are unauthenticated capability URLs: anyone who has an asset URL can read the file until it is deleted or cleaned up, so share them like secret links. They are served with `Cache-Control: private`, so shared caches and CDNs do not keep copies after deletion. `input_` temporary file ids are likewise global capability ids: they are not bound to the client key that staged them, and any client key that knows one can reference it until it expires.
+
 Stored responses and compact depend on the selected Provider. The signed-in admin console provides live examples at `/docs`; Swagger is available only when `server.swaggerEnabled: true`.
 
 `/v1/audio/transcriptions` supports `json` (default), `verbose_json`, and `text`. Video edit/extension routes must resolve to Console `grok-imagine-video`; custom public model names remain supported. Monetary billing is applied only when the gateway can reliably measure the official pricing unit: TTS is reserved and settled from its input character count, while REST and streaming STT are settled from the actual audio duration returned by a successful response. Because STT duration is known only after completion, concurrent requests may briefly take a billing-limited key beyond its spend limit. Realtime, video edits/extensions, and custom routes without a recognized official price are currently audited as unpriced; they remain callable and do not consume the spend limit.
+
+Text requests reserve an estimate built from the request body plus, for `previous_response_id` continuations, the stored context size this instance recorded for that response. Context the gateway cannot see before the call (responses stored by another instance or before a restart, provider-side reasoning replay, server-side tool results) is billed at settlement but not reserved, so it can likewise take a billing-limited key past its limit. When a successful stream is cut off before its final usage frame, the request is settled from estimated usage (input from the request, output from the text already forwarded) and audited with usage source `estimated`. Non-streaming image, TTS, and REST STT requests whose upstream call succeeded but whose delivery to the client failed are billed as well.
 
 Client keys support model allowlists and optional RPM, concurrency, spend, and expiry limits.
 
@@ -411,7 +417,7 @@ qualityGuard:
     idleAccountCooldown: 15m
 ```
 
-`requestRetry` runs on the gateway request path and is independent of the sidecar. The example above explicitly enables it; built-in defaults and `config.example.yaml` leave both `enabled` and `autoDisable` off. Either switch enables request-path quality checks and retries. A thinking-model stream with enough visible output and no streamed reasoning is **not delivered**; another account is tried. `autoDisable: true` disables an account on the first confirmed missing-thinking or degraded output-speed hit (soft-TPS, hard-TPS, or buffered-burst). The Account Maintenance switch controls `autoDisable`; turning it off restores the YAML `requestRetry.enabled` policy. If every attempt still has no reasoning, `onExhausted` either returns `503 quality_degraded` or delivers the last body. Context compaction is exempt from both missing-thinking and output-speed account penalties. Image, video, stored-response, and ForcedEgress probe requests are unchanged. Grok TUI tool turns stay held so 0-thinking dumps cannot skip the gate.
+`requestRetry` runs on the gateway request path and is independent of the sidecar. The example above explicitly enables it; built-in defaults and `config.example.yaml` leave both `enabled` and `autoDisable` off. Either switch enables request-path quality checks and retries. A thinking-model stream with enough visible output and no streamed reasoning is **not delivered**; another account is tried. `autoDisable: true` disables an account on the first confirmed missing-thinking or degraded output-speed hit (soft-TPS, hard-TPS, or buffered-burst). The Account Maintenance switch controls `autoDisable`; turning it off restores the YAML `requestRetry.enabled` policy. If every attempt still has no reasoning, `onExhausted` either returns `503 quality_degraded` or delivers the last body. Context compaction is exempt from both missing-thinking and output-speed account penalties. Image, video, and ForcedEgress probe requests are unchanged. Stored-response continuations (`previous_response_id`) and turns whose hosted tools may already have had side effects are still held, classified, and can penalize their account, but they are never replayed on another account: a withheld result is resolved through `onExhausted` right away. Grok TUI tool turns stay held so 0-thinking dumps cannot skip the gate. `holdTimeout` is a soft deadline; every hold also has a hard limit of 2 × `holdTimeout` (at least `holdTimeout` + 2 s, at most 50 s) because no response headers are sent while a stream is held. At the hard limit, a stream that has already shown reasoning or output is delivered as-is, and a stream with no output at all is treated as empty (`502 upstream_stream_empty` once no other account can be tried).
 
 ```bash
 docker compose --profile quality-guard up -d --build
@@ -506,16 +512,18 @@ docker network inspect grok2api_default \
   --format '{{(index .IPAM.Config 0).Subnet}}'
 ```
 
-For example, an isolated network reported as `172.20.0.0/16` can be configured as a trusted proxy CIDR. Never use `0.0.0.0/0` or `::/0`; grok2api rejects unrestricted trusted-proxy ranges. Without `trustedProxies`, forwarded headers are ignored and audits contain the direct TCP peer address, preventing clients from spoofing `X-Forwarded-For`.
+For example, an isolated network reported as `172.20.0.0/16` can be configured as a trusted proxy CIDR. Never use broad ranges such as `0.0.0.0/0` or `::/0`: grok2api rejects IPv4 prefixes shorter than `/8` and IPv6 prefixes shorter than `/32`, and evaluates IPv4-mapped IPv6 ranges such as `::ffff:0:0/96` as their IPv4 equivalent. Without `trustedProxies`, forwarded headers are ignored and audits contain the direct TCP peer address, preventing clients from spoofing `X-Forwarded-For`.
+
+Administrator login rate limits are keyed by the same resolved client IP, so behind a proxy without `trustedProxies` all sign-in attempts share the proxy's address. Session cookies are marked `Secure` when `auth.secureCookies` is enabled, when the request arrives over TLS, or when a trusted proxy sends `X-Forwarded-Proto: https`; that header is ignored from any other peer.
 
 If Cloudflare is in front of Nginx, configure Nginx's real-IP module with `CF-Connecting-IP` and Cloudflare's official proxy ranges first. Do not trust `CF-Connecting-IP` from arbitrary peers. Restart grok2api after changing `server.trustedProxies`; reload Nginx after changing its configuration.
 
 Important optional settings:
 
-- `audit.ledgerMode`: `observe` reports ledger faults; `enforce` can pause new inference to protect billing integrity.
+- `audit.ledgerMode`: `observe` only reports ledger faults, including dropped audit records, and never pauses traffic. `enforce` pauses new inference once write failures (`ledgerFailureThreshold`) or a backed-up queue persist past `ledgerUnhealthyGrace`, and after a dropped record until a later batch has been written and no further record has been dropped for max(`ledgerUnhealthyGrace`, 1 minute). `/readyz` follows the same rule.
 - `routing.accountIsolatedConnections`: partitions outbound TCP/HTTP pools by account for external L4 or connection-hash load balancers. It is off by default because it increases connections, TLS handshakes, memory, and file-descriptor usage.
 - `routing.segmentedSelectorEnabled`: enabled by default for pools with at least 3,000 eligible accounts; bounds dynamic concurrency reads while retaining quota/tier priorities, sticky sessions, full-planner fallback, and atomic guards.
-- `routing.autoAssignMaxNodeShare` / `routing.autoAssignMaxMigrationShare`: optional large-pool guards. `0` (default) keeps the historical unbounded first-pass evacuation and the existing 200-move ceiling for capacity/rebalance repair. Set `0.05`–`1` only when a quarantined node would otherwise dump thousands of auto accounts onto the last healthy exits. `GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE` and `GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE` override the YAML when set.
+- `routing.autoAssignMaxNodeShare` / `routing.autoAssignMaxMigrationShare`: optional large-pool guards. `0` (default) keeps the historical unbounded first-pass evacuation and the existing 200-move ceiling for capacity/rebalance repair. Set `0.05`–`1` only when a quarantined node would otherwise dump thousands of auto accounts onto the last healthy exits. Non-empty `GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE` and `GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE` override the YAML at startup (Compose passes them through); they follow the same `0` or `0.05`–`1` rule, and an invalid value stops startup instead of being ignored.
 - Build response-header timeout and exact-match 403 invalidation rules are hot-reloadable.
 - **Sync latest version** applies the validated Grok Build client version and User-Agent.
 
@@ -524,6 +532,7 @@ Important optional settings:
 ## Production checklist
 
 - Use HTTPS and enable `auth.secureCookies`.
+- Behind a reverse proxy on the same host, publish the port on loopback only (`"127.0.0.1:${GROK2API_PORT:-8000}:8000"` in `docker-compose.yml`) so clients cannot bypass the proxy, and list the proxy in `server.trustedProxies`.
 - Keep Swagger disabled on public deployments.
 - Use strong, backed-up secrets; never commit credentials, cookies, exports, or databases.
 - Back up `config.yaml`, the database, and media storage.

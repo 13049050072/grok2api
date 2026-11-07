@@ -179,6 +179,8 @@ bootstrapAdmin:
   password: "替换为强密码"
 ```
 
+保留上述任一占位值，或 `jwtSecret` 少于 32 个字符、不同字符少于 8 种时，grok2api 会拒绝启动。初始管理员密码长度须为 8–72 字节（bcrypt 上限）。
+
 启动服务：
 
 ```bash
@@ -323,9 +325,13 @@ Authorization: Bearer g2a_xxx_xxx
 
 `/v1/images/edits` 接受 `application/json` 与 `multipart/form-data`：`image` / `images` 的每一项可以是 HTTP(S) 或 Data URL、`input_` 开头的临时 `file_id`，也可以直接传字符串；multipart 文件字段（`image`、`images`、`image[]`、`images[]`）支持 PNG、JPEG、WebP、GIF，单文件上限 20 MiB。
 
+`/healthz`、`/readyz` 和 `/v1/media/*` 不需要客户端密钥。匿名 `/readyz` 只返回总体状态和各组件状态，且最多每 5 秒重新计算一次。媒体 URL 是无需鉴权的能力 URL：任何拿到资源 URL 的人都能读取该文件，直到它被删除或清理，请像私密链接一样分享；响应带 `Cache-Control: private`，共享缓存与 CDN 不会在删除后继续保留副本。`input_` 开头的临时 `file_id` 同样是全局能力 ID，不绑定上传它的客户端密钥，任何知道该 ID 的客户端密钥都能在过期前引用它。
+
 stored response 和 compact 取决于最终 Provider。登录管理端后可在 `/docs` 查看当前模型与调用示例；仅在 `server.swaggerEnabled: true` 时提供 Swagger。
 
 `/v1/audio/transcriptions` 支持 `json`（默认）、`verbose_json` 和 `text`。视频编辑与延长按实际路由校验 Console `grok-imagine-video`，对外模型名仍可自定义。金额计费以网关能够可靠测量的官方计价单位为准：TTS 按输入字符数预留并结算，REST 与流式 STT 按成功响应返回的实际音频时长结算。STT 时长只能在请求完成后获得，因此并发中的请求可能使有限额 Key 短暂超过金额上限。Realtime、视频编辑与延长，以及未收录官方定价的自定义路由当前记录为“未计费”，保持可调用且不消耗金额额度。
+
+文本请求按请求体估算预留金额；使用 `previous_response_id` 续写时，还会加上本实例为该响应记录的上下文规模。网关在调用前无法看到的上下文（其他实例或重启前存储的响应、Provider 侧的推理回放、服务端工具结果）会在结算时计费但不会预留，因此同样可能使有限额 Key 超过金额上限。成功的流式响应如果在最终 usage 帧之前中断，会按估算用量结算（输入取自请求，输出取自已转发的文本），审计中 usage 来源记为 `estimated`。上游已成功、仅向客户端交付失败的非流式图片、TTS 与 REST STT 请求同样计费。
 
 客户端密钥支持模型白名单，以及可选的 RPM、并发、用量和截止日期限制。
 
@@ -377,7 +383,7 @@ qualityGuard:
     idleAccountCooldown: 15m
 ```
 
-`requestRetry` 在网关请求路径上生效，与 sidecar 探测/隔离相互独立。上面的示例显式开启；内置默认值和 `config.example.yaml` 均将 `enabled`、`autoDisable` 设为关闭。任一开关开启后都会启用请求内质量检测与重试。可见输出达到 `minOutputTokens` 且全程无流式 reasoning 时**不发给用户**，排除该账号再试；`autoDisable: true` 会在首次确认缺 thinking 或吞吐降智（soft/hard/burst）时直接禁用账号。管理页面的“自动停用降智账号”控制 `autoDisable`，关闭后恢复 YAML 中 `requestRetry.enabled` 的原有策略。全部仍无推理则按 `onExhausted` 返回 `503 quality_degraded` 或放出最后一枪。上下文压缩同时豁免缺 thinking 和输出速度的账号惩罚。不处理图/视频、stored response 钉账号和 ForcedEgress 探针。Grok TUI 带 tools 的回合仍会 hold，避免 0-thinking 降智流跳过闸门。
+`requestRetry` 在网关请求路径上生效，与 sidecar 探测/隔离相互独立。上面的示例显式开启；内置默认值和 `config.example.yaml` 均将 `enabled`、`autoDisable` 设为关闭。任一开关开启后都会启用请求内质量检测与重试。可见输出达到 `minOutputTokens` 且全程无流式 reasoning 时**不发给用户**，排除该账号再试；`autoDisable: true` 会在首次确认缺 thinking 或吞吐降智（soft/hard/burst）时直接禁用账号。管理页面的“自动停用降智账号”控制 `autoDisable`，关闭后恢复 YAML 中 `requestRetry.enabled` 的原有策略。全部仍无推理则按 `onExhausted` 返回 `503 quality_degraded` 或放出最后一枪。上下文压缩同时豁免缺 thinking 和输出速度的账号惩罚。不处理图/视频和 ForcedEgress 探针。stored response 续写（`previous_response_id`）以及托管工具可能已产生副作用的回合仍会 hold、分类，并可能惩罚所在账号，但绝不会换到其他账号重放：被扣下的结果直接按 `onExhausted` 处理。Grok TUI 带 tools 的回合仍会 hold，避免 0-thinking 降智流跳过闸门。`holdTimeout` 是软截止；由于 hold 期间不会发送响应头，每次 hold 另有硬上限：2 × `holdTimeout`（至少 `holdTimeout` + 2 秒，最多 50 秒）。到达硬上限时，已出现推理或输出的流原样放出；完全没有输出的流按空流处理（无其他账号可试时返回 `502 upstream_stream_empty`）。
 
 ```bash
 docker compose --profile quality-guard up -d --build
@@ -465,22 +471,25 @@ docker network inspect grok2api_default \
   --format '{{(index .IPAM.Config 0).Subnet}}'
 ```
 
-例如隔离网络返回 `172.20.0.0/16` 时，可以将该 CIDR 配置为可信代理。不要使用 `0.0.0.0/0` 或 `::/0`；grok2api 会拒绝不受限的可信代理范围。未配置 `trustedProxies` 时，所有转发头都会被忽略，审计记录 TCP 直连对端地址，从而避免客户端伪造 `X-Forwarded-For`。
+例如隔离网络返回 `172.20.0.0/16` 时，可以将该 CIDR 配置为可信代理。不要使用 `0.0.0.0/0`、`::/0` 这类宽泛网段：grok2api 会拒绝短于 `/8` 的 IPv4 前缀和短于 `/32` 的 IPv6 前缀，并将 `::ffff:0:0/96` 等 IPv4 映射网段按等价的 IPv4 网段校验。未配置 `trustedProxies` 时，所有转发头都会被忽略，审计记录 TCP 直连对端地址，从而避免客户端伪造 `X-Forwarded-For`。
+
+管理员登录限流同样按解析出的客户端 IP 计数；位于代理之后却未配置 `trustedProxies` 时，所有登录尝试会共用代理地址。启用 `auth.secureCookies`、请求本身经 TLS 到达，或可信代理发送 `X-Forwarded-Proto: https` 时，会话 Cookie 会带上 `Secure`；其他来源发送的该请求头会被忽略。
 
 如果 Nginx 前还有 Cloudflare，应先使用 Cloudflare 官方代理网段和 `CF-Connecting-IP` 正确配置 Nginx real-IP 模块，不要信任任意来源提供的 `CF-Connecting-IP`。修改 `server.trustedProxies` 后需要重启 grok2api；修改 Nginx 配置后需要重新加载 Nginx。
 
 重要的可选设置：
 
-- `audit.ledgerMode`：`observe` 仅报告账本故障；`enforce` 可暂停新推理以保护计费准确性。
+- `audit.ledgerMode`：`observe` 仅报告账本故障（包括审计记录丢失），从不暂停流量。`enforce` 在写入失败（`ledgerFailureThreshold`）或队列积压持续超过 `ledgerUnhealthyGrace` 时暂停新推理；出现记录丢失后，需等到之后至少一批写入成功，且 max(`ledgerUnhealthyGrace`, 1 分钟) 内没有新的丢失，才恢复。`/readyz` 遵循相同规则。
 - `routing.accountIsolatedConnections`：为外部 L4 或按连接哈希的负载均衡器按账号拆分出站 TCP/HTTP 连接池。默认关闭，因为会增加连接数、TLS 握手、内存和文件描述符占用。
 - `routing.segmentedSelectorEnabled`：默认对至少 3000 个可用账号的大号池启用，限制动态并发读取规模，同时保留额度/等级优先级、会话粘性、完整选号回退与原子门禁。
-- `routing.autoAssignMaxNodeShare` / `routing.autoAssignMaxMigrationShare`：可选的大号池保护。`0`（默认）保持历史行为：不健康节点上的 auto 账号会一次性迁走，容量/再均衡仍最多 200 次。仅在隔离一个节点会把大量账号压到最后几个健康出口时，才设为 `0.05`–`1`。环境变量 `GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE` 与 `GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE` 可覆盖 YAML。
+- `routing.autoAssignMaxNodeShare` / `routing.autoAssignMaxMigrationShare`：可选的大号池保护。`0`（默认）保持历史行为：不健康节点上的 auto 账号会一次性迁走，容量/再均衡仍最多 200 次。仅在隔离一个节点会把大量账号压到最后几个健康出口时，才设为 `0.05`–`1`。环境变量 `GROK2API_AUTO_ASSIGN_MAX_NODE_SHARE` 与 `GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE` 非空时在启动时覆盖 YAML（Compose 已透传），取值规则同样为 `0` 或 `0.05`–`1`，非法值会直接导致启动失败而不是被忽略。
 - Build 响应头超时和精确匹配的 403 失效规则支持热加载。
 - “同步最新版本”可应用已验证的 Grok Build 客户端版本和 User-Agent。
 
 ## 生产检查
 
 - 使用 HTTPS，并启用 `auth.secureCookies`。
+- 反向代理与 grok2api 同机部署时，在 `docker-compose.yml` 中仅在本机回环地址发布端口（`"127.0.0.1:${GROK2API_PORT:-8000}:8000"`），避免客户端绕过代理，并将代理地址加入 `server.trustedProxies`。
 - 公网部署保持 Swagger 关闭。
 - 使用强密钥并妥善备份；不要提交凭据、Cookie、账号导出或数据库。
 - 备份 `config.yaml`、数据库和媒体目录。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -12,13 +13,23 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
+const (
+	loginIPRateLimit      = 30
+	loginAccountRateLimit = 12
+	// maxSessionLifetime 自会话创建起计算，refresh 轮换不能把会话续期到该上限之后。
+	maxSessionLifetime = 90 * 24 * time.Hour
+	// 单个 IPv6 主机通常可支配整段 /64，按完整地址计数时轮换地址即可绕过限流。
+	rateLimitIPv6PrefixBits = 64
+)
+
 var (
-	ErrInvalidCredentials = errors.New("管理员账号或密码错误")
-	ErrInvalidSession     = errors.New("管理员会话无效")
-	ErrBootstrapRequired  = errors.New("首次启动需要设置管理员账号和密码")
-	ErrInvalidPassword    = errors.New("新密码至少需要 8 个字符")
-	ErrLoginRateLimited   = errors.New("管理员登录尝试过于频繁")
-	ErrRuntimeUnavailable = errors.New("管理员认证运行态暂不可用")
+	ErrInvalidCredentials      = errors.New("管理员账号或密码错误")
+	ErrInvalidSession          = errors.New("管理员会话无效")
+	ErrBootstrapRequired       = errors.New("首次启动需要设置管理员账号和密码")
+	ErrBootstrapPasswordLength = fmt.Errorf("bootstrapAdmin.password 长度必须为 %d 到 %d 字节", security.MinPasswordBytes, security.MaxPasswordBytes)
+	ErrInvalidPassword         = fmt.Errorf("新密码长度必须为 %d 到 %d 字节", security.MinPasswordBytes, security.MaxPasswordBytes)
+	ErrLoginRateLimited        = errors.New("管理员登录尝试过于频繁")
+	ErrRuntimeUnavailable      = errors.New("管理员认证运行态暂不可用")
 )
 
 type Tokens struct {
@@ -55,8 +66,11 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 	if count > 0 {
 		return nil
 	}
-	if strings.TrimSpace(username) == "" || len(password) < 8 {
+	if strings.TrimSpace(username) == "" || password == "" {
 		return ErrBootstrapRequired
+	}
+	if len(password) < security.MinPasswordBytes || len(password) > security.MaxPasswordBytes {
+		return ErrBootstrapPasswordLength
 	}
 	hash, err := security.HashPassword(password)
 	if err != nil {
@@ -66,10 +80,10 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 	return err
 }
 
-// Login 校验密码并创建新的可撤销 refresh session。
-func (s *Service) Login(ctx context.Context, username, password, remoteAddress string) (admin.Admin, Tokens, error) {
+// Login 校验密码并创建新的可撤销 refresh session。clientIP 应为按可信代理解析后的调用方地址。
+func (s *Service) Login(ctx context.Context, username, password, clientIP string) (admin.Admin, Tokens, error) {
 	username = strings.TrimSpace(username)
-	if err := s.checkLoginRate(ctx, username, remoteAddress); err != nil {
+	if err := s.checkLoginRate(ctx, username, clientIP); err != nil {
 		return admin.Admin{}, Tokens{}, err
 	}
 	value, err := s.admins.GetByUsername(ctx, username)
@@ -87,7 +101,7 @@ func (s *Service) Login(ctx context.Context, username, password, remoteAddress s
 	return value, tokens, err
 }
 
-// Refresh 轮换 refresh token，旧 token 立即失效。
+// Refresh 轮换 refresh token，旧 token 立即失效；再次提交上一个 token 会撤销整个会话。
 func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (Tokens, error) {
 	hash := security.HashToken(rawRefreshToken)
 	session, err := s.sessions.GetByTokenHash(ctx, hash)
@@ -95,9 +109,10 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (Tokens, 
 		if !errors.Is(err, repository.ErrNotFound) {
 			return Tokens{}, fmt.Errorf("%w: %v", ErrRuntimeUnavailable, err)
 		}
-		return Tokens{}, ErrInvalidSession
+		return Tokens{}, s.revokeReusedSession(ctx, hash)
 	}
-	if !time.Now().UTC().Before(session.ExpiresAt) {
+	now := time.Now().UTC()
+	if !sessionActive(session, now) {
 		return Tokens{}, ErrInvalidSession
 	}
 	adminValue, err := s.admins.GetByID(ctx, session.AdminID)
@@ -115,7 +130,10 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string) (Tokens, 
 	if err != nil {
 		return Tokens{}, err
 	}
-	refreshExpiresAt := time.Now().UTC().Add(s.refreshTTL)
+	refreshExpiresAt := now.Add(s.refreshTTL)
+	if deadline := session.CreatedAt.Add(maxSessionLifetime); refreshExpiresAt.After(deadline) {
+		refreshExpiresAt = deadline
+	}
 	if err := s.sessions.Rotate(ctx, session.ID, hash, security.HashToken(refreshToken), refreshExpiresAt); err != nil {
 		if errors.Is(err, repository.ErrConflict) || errors.Is(err, repository.ErrNotFound) {
 			return Tokens{}, ErrInvalidSession
@@ -153,7 +171,7 @@ func (s *Service) AuthenticateAccess(ctx context.Context, rawAccessToken string)
 		}
 		return admin.Admin{}, ErrInvalidSession
 	}
-	if session.AdminID != identity.AdminID || !time.Now().UTC().Before(session.ExpiresAt) {
+	if session.AdminID != identity.AdminID || !sessionActive(session, time.Now().UTC()) {
 		return admin.Admin{}, ErrInvalidSession
 	}
 	value, err := s.admins.GetByID(ctx, identity.AdminID)
@@ -166,10 +184,14 @@ func (s *Service) AuthenticateAccess(ctx context.Context, rawAccessToken string)
 	return value, nil
 }
 
-// ChangePassword 修改密码并撤销管理员的全部 refresh session。
-func (s *Service) ChangePassword(ctx context.Context, adminID uint64, currentPassword, newPassword string) error {
-	if len(newPassword) < 8 {
+// ChangePassword 修改密码并撤销管理员的全部 refresh session。当前密码校验与登录共用限流器。
+func (s *Service) ChangePassword(ctx context.Context, adminID uint64, currentPassword, newPassword, clientIP string) error {
+	if len(newPassword) < security.MinPasswordBytes || len(newPassword) > security.MaxPasswordBytes {
 		return ErrInvalidPassword
+	}
+	passwordKey := fmt.Sprintf("%d\n%s", adminID, rateLimitClient(clientIP))
+	if err := s.checkRate(ctx, rateLimit{key: "admin-login:password-change:" + security.HashToken(passwordKey), limit: loginAccountRateLimit}); err != nil {
+		return err
 	}
 	value, err := s.admins.GetByID(ctx, adminID)
 	if err != nil {
@@ -193,7 +215,7 @@ func (s *Service) createSession(ctx context.Context, adminID uint64) (Tokens, ad
 	if err != nil {
 		return Tokens{}, admin.Session{}, err
 	}
-	refreshExpiresAt := time.Now().UTC().Add(s.refreshTTL)
+	refreshExpiresAt := time.Now().UTC().Add(min(s.refreshTTL, maxSessionLifetime))
 	session, err := s.sessions.Create(ctx, admin.Session{AdminID: adminID, RefreshTokenHash: security.HashToken(refreshToken), ExpiresAt: refreshExpiresAt})
 	if err != nil {
 		return Tokens{}, admin.Session{}, err
@@ -206,19 +228,60 @@ func (s *Service) createSession(ctx context.Context, adminID uint64) (Tokens, ad
 	return Tokens{AccessToken: accessToken, AccessTokenExpiresAt: accessExpiresAt, RefreshToken: refreshToken, RefreshTokenExpiresAt: refreshExpiresAt}, session, err
 }
 
-func (s *Service) checkLoginRate(ctx context.Context, username, remoteAddress string) error {
+// revokeReusedSession 处理已不是当前值的 refresh token：若它是某会话的上一个 token，
+// 说明该 token 已被轮换后再次使用（可能被窃取），撤销整个会话。
+func (s *Service) revokeReusedSession(ctx context.Context, tokenHash string) error {
+	session, err := s.sessions.GetByPreviousTokenHash(ctx, tokenHash)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return ErrInvalidSession
+		}
+		return fmt.Errorf("%w: %v", ErrRuntimeUnavailable, err)
+	}
+	if err := s.sessions.Revoke(ctx, session.ID); err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return fmt.Errorf("%w: %v", ErrRuntimeUnavailable, err)
+	}
+	return ErrInvalidSession
+}
+
+func sessionActive(session admin.Session, now time.Time) bool {
+	return now.Before(session.ExpiresAt) && now.Before(session.CreatedAt.Add(maxSessionLifetime))
+}
+
+type rateLimit struct {
+	key   string
+	limit int
+}
+
+func (s *Service) checkLoginRate(ctx context.Context, username, clientIP string) error {
+	client := rateLimitClient(clientIP)
+	return s.checkRate(ctx,
+		rateLimit{key: "admin-login:ip:" + security.HashToken(client), limit: loginIPRateLimit},
+		// 账号维度按 (客户端 IP, 用户名) 计数，其他来源的失败尝试不会锁定管理员本人。
+		rateLimit{key: "admin-login:ip-user:" + security.HashToken(client+"\n"+strings.ToLower(username)), limit: loginAccountRateLimit},
+	)
+}
+
+// rateLimitClient 返回限流计数主体：IPv4 按单个地址，IPv6 按所在 /64。
+func rateLimitClient(clientIP string) string {
+	clientIP = strings.TrimSpace(clientIP)
+	ip := net.ParseIP(clientIP)
+	switch {
+	case ip == nil:
+		return clientIP
+	case ip.To4() != nil:
+		return ip.To4().String()
+	default:
+		return ip.Mask(net.CIDRMask(rateLimitIPv6PrefixBits, 8*net.IPv6len)).String() + fmt.Sprintf("/%d", rateLimitIPv6PrefixBits)
+	}
+}
+
+func (s *Service) checkRate(ctx context.Context, limits ...rateLimit) error {
 	if s.loginLimiter == nil {
 		return nil
 	}
 	now := time.Now().UTC()
-	keys := []struct {
-		key   string
-		limit int
-	}{
-		{key: "admin-login:ip:" + security.HashToken(strings.TrimSpace(remoteAddress)), limit: 30},
-		{key: "admin-login:user:" + security.HashToken(strings.ToLower(username)), limit: 12},
-	}
-	for _, item := range keys {
+	for _, item := range limits {
 		allowed, err := s.loginLimiter.Allow(ctx, item.key, item.limit, now)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrRuntimeUnavailable, err)

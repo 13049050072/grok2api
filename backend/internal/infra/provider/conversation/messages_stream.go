@@ -188,7 +188,7 @@ func (c *streamConverter) toolStartMessages(item responseItem) error {
 	if err := c.closeMessagesBlock(&c.textStarted, &c.textClosed, c.textIndex); err != nil {
 		return err
 	}
-	tool := streamTool{Index: c.nextIndex, ID: anthropicToolUseID(item.CallID), Name: item.Name, Arguments: item.Arguments}
+	tool := streamTool{Index: c.nextIndex, ID: anthropicToolUseID(item.CallID), CallID: strings.TrimSpace(item.CallID), Name: item.Name, Arguments: item.Arguments}
 	c.nextIndex++
 	c.tools[item.ID] = tool
 	return c.writeEvent("content_block_start", map[string]any{

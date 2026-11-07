@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -67,6 +70,56 @@ func TestReadinessKeepsBuildReadyWhenWebIsUnavailable(t *testing.T) {
 	}
 	if snapshot.Components["grok_build"].State != "ready" || snapshot.Components["grok_web"].State != "unavailable" {
 		t.Fatalf("components = %#v", snapshot.Components)
+	}
+}
+
+func TestReadinessLedgerLossDegradesObserveAndBlocksEnforce(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "readiness-ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	models := relational.NewModelRepository(database)
+	now := time.Now().UTC()
+	build, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build-ledger", SourceKey: "build-ledger",
+		EncryptedAccessToken: "access", EncryptedRefreshToken: "refresh", ExpiresAt: now.Add(time.Hour),
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := models.UpsertRoutes(ctx, []modeldomain.Route{{PublicID: "build-model", Provider: accountdomain.ProviderBuild, UpstreamModel: "build-model", Capability: modeldomain.CapabilityResponses, Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, build.ID, []string{"build-model"}, now); err != nil {
+		t.Fatal(err)
+	}
+	ledger := auditapp.NewService(nil, slog.Default(), 1, 1, time.Hour)
+	ledgerConfig := auditapp.LedgerConfig{Mode: auditapp.LedgerModeObserve, FailureThreshold: 1, UnhealthyGrace: time.Hour, QueueHighWatermarkPercent: 100}
+	ledger.UpdateLedgerConfig(ledgerConfig)
+	if !ledger.Record(auditdomain.Record{EventID: "queued"}) {
+		t.Fatal("record was not queued")
+	}
+	if ledger.Record(auditdomain.Record{EventID: "dropped"}) {
+		t.Fatal("full queue accepted a record")
+	}
+	state := newStartupState(0)
+	state.setPhase("running")
+	snapshot := readinessSnapshot(ctx, state, func(context.Context) error { return nil }, models, accounts, provider.NewRegistry(), ledger)
+	if !snapshot.Ready || snapshot.State != "degraded" || snapshot.Components["billing_ledger"].State != "degraded" {
+		t.Fatalf("observe snapshot after drop = %#v", snapshot)
+	}
+	ledgerConfig.Mode = auditapp.LedgerModeEnforce
+	ledger.UpdateLedgerConfig(ledgerConfig)
+	snapshot = readinessSnapshot(ctx, state, func(context.Context) error { return nil }, models, accounts, provider.NewRegistry(), ledger)
+	if snapshot.Ready || snapshot.State != "not_ready" {
+		t.Fatalf("enforce snapshot after drop = %#v", snapshot)
 	}
 }
 

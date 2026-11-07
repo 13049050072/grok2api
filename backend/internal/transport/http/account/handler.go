@@ -292,12 +292,25 @@ type accountTokenRefreshResponse struct {
 }
 
 type accountImportResponse struct {
-	Created    int `json:"created"`
-	Updated    int `json:"updated"`
-	Skipped    int `json:"skipped"`
-	Failed     int `json:"failed"`
-	Synced     int `json:"synced"`
-	SyncFailed int `json:"syncFailed"`
+	Created    int                            `json:"created"`
+	Updated    int                            `json:"updated"`
+	Skipped    int                            `json:"skipped"`
+	Failed     int                            `json:"failed"`
+	Synced     int                            `json:"synced"`
+	SyncFailed int                            `json:"syncFailed"`
+	Failures   []accountImportFailureResponse `json:"failures,omitempty"`
+}
+
+type accountImportFailureResponse struct {
+	Index  int    `json:"index"`
+	Reason string `json:"reason"`
+}
+
+// accountImportErrorResponse 在 error 事件中附带出错前已经写入的部分结果。
+type accountImportErrorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	accountImportResponse
 }
 
 type accountResponse struct {
@@ -922,7 +935,7 @@ func (h *Handler) runWebToConsoleSync(ctx context.Context, all bool, ids []uint6
 	} else {
 		result, err = h.service.SyncWebAccountsToConsoleWithStrategy(pipeline.ctx, ids, strategy, pipeline.Observe, progress)
 	}
-	syncResult := pipeline.Finish(err != nil)
+	syncResult := pipeline.Finish(err != nil && len(result.AccountIDs) == 0)
 	return result, syncResult, err
 }
 
@@ -935,7 +948,7 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", newAccountImportResponse(result, syncResult))
 }
 
 func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
@@ -1107,12 +1120,44 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 	} else {
 		result, err = h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
 	}
-	syncResult := pipeline.Finish(err != nil)
+	// 出错前已经写入的账号照常完成初始同步。
+	syncResult := pipeline.Finish(err != nil && len(result.AccountIDs) == 0)
 	if err != nil {
-		stream.WriteError("authImportFailed", "导入账号失败")
+		_ = stream.Write("error", newAccountImportError(err, result, syncResult))
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Failed: result.Failed, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", newAccountImportResponse(result, syncResult))
+}
+
+func newAccountImportResponse(result accountapp.ImportResult, syncResult accountsyncapp.Result) accountImportResponse {
+	response := accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Failed: result.Failed, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed}
+	for _, failure := range result.Failures {
+		response.Failures = append(response.Failures, accountImportFailureResponse{Index: failure.Index, Reason: failure.Reason})
+	}
+	return response
+}
+
+// newAccountImportError 沿用 writeServiceError 的错误分类。前端对已登记的错误码只显示本地化文案，
+// 需要展示具体原因的错误因此使用未登记的错误码；已有账号写入时文案附带部分结果。
+func newAccountImportError(err error, result accountapp.ImportResult, syncResult accountsyncapp.Result) accountImportErrorResponse {
+	code, message := "authImportFailed", "导入账号失败"
+	switch {
+	case errors.Is(err, accountapp.ErrImportLimit):
+		code, message = "accountImportLimitExceeded", err.Error()
+	case errors.Is(err, accountapp.ErrInvalidInput), errors.Is(err, accountapp.ErrInvalidImport):
+		code, message = "authImportInvalid", err.Error()
+	case errors.Is(err, accountapp.ErrConflict):
+		code, message = "authImportConflict", err.Error()
+	case errors.Is(err, accountapp.ErrUnsupported):
+		code, message = "accountOperationUnsupported", err.Error()
+	}
+	if result.Created+result.Updated+result.Failed > 0 {
+		if code == "authImportFailed" {
+			code = "authImportInterrupted"
+		}
+		message = fmt.Sprintf("%s；已新增 %d，更新 %d，跳过 %d，失败 %d；初始同步成功 %d，失败 %d", message, result.Created, result.Updated, result.Skipped, result.Failed, syncResult.Succeeded, syncResult.Failed)
+	}
+	return accountImportErrorResponse{Code: code, Message: message, accountImportResponse: newAccountImportResponse(result, syncResult)}
 }
 
 func readAccountImportDocuments(c *gin.Context, fileDescription string) ([][]byte, bool) {

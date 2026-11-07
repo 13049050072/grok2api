@@ -107,6 +107,54 @@ func TestEventKeyKeepsClientKeyInvalidationsDistinct(t *testing.T) {
 	}
 }
 
+func TestEventKeyKeepsProviderlessAccountInvalidationsDistinct(t *testing.T) {
+	first := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: 1})
+	second := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: 2})
+	global := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged})
+	if first == second || first == global || second == global {
+		t.Fatalf("provider-less account invalidations were coalesced: first=%#v second=%#v global=%#v", first, second, global)
+	}
+	buildFirst := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: 1})
+	buildSecond := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: 2})
+	if buildFirst != buildSecond {
+		t.Fatalf("provider-scoped invalidations should still coalesce: first=%#v second=%#v", buildFirst, buildSecond)
+	}
+}
+
+func TestRunPublisherPublishesEachProviderlessAccountInvalidation(t *testing.T) {
+	bus := &testBus{}
+	service := NewService(bus, "local", nil, slog.Default())
+	for _, id := range []uint64{1, 2, 1} {
+		service.queue <- repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, AccountID: id, SourceInstance: "local"}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.RunPublisher(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		bus.mu.Lock()
+		published := len(bus.published)
+		bus.mu.Unlock()
+		if published >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+	seen := map[uint64]bool{}
+	for _, event := range bus.published {
+		seen[event.AccountID] = true
+	}
+	if len(bus.published) != 2 || !seen[1] || !seen[2] {
+		t.Fatalf("published = %#v", bus.published)
+	}
+}
+
 func TestEventKeyKeepsAccountHealthInvalidationsDistinct(t *testing.T) {
 	first := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountHealthChanged, Provider: account.ProviderBuild, AccountID: 1})
 	second := eventKey(repository.InvalidationEvent{Kind: repository.InvalidationAccountHealthChanged, Provider: account.ProviderBuild, AccountID: 2})

@@ -442,7 +442,7 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 					continue
 				}
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, status, consumeErr)
+			a.reportUpstreamFailure(ctx, lease.NodeID, consumeErr)
 			lease.Release()
 			if status == http.StatusForbidden {
 				response := antiBotProviderResponse()
@@ -740,7 +740,7 @@ func (a *Adapter) generateWSImageAttempt(ctx context.Context, request provider.I
 	for collector.UsableCount() < count && !collector.Done(modelConfig.ExpectedCount) {
 		messageType, data, readErr := connection.ReadMessage()
 		if readErr != nil {
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, readErr)
+			a.reportUpstreamFailure(ctx, lease.NodeID, readErr)
 			return nil, fmt.Errorf("读取 Imagine WebSocket: %w", readErr)
 		}
 		if messageType != websocket.TextMessage {
@@ -751,9 +751,7 @@ func (a *Adapter) generateWSImageAttempt(ctx context.Context, request provider.I
 			continue
 		}
 		if message["type"] == "error" {
-			upstreamErr := fmt.Errorf("Imagine WebSocket 返回错误")
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, upstreamErr)
-			return nil, upstreamErr
+			return nil, provider.NewUpstreamBusinessError(fmt.Errorf("Imagine WebSocket 返回错误"))
 		}
 		collector.Accept(message)
 	}
@@ -907,12 +905,13 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 	capture := &boundedCapture{limit: 8 << 20}
 	parsed, consumeErr := consumeUpstream(io.TeeReader(response.Body, capture), nil)
 	if consumeErr != nil {
+		a.reportUpstreamFailure(ctx, lease.NodeID, consumeErr)
 		return nil, consumeErr
 	}
-	urls := imageEditResultURLs(&parsed, capture.Bytes())
-	confirmed, echoed, resolvedCount := inspectImageEditBinding(capture.Bytes(), references)
-	promptMatched, finalSeen, finalMatched := inspectImageEditOutput(capture.Bytes(), request.Prompt, urls)
-	a.log().Info("web_image_edit_reference_binding", "reference_count", len(references), "user_response_seen", echoed, "references_match", confirmed, "resolved_reference_count", resolvedCount, "prompt_match", promptMatched, "final_frame_seen", finalSeen, "selected_matches_final", finalMatched, "output_image_count", len(urls))
+	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+	report := inspectImageEditCapture(capture.Bytes(), references, request.Prompt, len(parsed.Images) == 0)
+	urls := selectImageEditResultURLs(&parsed, report.capturedURLs)
+	a.log().Info("web_image_edit_reference_binding", "reference_count", len(references), "user_response_seen", report.userSeen, "references_match", report.referencesMatch, "resolved_reference_count", report.resolvedCount, "prompt_match", report.promptMatched, "final_frame_seen", report.finalFrameSeen(), "selected_matches_final", report.selectedMatchesFinal(urls), "output_image_count", len(urls))
 	if len(urls) == 0 {
 		return jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
 			"message": "上游未返回可用的编辑图片",
@@ -926,68 +925,74 @@ func (a *Adapter) editImageAttempt(ctx context.Context, request provider.ImageEd
 	return result, err
 }
 
-// Report structural matches only; never log prompts or media URLs.
-func inspectImageEditOutput(captured []byte, prompt string, selected []string) (bool, bool, bool) {
-	promptMatched, finalSeen, finalMatched := false, false, false
-	_ = consumeJSONObjects(bytes.NewReader(captured), 8<<20, func(frame []byte) error {
-		var root map[string]any
-		if json.Unmarshal(frame, &root) != nil {
-			return nil
-		}
-		result, _ := root["result"].(map[string]any)
-		response, _ := result["response"].(map[string]any)
-		if user, ok := response["userResponse"].(map[string]any); ok {
-			promptMatched = user["message"] == prompt
-		}
-		image, ok := parseImageEditStreamFrame(frame)
-		if ok && !image.Moderated && image.Progress >= 100 {
-			finalSeen = true
-			if len(selected) > 0 && image.URL == selected[0] {
-				finalMatched = true
-			}
-		}
-		return nil
-	})
-	return promptMatched, finalSeen, finalMatched
+// imageEditCaptureReport is what the non-streaming edit path learns from the
+// captured response. Only structural metadata reaches the log: never input
+// IDs, prompts, image URLs, or account credentials.
+type imageEditCaptureReport struct {
+	capturedURLs    []string
+	userSeen        bool
+	referencesMatch bool
+	resolvedCount   int
+	promptMatched   bool
+	finalURLs       []string
 }
 
-// inspectImageEditBinding reports only structural metadata, never input IDs,
-// prompts, image URLs, or account credentials.
-func inspectImageEditBinding(captured []byte, expected []string) (bool, bool, int) {
-	matched, seen, resolved := false, false, 0
+// inspectImageEditCapture decodes each captured frame once. collectURLs
+// gathers the captured-URL fallback of selectImageEditResultURLs in the same
+// pass.
+func inspectImageEditCapture(captured []byte, references []string, prompt string, collectURLs bool) imageEditCaptureReport {
+	report := imageEditCaptureReport{}
 	_ = consumeJSONObjects(bytes.NewReader(captured), 8<<20, func(frame []byte) error {
-		var root map[string]any
-		if json.Unmarshal(frame, &root) != nil {
+		var value any
+		if json.Unmarshal(frame, &value) != nil {
 			return nil
 		}
+		if collectURLs {
+			collectCapturedImageURLs(value, &report.capturedURLs)
+		}
+		root, _ := value.(map[string]any)
 		result, _ := root["result"].(map[string]any)
 		response, _ := result["response"].(map[string]any)
-		userResponse, _ := response["userResponse"].(map[string]any)
-		if userResponse == nil {
-			return nil
+		if userResponse, ok := response["userResponse"].(map[string]any); ok {
+			report.observeUserResponse(userResponse, references, prompt)
 		}
-		seen = true
-		media, _ := userResponse["mediaGenInput"].(map[string]any)
-		imageToImage, _ := media["imageToImage"].(map[string]any)
-		assets, _ := imageToImage["inputAssets"].([]any)
-		if len(assets) == len(expected) && len(expected) > 0 {
-			matched = true
-			for i, id := range expected {
-				if assets[i] != id {
-					matched = false
-					break
-				}
-			}
+		if image, ok := imageEditStreamFrameFromRoot(root); ok && !image.Moderated && image.Progress >= 100 && !containsString(report.finalURLs, image.URL) {
+			report.finalURLs = append(report.finalURLs, image.URL)
 		}
-		metadata, _ := userResponse["metadata"].(map[string]any)
-		override, _ := metadata["modelConfigOverride"].(map[string]any)
-		modelMap, _ := override["modelMap"].(map[string]any)
-		config, _ := modelMap["imageEditModelConfig"].(map[string]any)
-		values, _ := config["resolvedImageReferences"].([]any)
-		resolved = len(values)
 		return nil
 	})
-	return matched, seen, resolved
+	return report
+}
+
+func (r *imageEditCaptureReport) observeUserResponse(userResponse map[string]any, references []string, prompt string) {
+	r.userSeen = true
+	r.promptMatched = userResponse["message"] == prompt
+	media, _ := userResponse["mediaGenInput"].(map[string]any)
+	imageToImage, _ := media["imageToImage"].(map[string]any)
+	assets, _ := imageToImage["inputAssets"].([]any)
+	if len(assets) == len(references) && len(references) > 0 {
+		r.referencesMatch = true
+		for i, id := range references {
+			if assets[i] != id {
+				r.referencesMatch = false
+				break
+			}
+		}
+	}
+	metadata, _ := userResponse["metadata"].(map[string]any)
+	override, _ := metadata["modelConfigOverride"].(map[string]any)
+	modelMap, _ := override["modelMap"].(map[string]any)
+	config, _ := modelMap["imageEditModelConfig"].(map[string]any)
+	values, _ := config["resolvedImageReferences"].([]any)
+	r.resolvedCount = len(values)
+}
+
+func (r imageEditCaptureReport) finalFrameSeen() bool {
+	return len(r.finalURLs) > 0
+}
+
+func (r imageEditCaptureReport) selectedMatchesFinal(selected []string) bool {
+	return len(selected) > 0 && containsString(r.finalURLs, selected[0])
 }
 
 // buildImageEditPayload follows the Imagine request sent by grok.com after a
@@ -1026,6 +1031,10 @@ func parseImageEditStreamFrame(data []byte) (imageEditStreamFrame, bool) {
 	if json.Unmarshal(data, &root) != nil {
 		return imageEditStreamFrame{}, false
 	}
+	return imageEditStreamFrameFromRoot(root)
+}
+
+func imageEditStreamFrameFromRoot(root map[string]any) (imageEditStreamFrame, bool) {
 	result, _ := root["result"].(map[string]any)
 	response, _ := result["response"].(map[string]any)
 	imageResponse, _ := response["streamingImageGenerationResponse"].(map[string]any)
@@ -1057,6 +1066,7 @@ func (a *Adapter) streamImageEdit(
 	size string,
 	aspectRatio string,
 ) {
+	defer provider.RecoverStreamPanic(writer, a.log(), "web_image_edit")
 	defer lease.Release()
 	defer source.Close()
 	createdAt := time.Now().Unix()
@@ -1090,15 +1100,14 @@ func (a *Adapter) streamImageEdit(
 		return nil
 	})
 	if consumeErr != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, consumeErr)
+		a.reportUpstreamFailure(ctx, lease.NodeID, consumeErr)
 		_ = writer.CloseWithError(consumeErr)
 		return
 	}
+	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
 	urls := imageEditResultURLs(&parsed, capture.Bytes())
 	if len(urls) == 0 {
-		err := fmt.Errorf("上游未返回可用的编辑图片")
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
-		_ = writer.CloseWithError(err)
+		_ = writer.CloseWithError(fmt.Errorf("上游未返回可用的编辑图片"))
 		return
 	}
 	raw, err := a.imageBytes(ctx, credential, imagineImageValue{URL: urls[0]})
@@ -1116,7 +1125,6 @@ func (a *Adapter) streamImageEdit(
 		_ = writer.CloseWithError(err)
 		return
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
 	_ = writer.Close()
 }
 
@@ -1155,9 +1163,18 @@ func imageEditEventSize(size, aspectRatio string) string {
 }
 
 func imageEditResultURLs(parsed *parsedChat, captured []byte) []string {
+	if len(parsed.Images) > 0 {
+		return selectImageEditResultURLs(parsed, nil)
+	}
+	return selectImageEditResultURLs(parsed, extractCapturedImageURLs(captured))
+}
+
+// selectImageEditResultURLs prefers parsed images, then capturedURLs (as
+// extracted by extractCapturedImageURLs), then markdown images in the text.
+func selectImageEditResultURLs(parsed *parsedChat, capturedURLs []string) []string {
 	values := append([]string(nil), parsed.Images...)
 	if len(values) == 0 {
-		values = extractCapturedImageURLs(captured)
+		values = capturedURLs
 	}
 	if len(values) == 0 {
 		values = extractMarkdownImages(parsed.Text.String())
@@ -1621,6 +1638,7 @@ func (a *Adapter) imageBytes(ctx context.Context, credential account.Credential,
 }
 
 func (a *Adapter) streamImagineImages(ctx context.Context, writer *io.PipeWriter, connection *websocket.Conn, lease *egress.Lease, credential account.Credential, count, partialImages int, modelConfig imagineModelConfig, requestID ...string) {
+	defer provider.RecoverStreamPanic(writer, a.log(), "web_imagine")
 	defer lease.Release()
 	defer connection.Close()
 	done := make(chan struct{})
@@ -1654,9 +1672,7 @@ func (a *Adapter) streamImagineImages(ctx context.Context, writer *io.PipeWriter
 			continue
 		}
 		if message["type"] == "error" {
-			upstreamErr := fmt.Errorf("Imagine WebSocket 返回错误")
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, upstreamErr)
-			_ = writer.CloseWithError(upstreamErr)
+			_ = writer.CloseWithError(provider.NewUpstreamBusinessError(fmt.Errorf("Imagine WebSocket 返回错误")))
 			return
 		}
 		collector.Accept(message)

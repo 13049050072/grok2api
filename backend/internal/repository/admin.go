@@ -21,6 +21,9 @@ type AdminSessionRepository interface {
 	Create(ctx context.Context, value admin.Session) (admin.Session, error)
 	GetByID(ctx context.Context, id uint64) (admin.Session, error)
 	GetByTokenHash(ctx context.Context, tokenHash string) (admin.Session, error)
+	// GetByPreviousTokenHash 按最近一次轮换前的 refresh token 摘要查找会话，用于检测旧 token 重放。
+	GetByPreviousTokenHash(ctx context.Context, tokenHash string) (admin.Session, error)
+	// Rotate 仅在当前摘要仍为 expectedTokenHash 时替换，并把它记录为上一个摘要。
 	Rotate(ctx context.Context, id uint64, expectedTokenHash, newTokenHash string, expiresAt time.Time) error
 	Revoke(ctx context.Context, id uint64) error
 	RevokeAllByAdmin(ctx context.Context, adminID uint64) error

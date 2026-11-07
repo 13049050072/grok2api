@@ -412,6 +412,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		SegmentedWindowSize:         segmentedWindowSize,
 		ReasoningReplayEnabled:      base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
+		AutoAssignMaxNodeShare:    base.Routing.AutoAssignMaxNodeShare, AutoAssignMaxMigrationShare: base.Routing.AutoAssignMaxMigrationShare,
 	}
 	commitDelay := base.Audit.CommitDelay.Value()
 	if value.Audit.CommitDelay > 0 {
