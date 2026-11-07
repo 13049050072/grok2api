@@ -3,9 +3,10 @@ import { useTranslation } from "react-i18next";
 import { Mic, Square } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { publicWebSocketURL } from "@/features/creative-console/creative-console-api";
 
 type Status = "idle" | "connecting" | "connected";
-type Session = { socket?: WebSocket; stream?: MediaStream; context?: AudioContext; processor?: ScriptProcessorNode; source?: MediaStreamAudioSourceNode; playing: Set<AudioBufferSourceNode>; nextPlayback: number; stopped: boolean; suppressAudio: boolean };
+type Session = { socket?: WebSocket; stream?: MediaStream; context?: AudioContext; processor?: ScriptProcessorNode; source?: MediaStreamAudioSourceNode; playing: Set<AudioBufferSourceNode>; nextPlayback: number; stopped: boolean; suppressAudio: boolean; responseActive: boolean; lastError?: string };
 
 export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string }) {
   const { t } = useTranslation();
@@ -36,7 +37,7 @@ export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string
 
   async function start() {
     if (sessionRef.current || !apiKey || !model) return;
-    const session: Session = { playing: new Set(), nextPlayback: 0, stopped: false, suppressAudio: false };
+    const session: Session = { playing: new Set(), nextPlayback: 0, stopped: false, suppressAudio: false, responseActive: false };
     sessionRef.current = session;
     setError(""); setTranscript([]); setStatus("connecting");
     try {
@@ -48,8 +49,7 @@ export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string
       await context.resume();
       if (session.stopped) return;
       if (![8000, 16000, 22050, 24000, 32000, 44100, 48000].includes(context.sampleRate)) throw new Error(t("creativeConsole.realtimeAudioRate"));
-      const url = new URL("/v1/realtime", window.location.href);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const url = publicWebSocketURL("/realtime");
       url.searchParams.set("model", model);
       const socket = new WebSocket(url, ["grok2api-realtime", `grok2api-key.${apiKey}`]);
       session.socket = socket;
@@ -89,20 +89,26 @@ export function RealtimeVoice({ apiKey, model }: { apiKey: string; model: string
           session.suppressAudio = true;
           for (const player of session.playing) { try { player.stop(); } catch { /* already stopped */ } }
           session.playing.clear(); session.nextPlayback = context.currentTime;
-          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "response.cancel" }));
+          if (session.responseActive && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "response.cancel" }));
         } else if (event.type === "response.created") {
-          session.suppressAudio = false;
+          session.suppressAudio = false; session.responseActive = true;
+          if (session.lastError) { session.lastError = undefined; setError(""); }
+        } else if (event.type === "response.done") {
+          // response.done is the only terminal event; cancelled/failed responses report it via response.status.
+          session.responseActive = false;
         } else if ((event.type === "conversation.item.input_audio_transcription.completed" || event.type === "response.output_audio_transcript.done" || event.type === "response.audio_transcript.done") && typeof event.transcript === "string") {
           const label = event.type.startsWith("conversation.") ? t("creativeConsole.realtimeYou") : t("creativeConsole.realtimeAssistant");
           setTranscript((previous) => [...previous.slice(-49), `${label}: ${event.transcript as string}`]);
         } else if (event.type === "error") {
-          const detail = event.error && typeof event.error === "object" ? (event.error as { message?: unknown }).message : undefined;
-          setError(typeof detail === "string" ? detail : t("creativeConsole.realtimeError"));
-          dispose(session); setStatus("idle");
+          // Realtime errors are recoverable and the session stays open; a fatal one is followed by the socket closing.
+          const detail = event.error && typeof event.error === "object" ? (event.error as { code?: unknown; message?: unknown }) : undefined;
+          if (detail?.code === "response_cancel_not_active") return;
+          session.lastError = typeof detail?.message === "string" ? detail.message : t("creativeConsole.realtimeError");
+          setError(session.lastError);
         }
       };
       socket.onerror = () => { if (!session.stopped) setError(t("creativeConsole.realtimeError")); };
-      socket.onclose = () => { if (!session.stopped) { setError(t("creativeConsole.realtimeDisconnected")); dispose(session); setStatus("idle"); } };
+      socket.onclose = () => { if (!session.stopped) { setError(session.lastError ?? t("creativeConsole.realtimeDisconnected")); dispose(session); setStatus("idle"); } };
     } catch (cause) {
       if (!session.stopped) { setError(cause instanceof Error ? cause.message : t("creativeConsole.realtimeError")); dispose(session); setStatus("idle"); }
     }

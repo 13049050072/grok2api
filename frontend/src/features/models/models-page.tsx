@@ -92,6 +92,7 @@ export function ModelsPage() {
     onSuccess: () => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["models"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       setEditing(null);
       toast.success(t(editing === "new" ? "models.created" : "models.updated"));
     },
@@ -106,6 +107,7 @@ export function ModelsPage() {
     onSuccess: () => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["models"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       setDeleting(null);
       setPage(1);
       toast.success(t("models.deleted"));
@@ -120,6 +122,7 @@ export function ModelsPage() {
       setBatchDeleteOpen(false);
       setPage(1);
       void queryClient.invalidateQueries({ queryKey: ["models"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       toast.success(t("models.batchDeleted", { count: result.deleted }));
     },
     onError: showError,
@@ -131,6 +134,7 @@ export function ModelsPage() {
       setSelected(new Set());
       setPage(1);
       void queryClient.invalidateQueries({ queryKey: ["models"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       toast.success(t("models.batchUpdated"));
     },
     onError: showError,
@@ -147,6 +151,7 @@ export function ModelsPage() {
       setSelected(new Set());
       setPage(1);
       void queryClient.invalidateQueries({ queryKey: ["models"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       toast.success(t("models.synced", { count: result.synced }), { id: modelSyncToastID });
     },
     onError: (error) => {

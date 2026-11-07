@@ -12,7 +12,10 @@ type DashboardActivityProps = {
   dashboard?: DashboardDTO;
   locale: string;
   loading: boolean;
+  retentionDays?: number;
 };
+
+const ACTIVITY_DAYS = 180;
 
 const INTENSITY_CLASSES = [
   "bg-emerald-500/10",
@@ -22,7 +25,7 @@ const INTENSITY_CLASSES = [
   "bg-emerald-500",
 ] as const;
 
-export function DashboardActivity({ dashboard, locale, loading }: DashboardActivityProps) {
+export function DashboardActivity({ dashboard, locale, loading, retentionDays = 0 }: DashboardActivityProps) {
   const { t } = useTranslation();
   const activity = useMemo(() => dashboard?.activity ?? [], [dashboard?.activity]);
   const activityWeeks = useMemo(() => Array.from({ length: Math.ceil(activity.length / 7) }, (_, index) => activity.slice(index * 7, index * 7 + 7)), [activity]);
@@ -35,7 +38,7 @@ export function DashboardActivity({ dashboard, locale, loading }: DashboardActiv
     <DashboardPanel
       id="dashboard-activity-title"
       title={t("dashboard.activityTitle")}
-      actions={<span className="text-[11px] text-muted-foreground">{t("dashboard.lastDays", { count: 180 })}</span>}
+      actions={<span className="text-[11px] text-muted-foreground">{t("dashboard.lastDays", { count: ACTIVITY_DAYS })}</span>}
       className="min-h-[210px]"
     >
       {loading ? (
@@ -74,6 +77,7 @@ export function DashboardActivity({ dashboard, locale, loading }: DashboardActiv
           </div>
 
           <div className="mt-3 flex items-center justify-end gap-1.5 text-[10px] text-muted-foreground">
+            {retentionDays > 0 && retentionDays < ACTIVITY_DAYS ? <span className="mr-auto">{t("dashboard.activityRetentionNotice", { count: retentionDays })}</span> : null}
             <span>{t("dashboard.activityLess")}</span>
             {INTENSITY_CLASSES.map((className) => <span key={className} className={cn("size-2.5 rounded-[2px]", className)} />)}
             <span>{t("dashboard.activityMore")}</span>

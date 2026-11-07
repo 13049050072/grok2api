@@ -19,6 +19,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { listModels } from "@/entities/model/model-api";
 import type { ModelRouteDTO } from "@/entities/model/types";
+import { chatHistoryStoragePrefix } from "@/features/creative-console/chat-history-storage";
 import {
   createChatResponse,
   createVideo,
@@ -28,6 +29,7 @@ import {
   generateImage,
   getVideo,
   listVoices,
+  publicApiURL,
   synthesizeSpeech,
   transcribeSpeech,
   type ChatMessage,
@@ -95,7 +97,6 @@ const videoResolutions = ["480p", "720p", "1080p"] as const;
 const videoDurations = ["6", "10", "15"] as const;
 const videoExtendDurations = ["2", "4", "6", "8", "10"] as const;
 type VideoAction = "generate" | "edit" | "extend";
-const chatHistoryStoragePrefix = "grok2api:creative-console:chat-history:";
 const chatHistoryMaxSessions = 50;
 const chatHistoryMaxBytes = 4 * 1024 * 1024;
 const composerClassName = "overflow-hidden rounded-2xl bg-secondary/45 ring-1 ring-transparent transition-colors focus-within:bg-secondary/60 focus-within:ring-ring";
@@ -2120,7 +2121,7 @@ function safeAssistantLink(value: string | null): string {
 function safeAssistantImage(value: string | null): string {
   const source = value?.trim() ?? "";
   if (!source) return "";
-  if (source.startsWith("/v1/media/images/")) return source;
+  if (source.startsWith("/v1/media/images/")) return publicApiURL(source.slice("/v1".length));
   try {
     const parsed = new URL(source);
     return parsed.protocol === "https:" ? parsed.toString() : "";

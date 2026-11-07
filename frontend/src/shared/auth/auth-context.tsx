@@ -1,4 +1,7 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 
 import {
   ApiError,
@@ -13,7 +16,10 @@ import {
 } from "@/shared/api/client";
 import { AuthContext, type AuthStatus } from "@/shared/auth/auth-state";
 
-export function AuthProvider({ children }: { children: ReactNode }) {
+// onLoggedOut 让 app 层清理 feature 自己的本地数据，shared 不反向依赖 features。
+export function AuthProvider({ children, onLoggedOut }: { children: ReactNode; onLoggedOut?: () => void }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [admin, setAdmin] = useState<AdminDTO | null>(null);
   const [status, setStatus] = useState<AuthStatus>("restoring");
 
@@ -77,10 +83,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         authenticated: false,
         retryAuth: false,
       }, decodeLoggedOut);
+    } catch {
+      toast.warning(t("auth.signOutIncomplete"));
     } finally {
       setAccessToken(null);
       setAdmin(null);
       setStatus("anonymous");
+      queryClient.clear();
+      onLoggedOut?.();
     }
   }
 

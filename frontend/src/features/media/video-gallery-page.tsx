@@ -13,6 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { publicApiURL } from "@/features/creative-console/creative-console-api";
 import { deleteVideos, getVideoStats, listVideos } from "@/features/media/media-api";
 import type { MediaJobDTO, VideoStatsDTO } from "@/features/media/types";
 import { EmptyState, ErrorState, TableLoadingRow } from "@/shared/components/data-state";
@@ -430,5 +431,5 @@ function formatSpec(job: MediaJobDTO): string {
 }
 
 function videoAssetURL(assetID: string): string {
-  return `/v1/media/videos/${encodeURIComponent(assetID)}`;
+  return publicApiURL(`/media/videos/${encodeURIComponent(assetID)}`);
 }

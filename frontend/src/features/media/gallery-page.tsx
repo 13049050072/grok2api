@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { publicApiURL } from "@/features/creative-console/creative-console-api";
 import { deleteImages, getImageStats, listImages } from "@/features/media/media-api";
 import type { MediaAssetDTO } from "@/features/media/types";
 import { ErrorState } from "@/shared/components/data-state";
@@ -175,7 +176,7 @@ export function GalleryPage() {
 function ImageCard({ image, locale, selectionMode, selected, onSelectedChange }: { image: MediaAssetDTO; locale: string; selectionMode: boolean; selected: boolean; onSelectedChange: (checked: boolean) => void }) {
   const { t } = useTranslation();
   // 管理端图库与 API 同源，使用相对路径避免依赖未配置或仅对外可用的公共地址。
-  const imageURL = `/v1/media/images/${encodeURIComponent(image.id)}`;
+  const imageURL = publicApiURL(`/media/images/${encodeURIComponent(image.id)}`);
   return (
     <article className="group relative min-w-0 [content-visibility:auto] [contain-intrinsic-size:0_280px]">
       <Checkbox

@@ -310,7 +310,7 @@ export async function synthesizeSpeech(input: {
   speed?: number;
   signal?: AbortSignal;
 }): Promise<TTSResult> {
-  const response = await fetch("/v1/tts", {
+  const response = await fetch(publicApiURL("/tts"), {
     method: "POST",
     headers: new Headers({
       Accept: "application/json, audio/*",
@@ -364,7 +364,7 @@ export async function transcribeSpeech(input: {
   if (input.language) form.append("language", input.language);
   form.append("format", "true");
   form.append("file", input.file, input.file.name);
-  const response = await fetch("/v1/stt", {
+  const response = await fetch(publicApiURL("/stt"), {
     method: "POST",
     headers: new Headers({ Accept: "application/json", Authorization: `Bearer ${input.apiKey}` }),
     body: form,
@@ -398,6 +398,23 @@ export async function transcribeSpeech(input: {
   };
 }
 
+/** 公共 API（/v1）地址统一从 runtime config 的 apiBaseUrl 派生；apiBaseUrl 为空时保持同源相对路径。 */
+export function publicApiURL(path: string, apiBaseUrl = runtimeApiBaseUrl()): string {
+  return `${apiBaseUrl.replace(/\/+$/, "")}/v1${path}`;
+}
+
+/** WebSocket 需要绝对地址：相对的 apiBaseUrl 按当前页面解析，再把 http(s) 换成 ws(s)。 */
+export function publicWebSocketURL(path: string, apiBaseUrl = runtimeApiBaseUrl(), pageURL = window.location.href): URL {
+  const url = new URL(publicApiURL(path, apiBaseUrl), pageURL);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url;
+}
+
+// 与 runtimeConfig.apiBaseUrl 读取同一份配置；runtime-config.ts 在模块顶层访问 window，导入它会让 node:test 无法加载本模块。
+function runtimeApiBaseUrl(): string {
+  return typeof window === "undefined" ? "" : (window.__GROK2API_RUNTIME_CONFIG__?.apiBaseUrl ?? "");
+}
+
 async function publicApiRequest(apiKey: string, path: string, options: RequestOptions): Promise<unknown> {
   const headers = new Headers({ Accept: "application/json", Authorization: `Bearer ${apiKey}` });
   let body: string | undefined;
@@ -405,7 +422,7 @@ async function publicApiRequest(apiKey: string, path: string, options: RequestOp
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(options.body);
   }
-  const response = await fetch(`/v1${path}`, {
+  const response = await fetch(publicApiURL(path), {
     method: options.method ?? "GET",
     headers,
     body,
@@ -430,7 +447,7 @@ async function publicApiRequest(apiKey: string, path: string, options: RequestOp
 }
 
 async function publicResponsesStream(apiKey: string, body: Record<string, unknown>, onUpdate?: (snapshot: ChatStreamSnapshot) => void, signal?: AbortSignal): Promise<ChatResponseResult> {
-  const response = await fetch("/v1/responses", {
+  const response = await fetch(publicApiURL("/responses"), {
     method: "POST",
     headers: new Headers({ Accept: "text/event-stream", Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }),
     body: JSON.stringify(body),
@@ -562,7 +579,7 @@ function resolveMediaURL(value: string): string {
     const browserOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
     const resolved = new URL(url, `${browserOrigin}/`);
     if (resolved.pathname.startsWith("/v1/media/images/")) {
-      return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+      return publicApiURL(`${resolved.pathname.slice("/v1".length)}${resolved.search}${resolved.hash}`);
     }
     return resolved.origin === browserOrigin ? `${resolved.pathname}${resolved.search}${resolved.hash}` : resolved.toString();
   } catch {

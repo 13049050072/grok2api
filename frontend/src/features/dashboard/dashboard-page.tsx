@@ -10,6 +10,7 @@ import { DashboardOverview, DashboardResources } from "@/features/dashboard/dash
 import { DashboardProviderDistribution } from "@/features/dashboard/dashboard-provider-distribution";
 import { DashboardTopModels } from "@/features/dashboard/dashboard-top-models";
 import { DashboardTrend } from "@/features/dashboard/dashboard-trend";
+import { getSettings } from "@/features/settings/settings-api";
 import { VersionUpdateBanner } from "@/features/system/version-update";
 import { ErrorState } from "@/shared/components/data-state";
 import { PeriodSelector } from "@/shared/components/period-selector";
@@ -39,6 +40,9 @@ export function DashboardPage() {
     placeholderData: (previous) => previous,
     staleTime: 15_000,
   });
+  // 仪表盘统计来自请求审计，超过保留天数的审计会被清理；0 表示永久保留。
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings, staleTime: 60_000 });
+  const retentionDays = settingsQuery.data?.config.audit.retentionDays ?? 0;
 
   function refreshAll(): void {
     setManualRefreshing(true);
@@ -64,7 +68,10 @@ export function DashboardPage() {
     <div className="space-y-5">
       <div className="space-y-5">
         <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <h1 className="text-xl font-medium">{t("dashboard.title")}</h1>
+          <div className="min-w-0 space-y-1">
+            <h1 className="text-xl font-medium">{t("dashboard.title")}</h1>
+            {retentionDays > 0 && periodDays > retentionDays ? <p className="text-xs text-muted-foreground">{t("dashboard.retentionNotice", { count: retentionDays })}</p> : null}
+          </div>
           <div className="flex min-w-0 shrink-0 items-center gap-2">
             <PeriodSelector
               value={periodDays}
@@ -101,7 +108,7 @@ export function DashboardPage() {
       <div className="grid items-stretch gap-2 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)]">
         <DashboardTopModels dashboard={dashboard} locale={i18n.language} loading={loading} />
         <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2 xl:h-full">
-          <DashboardActivity dashboard={dashboard} locale={i18n.language} loading={loading} />
+          <DashboardActivity dashboard={dashboard} locale={i18n.language} loading={loading} retentionDays={retentionDays} />
           <DashboardResources dashboard={dashboard} locale={i18n.language} loading={loading} />
         </div>
       </div>

@@ -87,7 +87,7 @@ export function AppShell() {
 
   const passwordSchema = z.object({
     currentPassword: z.string().min(1, t("errors.required")),
-    newPassword: z.string().min(8, t("errors.minPassword")),
+    newPassword: z.string().min(8, t("errors.minPassword")).refine((value) => new TextEncoder().encode(value).length <= 72, t("errors.maxPassword")),
   });
   type PasswordForm = z.infer<typeof passwordSchema>;
   const passwordForm = useForm<PasswordForm>({

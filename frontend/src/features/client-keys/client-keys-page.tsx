@@ -32,6 +32,7 @@ import { Pagination } from "@/shared/components/pagination";
 import { SortableTableHead } from "@/shared/components/sortable-table-head";
 import { VirtualTableBody } from "@/shared/components/virtual-table-body";
 import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
+import { useNow } from "@/shared/hooks/use-now";
 import { cn } from "@/shared/lib/cn";
 import { formatDateTime, toDateTimeLocal } from "@/shared/lib/format";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
@@ -74,7 +75,7 @@ export function ClientKeysPage() {
   const [secretDialog, setSecretDialog] = useState<SecretDialogState | null>(null);
   const [modelOptionsPage, setModelOptionsPage] = useState(1);
   const [modelOptionsSearch, setModelOptionsSearch] = useState("");
-  const [statusReferenceTime] = useState(() => Date.now());
+  const now = useNow();
   const debouncedSearch = useDebouncedValue(search);
   const debouncedModelOptionsSearch = useDebouncedValue(modelOptionsSearch);
   const schema = z.object({
@@ -126,6 +127,8 @@ export function ClientKeysPage() {
     queryKey: ["client-keys", page, pageSize, debouncedSearch, statusFilter, modelScopeFilter, sort.field, sort.order],
     queryFn: () => listClientKeys({ page, pageSize, search: debouncedSearch, status: statusFilter, modelScope: modelScopeFilter, sortBy: sort.field || undefined, sortOrder: sort.field ? sort.order : undefined }),
   });
+  // 分钟级时钟让「已过期」随时间推进；刚拉到的数据至少按拉取时刻判断。
+  const statusReferenceTime = Math.max(now, keysQuery.dataUpdatedAt);
   const modelsQuery = useQuery({
     queryKey: ["models", "options", modelOptionsPage, debouncedModelOptionsSearch, modelProviderScope.join(","), modelTierScope.join(",")],
     queryFn: () => listModels({ page: modelOptionsPage, pageSize: 50, search: debouncedModelOptionsSearch, providerScope: modelProviderScope, tierScope: modelTierScope }),
@@ -154,6 +157,7 @@ export function ClientKeysPage() {
     },
     onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ["client-keys"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       if ("secret" in result) {
         setSecretDialog({ secret: result.secret, source: "created" });
         toast.success(t("keys.created"));
@@ -169,6 +173,7 @@ export function ClientKeysPage() {
     mutationFn: deleteClientKey,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["client-keys"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       setDeleting(null);
       toast.success(t("keys.deleted"));
     },
@@ -186,6 +191,7 @@ export function ClientKeysPage() {
     onSuccess: () => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["client-keys"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       toast.success(t("keys.batchUpdated"));
     },
     onError: showError,
@@ -197,6 +203,7 @@ export function ClientKeysPage() {
       setSelected(new Set());
       setBatchDeleteOpen(false);
       void queryClient.invalidateQueries({ queryKey: ["client-keys"] });
+      void queryClient.invalidateQueries({ queryKey: ["creative-console"] });
       toast.success(t("keys.deleted"));
     },
     onError: showError,

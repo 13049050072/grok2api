@@ -39,9 +39,15 @@ export function buildExportFallbackFilename(input: AccountExportFallbackName): s
 function sanitizeFilename(value: string): string | undefined {
   // 只看最后一段，去掉路径穿越与控制字符；后端只给文件名，前端不得接受目录。
   const base = value.replaceAll("\\", "/").split("/").pop() ?? "";
-  const cleaned = base.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  const cleaned = [...base].filter((char) => !isControlCharacter(char)).join("").trim();
   if (!cleaned || cleaned === "." || cleaned === "..") return undefined;
   return cleaned.slice(0, 200);
+}
+
+/** C0 控制字符（U+0000–U+001F）与 DEL（U+007F）。 */
+function isControlCharacter(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return code <= 0x1f || code === 0x7f;
 }
 
 function decodeExtendedFilename(value: string): string | undefined {

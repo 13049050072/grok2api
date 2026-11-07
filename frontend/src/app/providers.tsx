@@ -4,6 +4,7 @@ import { useState, type ReactNode } from "react";
 import { Toaster } from "sonner";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { clearChatHistoryStorage } from "@/features/creative-console/chat-history-storage";
 import { AuthProvider } from "@/shared/auth/auth-context";
 
 export function AppProviders({ children }: { children: ReactNode }) {
@@ -17,7 +18,7 @@ export function AppProviders({ children }: { children: ReactNode }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
       <QueryClientProvider client={queryClient}>
-        <AuthProvider>
+        <AuthProvider onLoggedOut={clearChatHistoryStorage}>
           <TooltipProvider delayDuration={300}>
             {children}
             <Toaster richColors closeButton position="top-right" />

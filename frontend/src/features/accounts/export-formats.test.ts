@@ -95,6 +95,15 @@ describe("content-disposition filenames", () => {
     assert.equal(parseContentDispositionFilename('attachment; filename="gro\u0000k-accounts.csv"'), "grok-accounts.csv");
   });
 
+  it("strips the whole C0 range and DEL but keeps printable unicode", () => {
+    assert.equal(parseContentDispositionFilename('attachment; filename="\u0001账号\u001f-\u007fexport\t\n.csv"'), "账号-export.csv");
+    assert.equal(parseContentDispositionFilename("attachment; filename*=UTF-8''%E8%B4%A6%E5%8F%B7%7F%1F-%F0%9F%93%A6.zip"), "账号-📦.zip");
+  });
+
+  it("rejects a filename made only of control characters", () => {
+    assert.equal(parseContentDispositionFilename('attachment; filename="\u0001\u007f"'), undefined);
+  });
+
   it("rejects dot-only, empty and missing filenames", () => {
     assert.equal(parseContentDispositionFilename('attachment; filename=".."'), undefined);
     assert.equal(parseContentDispositionFilename('attachment; filename=""'), undefined);

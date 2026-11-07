@@ -477,8 +477,9 @@ export function AccountsPage() {
     // Snapshot id/targets in mutate() args so AlertDialog close/reset cannot clear linkedDeleteTargets mid-flight.
     mutationFn: (input: { id: string; provider: AccountProvider; linkedDeleteTargets: AccountProvider[] }) =>
       deleteAccount(input.id, input.linkedDeleteTargets.length ? { provider: input.provider, linkedDeleteTargets: input.linkedDeleteTargets } : undefined),
-    onSuccess: () => {
+    onSuccess: (_, input) => {
       invalidateAccountData();
+      toggleAccount(input.id, false);
       setDeleting(null);
       resetLinkedDeleteState();
       toast.success(t("accounts.deleted"));
@@ -702,9 +703,11 @@ export function AccountsPage() {
   });
 
   const selectAllMutation = useMutation({
-    mutationFn: () => listAccountIds(accountFilters),
-    onSuccess: ({ ids }) => {
-      setSelection({ provider, ids: withSelectedIds(ids) });
+    // Snapshot the filters (including provider) at click time; ids for a pool the user has left must not become the selection.
+    mutationFn: (filters: typeof accountFilters) => listAccountIds(filters),
+    onSuccess: ({ ids }, filters) => {
+      if (filters.provider !== provider) return;
+      setSelection((current) => (current.provider === filters.provider ? { provider: filters.provider, ids: withSelectedIds(ids) } : current));
       if (ids.length === 0) {
         toast.info(t("accountExport.selectAllEmpty"));
         return;
@@ -919,6 +922,8 @@ export function AccountsPage() {
     onSuccess: (result) => {
       setCleanupOpen(false);
       resetCleanupState();
+      // The cleanup result only carries counts, so the deleted ids are unknown here.
+      clearSelection();
       invalidateAccountData();
       const linked = result.linkedDeleted ?? 0;
       const skipped = result.skipped ?? 0;
@@ -1299,15 +1304,15 @@ export function AccountsPage() {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Tabs value={provider} onValueChange={(value) => changeProvider(value as AccountProvider)}>
             <TabsList>
-              <TabsTrigger value="grok_build" className="gap-1.5">
+              <TabsTrigger value="grok_build" className="gap-1.5" disabled={selectAllMutation.isPending}>
                 <SquareTerminal className="size-3.5 text-quota-product-1" />
                 <span>Grok Build</span>
               </TabsTrigger>
-              <TabsTrigger value="grok_web" className="gap-1.5">
+              <TabsTrigger value="grok_web" className="gap-1.5" disabled={selectAllMutation.isPending}>
                 <Compass className="size-3.5 text-quota-product-2" />
                 <span>Grok Web</span>
               </TabsTrigger>
-              <TabsTrigger value="grok_console" className="gap-1.5">
+              <TabsTrigger value="grok_console" className="gap-1.5" disabled={selectAllMutation.isPending}>
                 <Webhook className="size-3.5 text-quota-product-4" />
                 <span>Grok Console</span>
               </TabsTrigger>
@@ -1417,7 +1422,7 @@ export function AccountsPage() {
             </div>
             {/* 全选/取消选择常驻：全选走 /accounts/ids，能跨页选中当前筛选下的全部账号。 */}
             <div className="flex items-center gap-1.5">
-              <Button variant="secondary" size="sm" disabled={bulkTaskPending || selectAllMutation.isPending} onClick={() => selectAllMutation.mutate()}>
+              <Button variant="secondary" size="sm" disabled={bulkTaskPending || selectAllMutation.isPending} onClick={() => selectAllMutation.mutate(accountFilters)}>
                 {selectAllMutation.isPending ? <Spinner /> : null}
                 {t("accountExport.selectAll")}
               </Button>
@@ -2297,7 +2302,8 @@ function downloadAccountExport(blob: Blob, filename: string): void {
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  // 下载是异步开始的（Safari/WebKit 尤甚），立即 revoke 可能让大文件下载失败；延迟释放即可。
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function accountExportFormatLabel(format: AccountExportFormat): string {
